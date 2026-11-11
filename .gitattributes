@@ -1,0 +1,3 @@
+vendor/own/** -text
+own.lock text eol=lf
+own.toml text eol=lf

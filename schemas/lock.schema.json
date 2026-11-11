@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/own/schemas/lock.schema.json",
+  "title": "own.lock schema_version 1 (placeholder — normative definition in SPEC.md §7.1)",
+  "type": "object",
+  "required": ["metadata"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "required": ["schema_version", "vendor_files_sha256", "license_policy_sha256", "lock_digest"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "own_version": { "type": "string" },
+        "extractor_version": { "type": "string" },
+        "license_policy_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "vendor_files_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "licenses_md_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "lock_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "package": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "decision": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  }
+}

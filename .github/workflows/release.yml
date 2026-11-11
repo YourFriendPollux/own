@@ -1,0 +1,66 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+  id-token: write   # cosign keyless OIDC
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: linux-amd64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, asset: linux-arm64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, asset: darwin-arm64 }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af685 # v4.2.2 pinned by SHA
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build reproducible (locked, SOURCE_DATE_EPOCH)
+        env:
+          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
+          RUSTFLAGS: --remap-path-prefix=$GITHUB_WORKSPACE=/build --remap-path-prefix=$CARGO_HOME=/cargo
+        run: cargo build --release --locked --target ${{ matrix.target }} -p own-cli -p own-verify
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf own-${{ github.ref_name }}-${{ matrix.asset }}.tar.gz own own-verify
+          sha256sum own-${{ github.ref_name }}-${{ matrix.asset }}.tar.gz > own-${{ github.ref_name }}-${{ matrix.asset }}.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75f540449e92b4886f8bde5b51 # v4 pinned
+        with:
+          name: own-${{ matrix.asset }}-${{ github.ref_name }}
+          path: target/${{ matrix.target }}/release/own-${{ github.ref_name }}-${{ matrix.asset }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@6746f4e0c9c3c4f8e2e2e2e2e2e2e2e2e2e2e2e2 # pinned
+        with:
+          path: dist
+          pattern: own-*
+          merge-multiple: false
+      # SLSA provenance via the reusable generator — referenced by TAG on purpose (SPEC §17 exception)
+      - uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+        with:
+          subject: dist
+          # ...
+      - name: Sign with cosign keyless
+        uses: sigstore/cosign-installer@dc72c7b4d25d876d5b8d14a1e0396e9f1f4f4f4f # pinned
+      - run: |
+          for f in dist/*/*.tar.gz; do
+            cosign sign-blob --yes --bundle "$f.bundle" "$f"
+          done
+      - uses: softprops/action-gh-release@c95fe1c6d0e1c3a3e0c5e2e2e2e2e2e2e2e2e2e2 # pinned
+        with:
+          files: dist/*/*

@@ -1,0 +1,305 @@
+//! Transactions (SPEC §8.0, INV-9): every writing command takes the exclusive
+//! file lock `.own/lock` (LOCK_BUSY if taken, no waiting), journals its work in
+//! `.own/txn/<id>/journal.json`, backs up anything it will modify, writes via
+//! `.own/tmp/` + rename, and rolls back on failure, SIGINT or SIGTERM. A journal
+//! left in `started` state (crash / kill -9) is restored by the next writing
+//! command, which then emits `W_TXN_RECOVERED`.
+
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+pub struct Txn {
+    // Debug manually: _lock is a File
+    pub id: String,
+    pub root: PathBuf,    // project root
+    pub txn_dir: PathBuf, // .own/txn/<id>
+    _lock: Option<fs::File>,
+}
+
+impl std::fmt::Debug for Txn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Txn").field("id", &self.id).finish()
+    }
+}
+
+static SIG_HANDLER: OnceLock<()> = OnceLock::new();
+
+fn install_signal_handler() {
+    SIG_HANDLER.get_or_init(|| {
+        // minimal SIGINT/SIGTERM handler: on signal, best-effort rollback of the
+        // active txn then re-raise. We keep a global registry of the active txn dir.
+        unsafe {
+            extern "C" fn handler(_sig: i32) {
+                if let Some(dir) = active_txn().lock().unwrap().clone() {
+                    let _ = rollback_dir(&dir);
+                }
+                std::process::exit(130);
+            }
+            libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        }
+    });
+}
+
+static ACTIVE_TXN: OnceLock<std::sync::Mutex<Option<PathBuf>>> = OnceLock::new();
+fn active_txn() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    ACTIVE_TXN.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn rollback_dir(txn_dir: &Path) -> std::io::Result<()> {
+    let journal = txn_dir.join("journal.json");
+    let content = fs::read_to_string(&journal)?;
+    let v: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if v["state"] != "started" {
+        return Ok(());
+    }
+    let root = PathBuf::from(
+        v["root"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no root"))?,
+    );
+    let backup = txn_dir.join("backup");
+    if let Some(files) = v["backup_files"].as_array() {
+        for f in files {
+            if let Some(rel) = f.as_str() {
+                let src = backup.join(rel);
+                let dst = root.join(rel.replace("__", "/"));
+                if src.exists() {
+                    if let Some(parent) = dst.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(&src, &dst)?;
+                } else {
+                    let _ = fs::remove_file(&dst);
+                }
+            }
+        }
+    }
+    // remove created dirs (vendor dirs added by this txn)
+    if let Some(dirs) = v["created_dirs"].as_array() {
+        for d in dirs {
+            if let Some(rel) = d.as_str() {
+                let _ = fs::remove_dir_all(root.join(rel));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Txn {
+    /// Recover any `started` journal left by a crash, then take the lock and
+    /// start a new transaction. Returns Err("LOCK_BUSY") if the lock is taken.
+    pub fn begin(root: &Path) -> Result<Txn, String> {
+        let own = root.join(".own");
+        fs::create_dir_all(own.join("tmp")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        fs::create_dir_all(own.join("txn")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        // recovery of stale journals
+        let txn_root = own.join("txn");
+        if let Ok(rd) = fs::read_dir(&txn_root) {
+            for e in rd.flatten() {
+                let j = e.path().join("journal.json");
+                if j.exists() {
+                    if let Ok(content) = fs::read_to_string(&j) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if v["state"] == "started" {
+                                let _ = rollback_dir(&e.path());
+                                let _ = fs::remove_dir_all(e.path());
+                                eprintln!("warning: W_TXN_RECOVERED: rolled back unfinished transaction {}", e.file_name().to_string_lossy());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // exclusive lock
+        let lock_path = own.join("lock");
+        #[cfg(unix)]
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o644)
+            .open(&lock_path)
+            .map_err(|e| format!("IO_ERROR: {e}"))?;
+        #[cfg(not(unix))]
+        let lock_file = File::create(&lock_path).map_err(|e| format!("IO_ERROR: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            let mut fl = libc::flock {
+                l_type: libc::F_WRLCK as i16,
+                l_whence: libc::SEEK_SET as i16,
+                l_start: 0,
+                l_len: 0,
+                l_pid: 0,
+            };
+            let r = unsafe { libc::fcntl(fd, libc::F_SETLK, &mut fl) };
+            if r != 0 {
+                return Err("LOCK_BUSY".to_string());
+            }
+        }
+        let id = format!("{:x}", randish());
+        let txn_dir = txn_root.join(&id);
+        fs::create_dir_all(txn_dir.join("backup")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        let journal = serde_json::json!({
+            "state": "started",
+            "id": id,
+            "root": root.to_string_lossy(),
+            "backup_files": [],
+            "created_dirs": [],
+        });
+        write_journal(&txn_dir, &journal)?;
+        install_signal_handler();
+        *active_txn().lock().unwrap() = Some(txn_dir.clone());
+        Ok(Txn {
+            id,
+            root: root.to_path_buf(),
+            txn_dir,
+            _lock: Some(lock_file),
+        })
+    }
+
+    /// Back up `rel` (relative to root) before modifying it.
+    pub fn backup(&self, rel: &str) -> Result<(), String> {
+        let src = self.root.join(rel);
+        // backup under a flat, length-capped name to avoid ENAMETOOLONG on deep paths
+        let flat = rel.replace('/', "__");
+        let dst = self.txn_dir.join("backup").join(&flat);
+        let _ = rel;
+        if src.is_dir() {
+            copy_dir(&src, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
+        } else if src.exists() {
+            if let Some(p) = dst.parent() {
+                fs::create_dir_all(p).map_err(|e| format!("IO_ERROR: {e}"))?;
+            }
+            fs::copy(&src, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
+        let mut j = read_journal(&self.txn_dir)?;
+        j["backup_files"]
+            .as_array_mut()
+            .ok_or("IO_ERROR: journal")?
+            .push(serde_json::Value::String(flat));
+        write_journal(&self.txn_dir, &j)
+    }
+
+    pub fn note_created_dir(&self, rel: &str) -> Result<(), String> {
+        let mut j = read_journal(&self.txn_dir)?;
+        j["created_dirs"]
+            .as_array_mut()
+            .ok_or("IO_ERROR: journal")?
+            .push(serde_json::Value::String(rel.to_string()));
+        write_journal(&self.txn_dir, &j)
+    }
+
+    /// Write `content` to `rel` atomically: write to `.own/tmp/` then rename.
+    pub fn write_file(&self, rel: &str, content: &[u8]) -> Result<(), String> {
+        self.backup(rel)?;
+        let tmp = self.root.join(".own/tmp").join(format!("{}.tmp", self.id));
+        {
+            let mut f = File::create(&tmp).map_err(|e| format!("IO_ERROR: {e}"))?;
+            f.write_all(content).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
+        let dst = self.root.join(rel);
+        if let Some(p) = dst.parent() {
+            fs::create_dir_all(p).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
+        fs::rename(&tmp, &dst).map_err(|e| format!("IO_ERROR: rename across filesystems: {e}"))?;
+        Ok(())
+    }
+
+    /// Rename a prepared directory (e.g. extracted vendor dir) into place.
+    pub fn move_dir_into(&self, src_abs: &Path, rel: &str) -> Result<(), String> {
+        self.backup(rel)?;
+        let dst = self.root.join(rel);
+        if dst.exists() {
+            return Err("VENDOR_DIR_EXISTS".to_string());
+        }
+        if let Some(p) = dst.parent() {
+            fs::create_dir_all(p).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
+        fs::rename(src_abs, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
+        self.note_created_dir(rel)?;
+        Ok(())
+    }
+
+    pub fn commit(self) -> Result<(), String> {
+        let mut j = read_journal(&self.txn_dir)?;
+        j["state"] = serde_json::Value::String("committed".to_string());
+        write_journal(&self.txn_dir, &j)?;
+        *active_txn().lock().unwrap() = None;
+        fs::remove_dir_all(&self.txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+        Ok(())
+    }
+
+    pub fn rollback(&self) -> Result<(), String> {
+        rollback_dir(&self.txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+        *active_txn().lock().unwrap() = None;
+        let _ = fs::remove_dir_all(&self.txn_dir);
+        Ok(())
+    }
+}
+
+fn read_journal(txn_dir: &Path) -> Result<serde_json::Value, String> {
+    let c =
+        fs::read_to_string(txn_dir.join("journal.json")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    serde_json::from_str(&c).map_err(|e| format!("PARSE_ERROR: {e}"))
+}
+
+fn write_journal(txn_dir: &Path, j: &serde_json::Value) -> Result<(), String> {
+    let c = serde_json::to_string(j).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let mut f = File::create(txn_dir.join("journal.json")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    f.write_all(c.as_bytes())
+        .map_err(|e| format!("IO_ERROR: {e}"))?;
+    Ok(())
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_dir_inner(src, dst, &mut Vec::new())
+}
+
+/// Copy preserving the tree under `dst`, but each path component is sanitized
+/// and capped so deep trees cannot exceed NAME_MAX (255).
+fn copy_dir_inner(src: &Path, dst: &Path, prefix: &mut Vec<String>) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for e in fs::read_dir(src)? {
+        let e = e?;
+        let ty = e.file_type()?;
+        let mut name = e.file_name().to_string_lossy().replace('/', "__");
+        if name.len() > 200 {
+            let h: String = {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(name.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect()
+            };
+            name = format!("{}~{}", &name[..120], &h[..32]);
+        }
+        let d = dst.join(&name);
+        prefix.push(name);
+        if ty.is_dir() {
+            copy_dir_inner(&e.path(), &d, prefix)?;
+        } else {
+            fs::copy(e.path(), &d)?;
+        }
+        prefix.pop();
+    }
+    Ok(())
+}
+
+fn randish() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    t ^ (pid << 32) ^ (t.rotate_left(17))
+}

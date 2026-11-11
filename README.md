@@ -1,0 +1,67 @@
+# own — verified vendoring for supply chain & compliance
+
+`own` internalizes an npm dependency **byte-for-byte** from its published tarball
+into `vendor/own/`, with verifiable provenance, continuous offline integrity
+(`own verify`), CVE visibility (E0 alerts via OSV), clean ejection
+(`own eject --adopt`), and native air-gap support.
+
+## Install
+
+```bash
+OWN_VERSION=v0.1.0 ./scripts/install-own.sh   # verifies cosign signature + SLSA provenance first
+```
+
+## Quick start
+
+```bash
+own init                                  # own.toml, empty own.lock, .gitignore/.gitattributes
+own scan                                  # eligibility table of runtime deps (network)
+own add zod@3.22.4                        # vendor byte-identical + integrity + license check
+own verify                                # offline integrity vs own.lock
+own ci                                    # CI gate: verify + coherence + diamonds + licenses
+own osv-fetch && own check                # CVE E0 alerts from the OSV dump
+own licenses --write                      # regenerate vendor/own/LICENSES.md
+own diff zod@3.22.4 zod@3.23.8            # risk signals between two versions
+own update zod@3.23.8                     # single-transaction update (+ PR unless --no-pr)
+own sbom --format both --output sbom.json --vex-output vex.json
+own eject --adopt --yes                   # adopt vendor/ as first-party
+own-verify                                # minimal offline verifier (no network deps)
+```
+
+## Guarantees (invariants)
+
+- **INV-1** byte identity with the published tarball; `own` never writes inside `vendor/own/<dir>/`
+- **INV-2/3** registry URL + SRI sha512 + tarball sha256 verified *before* extraction; extraction reads the verified cache fd (no TOCTOU)
+- **INV-8** `own verify` is fully offline and depends only on disk state
+- **INV-9** every writing command is transactional (lock, journal, backup, rollback incl. `kill -9` recovery)
+- **INV-10** byte-reproducible outputs; inject the clock with `OWN_NOW` (RFC 3339 UTC)
+- Golden hash vectors from SPEC §7.3 are unit tests in `own-core`
+
+## Layout
+
+```
+crates/own-core      lock, manifest, JCS (RFC 8785), canonical TOML writer, verify, transactions
+crates/own-policy    eligibility §9.1, SPDX §9.3, npm semver, pnpm-lock v9 parser
+crates/own-net       registry client, OSV dump fetch (§10.2 network policy)
+crates/own-extract   hardened tarball extraction (§11.2, 18 hostile tests)
+crates/own-cli       the `own` binary
+crates/own-verify    minimal offline verifier (no reqwest in its dep tree)
+fuzz/                cargo-fuzz targets: extraction, packument, SPDX, OSV
+scripts/             day1.sh (Go/No-Go), corpus.txt (127 pkgs), install-own.sh
+docs/                status only (phase gate records in repo history)
+```
+
+## Quality gates (CI)
+
+`cargo fmt --check` · `clippy -D warnings` · `cargo test` (53 tests) ·
+`cargo deny check` · `cargo vet --locked` · fuzz smoke (4 targets) ·
+determinism check (INV-10). Measured `own ci`: **16 ms release / 145 ms debug**
+on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
+
+## Status
+
+Phase 0 (spec weeks 1-14) implemented: Day-1 GO recorded, 0.1 Core, hardening (fuzz + vet + own-verify), 0.2 (OSV/check/diff/update), 0.3 (sbom/eject/verify-signature). Phase 1 (slicing) requires the §4 gate (>= 70% code reduction on the corpus) — not yet met. Phase 2: E1/E2 reachability evidence (`own check --e1/--e2`, SPEC Annexes G/H) and `vendor-all` (`own add <pkg>@<ver> --allow-diamond=vendor-all` vendors every version of the package resolved in `pnpm-lock.yaml`).
+
+## License
+
+MIT

@@ -1,0 +1,15 @@
+[package]
+name = "own-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Eligibility (§9.1), SPDX license policy (§9.3), npm semver ranges, pnpm-lock v9 parsing (§9.2)"
+
+[dependencies]
+own-core = { path = "../own-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spdx = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

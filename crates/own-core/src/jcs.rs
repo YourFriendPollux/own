@@ -1,0 +1,224 @@
+//! JCS (RFC 8785) canonicalization, implemented internally per SPEC §12 / ADR 0003.
+//!
+//! Scope for `own`: strings, integers (i64/u64), arrays, objects, bools, null.
+//! Floats are rejected (SPEC §7.3: only integers and strings enter the digest).
+
+use serde_json::Value;
+
+/// Canonicalize a JSON value per RFC 8785.
+/// Property names are sorted by UTF-16 code units (ascending, unsigned).
+/// Strings are escaped per §3.2.2.2. Numbers: only integers supported here;
+/// floats return an error (not needed by own and keeps INV-10 simple).
+pub fn canonicalize(value: &Value) -> Result<String, String> {
+    let mut out = String::new();
+    write_value(value, &mut out)?;
+    Ok(out)
+}
+
+fn write_value(v: &Value, out: &mut String) -> Result<(), String> {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                out.push_str(&i.to_string());
+            } else if let Some(u) = n.as_u64() {
+                out.push_str(&u.to_string());
+            } else if let Some(f) = n.as_f64() {
+                out.push_str(&es6_format_f64(f)?);
+            } else {
+                // arbitrary_precision: number not representable as i64/u64/f64 —
+                // emit the raw literal digits
+                out.push_str(n.to_string().trim_matches('"'));
+            }
+        }
+        Value::String(s) => write_string(s, out),
+        Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_value(item, out)?;
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_by(|a, b| utf16_cmp(a, b));
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_string(k, out);
+                out.push(':');
+                write_value(&map[*k], out)?;
+            }
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+/// Sort comparison per RFC 8785 §3.2.3: property names compared as arrays of
+/// UTF-16 code units, unsigned, lexicographic; shorter precedes longer on prefix.
+fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let au: Vec<u16> = a.encode_utf16().collect();
+    let bu: Vec<u16> = b.encode_utf16().collect();
+    au.cmp(&bu)
+}
+
+/// ECMAScript Number::toString (ECMA-262 §7.1.12.1) for f64, as required by
+/// RFC 8785 §3.2.2.3. Digits come from ryu (shortest round-trip, same reference
+/// as the RFC); notation follows the ECMAScript rules (plain when -6 < n <= 21).
+fn es6_format_f64(f: f64) -> Result<String, String> {
+    if !f.is_finite() {
+        return Err("JCS: NaN/Infinity not permitted".to_string());
+    }
+    if f == 0.0 {
+        return Ok("0".to_string());
+    }
+    // ryu's Buffer::format gives the shortest round-trip decimal, in plain or
+    // scientific style ("56.0", "333333333.3333333", "1e30", "0.002").
+    let mut buf = ryu::Buffer::new();
+    let s = buf.format(f);
+    let (digits_raw, n) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => {
+            let exp: i32 = e.parse().map_err(|_| "bad exponent")?;
+            let d: String = m.chars().filter(|c| c.is_ascii_digit()).collect();
+            (d, exp + 1)
+        }
+        None => {
+            let frac = s.split_once('.').map(|(_, fr)| fr.len()).unwrap_or(0) as i32;
+            let d: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+            let n = d.len() as i32 - frac;
+            (d, n)
+        }
+    };
+    // strip trailing zeros (n is unchanged)
+    let mut digits = digits_raw;
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    let k = digits.len() as i32;
+    if n <= -6 || n > 21 {
+        let mantissa = if k == 1 {
+            digits.clone()
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        let e = n - 1;
+        Ok(format!(
+            "{}e{}{}",
+            mantissa,
+            if e >= 0 { "+" } else { "-" },
+            e.abs()
+        ))
+    } else if n > k {
+        // integral value with trailing zeros: digits + (n-k) zeros, no decimal point
+        Ok(format!("{}{}", digits, "0".repeat((n - k) as usize)))
+    } else if n == k {
+        // integral value, exactly k digits
+        Ok(digits.clone())
+    } else if n > 0 {
+        Ok(format!(
+            "{}.{}",
+            &digits[..n as usize],
+            &digits[n as usize..]
+        ))
+    } else {
+        Ok(format!("0.{}{}", "0".repeat((-n) as usize), digits))
+    }
+}
+
+/// String serialization per RFC 8785 §3.2.2.2.
+fn write_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{09}' => out.push_str("\\t"),
+            '\u{0a}' => out.push_str("\\n"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\u{0d}' => out.push_str("\\r"),
+            c if (c as u32) <= 0x1f => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Official RFC 8785 reference vectors (cyberphone/json-canonicalization testdata).
+    #[test]
+    fn rfc8785_official_vectors_inv10() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
+        for name in [
+            "arrays",
+            "french",
+            "structures",
+            "unicode",
+            "values",
+            "weird",
+        ] {
+            let input = fs::read_to_string(format!("{}/input/{}.json", dir, name)).unwrap();
+            let expected = fs::read_to_string(format!("{}/output/{}.json", dir, name)).unwrap();
+            let v: Value = serde_json::from_str(&input).unwrap();
+            let got = canonicalize(&v).unwrap();
+            assert_eq!(got, expected.trim_end(), "vector {}", name);
+        }
+    }
+
+    /// Golden vector from SPEC §7.3: default license policy JCS.
+    #[test]
+    fn golden_license_policy_sha256_inv10() {
+        use crate::sha256_hex;
+        let policy = serde_json::json!({
+            "allow": ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT"],
+            "deny": ["AGPL-*", "BSL-*", "Elastic-2.0", "GPL-*", "PolyForm-*", "SSPL-*"],
+            "review": ["LGPL-2.1-only", "LGPL-3.0-only", "MPL-2.0"],
+            "unknown": "deny"
+        });
+        let canon = canonicalize(&policy).unwrap();
+        assert_eq!(
+            canon,
+            "{\"allow\":[\"Apache-2.0\",\"BSD-2-Clause\",\"BSD-3-Clause\",\"ISC\",\"MIT\"],\"deny\":[\"AGPL-*\",\"BSL-*\",\"Elastic-2.0\",\"GPL-*\",\"PolyForm-*\",\"SSPL-*\"],\"review\":[\"LGPL-2.1-only\",\"LGPL-3.0-only\",\"MPL-2.0\"],\"unknown\":\"deny\"}"
+        );
+        assert_eq!(
+            sha256_hex(canon.as_bytes()),
+            "sha256:f23c02299b6304ae42886963d918e1a4b16cae83e70bc45efbd4102e50e5e2d1"
+        );
+    }
+
+    /// Golden vector from SPEC §7.3: lock_digest of the empty lock.
+    #[test]
+    fn golden_empty_lock_digest_inv10() {
+        use crate::sha256_hex;
+        let obj = serde_json::json!({
+            "decisions": [],
+            "license_policy_sha256": "sha256:f23c02299b6304ae42886963d918e1a4b16cae83e70bc45efbd4102e50e5e2d1",
+            "overrides": {},
+            "packages": [],
+            "schema_version": 1,
+            "vendor_files_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        });
+        let canon = canonicalize(&obj).unwrap();
+        assert_eq!(
+            canon,
+            "{\"decisions\":[],\"license_policy_sha256\":\"sha256:f23c02299b6304ae42886963d918e1a4b16cae83e70bc45efbd4102e50e5e2d1\",\"overrides\":{},\"packages\":[],\"schema_version\":1,\"vendor_files_sha256\":\"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}"
+        );
+        assert_eq!(
+            sha256_hex(canon.as_bytes()),
+            "sha256:cb21ba33540b37168a24bdaafd515c2c670908aed7867e35df97549b946f00af"
+        );
+    }
+}

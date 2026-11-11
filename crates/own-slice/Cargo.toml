@@ -1,0 +1,20 @@
+[package]
+name = "own-slice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase 1 conservative slicing: static reachability (E1) over vendored JS (SPEC §4, Phase 1)"
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+own-core = { path = "../own-core" }
+serde_json = { workspace = true }
+walkdir = "2"
+regex = "1"
+
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"

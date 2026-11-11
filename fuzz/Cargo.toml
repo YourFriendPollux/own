@@ -1,0 +1,32 @@
+[package]
+name = "own-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+own-extract = { path = "../crates/own-extract" }
+own-core = { path = "../crates/own-core" }
+own-policy = { path = "../crates/own-policy" }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "extract_tarball"
+path = "fuzz_targets/extract_tarball.rs"
+
+[[bin]]
+name = "packument"
+path = "fuzz_targets/packument.rs"
+
+[[bin]]
+name = "spdx_expr"
+path = "fuzz_targets/spdx_expr.rs"
+
+[[bin]]
+name = "osv_json"
+path = "fuzz_targets/osv_json.rs"

@@ -1,0 +1,15 @@
+[package]
+name = "own-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal offline verifier built on own-core (no network, no SPDX/OSV)"
+
+[[bin]]
+name = "own-verify"
+path = "src/main.rs"
+
+[dependencies]
+own-core = { path = "../own-core" }
+clap = { workspace = true }
+serde_json = { workspace = true }
