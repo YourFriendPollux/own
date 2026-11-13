@@ -58,7 +58,9 @@ fn main() -> ExitCode {
             } else {
                 0
             };
-            let _ = cli.installed; // --installed is accepted for CLI compat; core check is offline-only in 0.1
+            if cli.installed {
+                eprintln!("warning: --installed not implemented in own-verify 0.1 (offline-only core); run `own verify --installed` for the node_modules/.pnpm comparison");
+            }
             if cli.format == "json" {
                 println!(
                     "{}",

@@ -319,3 +319,119 @@ fn cache_file_must_be_0444_and_hash_named() {
     fs::set_permissions(&p2, fs::Permissions::from_mode(0o444)).unwrap();
     assert!(verify_cache_file(&p2).is_err());
 }
+
+#[test]
+fn rule_max_file_size_refused() {
+    let (t, cache) = setup();
+    let mut l = limits();
+    l.max_file_size = 10; // header claims 100 bytes
+    let c = write_cache(
+        &cache,
+        &[("package/", DIR, &[]), ("package/big", REG, &[b'x'; 100])],
+    );
+    let e = extract(&c, &t.path().join("dest"), &l).unwrap_err();
+    assert_eq!(e, "EXTRACT_REFUSED:max_file_size");
+}
+
+#[test]
+fn rule_max_unpacked_size_refused() {
+    let (t, cache) = setup();
+    let mut l = limits();
+    l.max_unpacked_size = 50;
+    l.max_file_size = 1024 * 1024;
+    let c = write_cache(
+        &cache,
+        &[
+            ("package/", DIR, &[]),
+            ("package/a", REG, &[b'x'; 40]),
+            ("package/b", REG, &[b'y'; 40]),
+        ],
+    );
+    let e = extract(&c, &t.path().join("dest"), &l).unwrap_err();
+    assert_eq!(e, "EXTRACT_REFUSED:max_unpacked_size");
+}
+
+#[test]
+fn rule_compression_ratio_refused() {
+    let (t, cache) = setup();
+    let mut l = limits();
+    l.max_compression_ratio = 5;
+    // highly compressible payload: 1000 'x' compress to a few bytes
+    let c = write_cache(
+        &cache,
+        &[
+            ("package/", DIR, &[]),
+            ("package/zeros", REG, &[b'x'; 1000]),
+        ],
+    );
+    let e = extract(&c, &t.path().join("dest"), &l).unwrap_err();
+    assert_eq!(e, "EXTRACT_REFUSED:compression_ratio");
+}
+
+#[test]
+fn rule_trailing_data_refused() {
+    // multi-member gzip: concatenate two valid gzip members. The extractor
+    // must refuse: the second member's entries would otherwise be silently
+    // merged into the first archive's namespace.
+    let (t, cache) = setup();
+    let raw1 = build_tar(&[("package/", DIR, &[]), ("package/index.js", REG, b"x=1\n")]);
+    let raw2 = build_tar(&[("package/", DIR, &[]), ("package/evil.js", REG, b"e=1\n")]);
+    let mut gz = gzip(&raw1);
+    gz.extend_from_slice(&gzip(&raw2));
+    let hex: String = Sha512::digest(&gz)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let p = cache.join(format!("{hex}.tgz"));
+    fs::write(&p, &gz).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
+    // Either the second member is refused as trailing data, or its duplicate
+    // prefix/path collides — but it must NOT be silently extracted.
+    let r = extract(&p, &t.path().join("dest"), &limits());
+    match r {
+        Err(e) => assert!(
+            e.starts_with("EXTRACT_REFUSED:"),
+            "expected refusal, got {e}"
+        ),
+        Ok(st) => {
+            // if it succeeded, the second member must not have added files
+            assert!(st.files <= 1, "multi-member gzip silently merged: {st:?}");
+        }
+    }
+}
+
+#[test]
+fn rule_non_utf8_path_refused() {
+    let (t, cache) = setup();
+    // entry whose name contains an invalid UTF-8 byte (0xff)
+    let mut h = [0u8; 512];
+    let name_bytes: &[u8] = b"package/bad\xffname";
+    h[..name_bytes.len()].copy_from_slice(name_bytes);
+    write_octal(&mut h[100..108], 0o644);
+    write_octal(&mut h[124..136], 1);
+    h[156] = REG;
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    for b in &mut h[148..156] {
+        *b = b' ';
+    }
+    let sum: u32 = h.iter().map(|&b| b as u32).sum();
+    let cs = format!("{sum:06o}\0 ");
+    h[148..156].copy_from_slice(cs.as_bytes());
+    let mut raw = build_tar(&[("package/", DIR, &[])]);
+    raw.truncate(raw.len() - 1024); // drop the two end blocks
+    raw.extend_from_slice(&h);
+    raw.extend_from_slice(b"x");
+    raw.extend(std::iter::repeat_n(0u8, 511));
+    raw.extend(std::iter::repeat_n(0u8, 1024));
+    let gz = gzip(&raw);
+    let hex: String = Sha512::digest(&gz)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let p = cache.join(format!("{hex}.tgz"));
+    fs::write(&p, &gz).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
+    let e = extract(&p, &t.path().join("dest"), &limits()).unwrap_err();
+    assert_eq!(e, "EXTRACT_REFUSED:non_utf8_path");
+}

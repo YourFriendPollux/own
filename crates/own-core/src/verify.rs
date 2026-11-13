@@ -173,23 +173,24 @@ pub fn verify(
                     };
                     let h = sha256_hex(&data);
                     if h != f.sha256 || data.len() as u64 != f.size {
-                        // CRLF->LF re-check for LINE_ENDINGS_REWRITTEN
+                        // CRLF->LF re-check for LINE_ENDINGS_REWRITTEN: convert
+                        // each CRLF pair to a single LF (a lone CR is kept).
                         let crlf_fixed = data
                             .iter()
-                            .zip(data.iter().skip(1))
-                            .any(|(a, b)| *a == b'\r' && *b == b'\n');
+                            .enumerate()
+                            .any(|(i, b)| *b == b'\r' && data.get(i + 1) == Some(&b'\n'));
                         if crlf_fixed {
-                            let fixed: Vec<u8> = data
-                                .windows(2)
-                                .flat_map(|w| {
-                                    if w == b"\r\n" {
-                                        vec![b'\n']
-                                    } else {
-                                        vec![w[0]]
-                                    }
-                                })
-                                .chain(data.last().copied())
-                                .collect();
+                            let mut fixed: Vec<u8> = Vec::with_capacity(data.len());
+                            let mut i = 0;
+                            while i < data.len() {
+                                if data[i] == b'\r' && data.get(i + 1) == Some(&b'\n') {
+                                    fixed.push(b'\n');
+                                    i += 2;
+                                } else {
+                                    fixed.push(data[i]);
+                                    i += 1;
+                                }
+                            }
                             if sha256_hex(&fixed) == f.sha256 {
                                 findings.push(Finding::err(
                                     "LINE_ENDINGS_REWRITTEN",

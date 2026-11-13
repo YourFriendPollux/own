@@ -67,17 +67,33 @@ fn rollback_dir(txn_dir: &Path) -> std::io::Result<()> {
     let backup = txn_dir.join("backup");
     if let Some(files) = v["backup_files"].as_array() {
         for f in files {
-            if let Some(rel) = f.as_str() {
-                let src = backup.join(rel);
-                let dst = root.join(rel.replace("__", "/"));
-                if src.exists() {
-                    if let Some(parent) = dst.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::copy(&src, &dst)?;
-                } else {
-                    let _ = fs::remove_file(&dst);
+            // new format: {"rel": "...", "flat": "..."}; legacy format: "flat"
+            let (rel, flat) = match f {
+                serde_json::Value::Object(o) => (
+                    o.get("rel")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    o.get("flat")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                serde_json::Value::String(s) => (s.replace("__", "/"), s.clone()),
+                _ => continue,
+            };
+            if rel.is_empty() || flat.is_empty() {
+                continue;
+            }
+            let src = backup.join(&flat);
+            let dst = root.join(&rel);
+            if src.exists() {
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
                 }
+                fs::copy(&src, &dst)?;
+            } else {
+                let _ = fs::remove_file(&dst);
             }
         }
     }
@@ -93,31 +109,15 @@ fn rollback_dir(txn_dir: &Path) -> std::io::Result<()> {
 }
 
 impl Txn {
-    /// Recover any `started` journal left by a crash, then take the lock and
-    /// start a new transaction. Returns Err("LOCK_BUSY") if the lock is taken.
+    /// Take the exclusive lock FIRST, then recover any `started` journal left
+    /// by a crash, then start a new transaction. Returns Err("LOCK_BUSY") if
+    /// the lock is taken. Recovery under the lock is what prevents a second
+    /// `own` from rolling back a transaction the first one is still working on.
     pub fn begin(root: &Path) -> Result<Txn, String> {
         let own = root.join(".own");
         fs::create_dir_all(own.join("tmp")).map_err(|e| format!("IO_ERROR: {e}"))?;
         fs::create_dir_all(own.join("txn")).map_err(|e| format!("IO_ERROR: {e}"))?;
-        // recovery of stale journals
-        let txn_root = own.join("txn");
-        if let Ok(rd) = fs::read_dir(&txn_root) {
-            for e in rd.flatten() {
-                let j = e.path().join("journal.json");
-                if j.exists() {
-                    if let Ok(content) = fs::read_to_string(&j) {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if v["state"] == "started" {
-                                let _ = rollback_dir(&e.path());
-                                let _ = fs::remove_dir_all(e.path());
-                                eprintln!("warning: W_TXN_RECOVERED: rolled back unfinished transaction {}", e.file_name().to_string_lossy());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // exclusive lock
+        // exclusive lock — taken before any journal inspection
         let lock_path = own.join("lock");
         #[cfg(unix)]
         let lock_file = std::fs::OpenOptions::new()
@@ -145,6 +145,24 @@ impl Txn {
                 return Err("LOCK_BUSY".to_string());
             }
         }
+        // recovery of stale journals — only safe now that we hold the lock
+        let txn_root = own.join("txn");
+        if let Ok(rd) = fs::read_dir(&txn_root) {
+            for e in rd.flatten() {
+                let j = e.path().join("journal.json");
+                if j.exists() {
+                    if let Ok(content) = fs::read_to_string(&j) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if v["state"] == "started" {
+                                let _ = rollback_dir(&e.path());
+                                let _ = fs::remove_dir_all(e.path());
+                                eprintln!("warning: W_TXN_RECOVERED: rolled back unfinished transaction {}", e.file_name().to_string_lossy());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let id = format!("{:x}", randish());
         let txn_dir = txn_root.join(&id);
         fs::create_dir_all(txn_dir.join("backup")).map_err(|e| format!("IO_ERROR: {e}"))?;
@@ -169,10 +187,16 @@ impl Txn {
     /// Back up `rel` (relative to root) before modifying it.
     pub fn backup(&self, rel: &str) -> Result<(), String> {
         let src = self.root.join(rel);
-        // backup under a flat, length-capped name to avoid ENAMETOOLONG on deep paths
-        let flat = rel.replace('/', "__");
+        // backup under a flat name: '/' -> "__" UNLESS the path already
+        // contains a literal "__", in which case the name is suffixed with
+        // "~<sha256-16>" so it round-trips unambiguously (e.g.
+        // "@types+babel__core" must not decode to "@types+babel/core").
+        let flat = if rel.contains("__") {
+            format!("{}~{}", rel.replace('/', "__"), sha256_hex16(rel))
+        } else {
+            rel.replace('/', "__")
+        };
         let dst = self.txn_dir.join("backup").join(&flat);
-        let _ = rel;
         if src.is_dir() {
             copy_dir(&src, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
         } else if src.exists() {
@@ -181,11 +205,12 @@ impl Txn {
             }
             fs::copy(&src, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
+        // journal stores the ORIGINAL relative path alongside the flat name
         let mut j = read_journal(&self.txn_dir)?;
         j["backup_files"]
             .as_array_mut()
             .ok_or("IO_ERROR: journal")?
-            .push(serde_json::Value::String(flat));
+            .push(serde_json::json!({"rel": rel, "flat": flat}));
         write_journal(&self.txn_dir, &j)
     }
 
@@ -302,4 +327,12 @@ fn randish() -> u64 {
         .unwrap_or(0);
     let pid = std::process::id() as u64;
     t ^ (pid << 32) ^ (t.rotate_left(17))
+}
+
+/// First 16 hex chars of the sha256 of `s` — used to disambiguate backup
+/// names that contain a literal "__" (see `Txn::backup`).
+fn sha256_hex16(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(s.as_bytes());
+    h[..8].iter().map(|b| format!("{b:02x}")).collect()
 }

@@ -102,8 +102,7 @@ pub fn extract(
             use std::os::unix::fs::OpenOptionsExt;
             OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true) // never reopen an existing path (TOCTOU)
                 .mode(0o600)
                 .open(&tmp)
                 .map_err(|e| format!("IO_ERROR: {e}"))?
@@ -159,10 +158,15 @@ fn extract_from_file(
     limits: &SecurityLimits,
 ) -> ExtractResult<ExtractStats> {
     let f = File::open(tar_gz).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let gz = GzDecoder::new(f);
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let reader = CountingReader::new(gz, limits.max_tarball_size, counter.clone()); // infallible
-    let mut archive = tar::Archive::new(reader);
+    // count COMPRESSED bytes on the raw stream (before GzDecoder), so the
+    // compression-ratio check compares decompressed vs compressed as intended.
+    let compressed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = CompressedCounter {
+        inner: f,
+        counter: compressed.clone(),
+    };
+    let gz = GzDecoder::new(counted);
+    let mut archive = tar::Archive::new(gz);
     fs::create_dir_all(dest_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
 
     let mut stats = ExtractStats {
@@ -205,7 +209,12 @@ fn extract_from_file(
             continue;
         }
         let raw_path = entry.path().map_err(|e| format!("PARSE_ERROR: {e}"))?;
-        let raw = raw_path.to_string_lossy();
+        // reject non-UTF-8 names instead of lossy-converting them (a lossy
+        // name can collide with a different real name on disk)
+        let raw = raw_path
+            .to_str()
+            .ok_or_else(|| refused("non_utf8_path"))?
+            .to_string();
         if raw.contains('\\') {
             return Err(refused("backslash"));
         }
@@ -269,8 +278,10 @@ fn extract_from_file(
         if stats.total_unpacked > limits.max_unpacked_size {
             return Err(refused("max_unpacked_size"));
         }
-        let compressed = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if stats.total_unpacked > limits.max_compression_ratio * compressed + 1_048_576 {
+        // compression ratio: decompressed bytes so far vs COMPRESSED bytes read
+        // so far (counter sits on the raw stream, before GzDecoder)
+        let compressed = compressed.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        if stats.total_unpacked / compressed > limits.max_compression_ratio {
             return Err(refused("compression_ratio"));
         }
         let dest = dest_dir.join(&rel);
@@ -295,11 +306,33 @@ fn extract_from_file(
             .open(&dest)
             .map_err(|e| format!("IO_ERROR: {e}"))?;
         let mut limited = entry.take(limits.max_file_size + 1);
-        std::io::copy(&mut limited, &mut out).map_err(|e| format!("IO_ERROR: {e}"))?;
+        let written =
+            std::io::copy(&mut limited, &mut out).map_err(|e| format!("IO_ERROR: {e}"))?;
+        if written > limits.max_file_size {
+            return Err(refused("max_file_size"));
+        }
         stats.files += 1;
     }
-    // trailing data / multi-member gzip: GzDecoder reads single member; check for extra bytes
-    // (flate2 GzDecoder stops at member end; we detect trailing data via the counting reader position)
+    // drain the decompressed stream to EOF so the GzDecoder consumes the whole
+    // member, then compare the compressed counter with the raw file size: any
+    // unread compressed bytes mean trailing/multi-member data.
+    {
+        let mut remaining = archive.into_inner();
+        let mut sink = [0u8; 65536];
+        loop {
+            match std::io::Read::read(&mut remaining, &mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            }
+        }
+        let raw_size = fs::metadata(tar_gz)
+            .map_err(|e| format!("IO_ERROR: {e}"))?
+            .len();
+        let read = compressed.load(std::sync::atomic::Ordering::Relaxed);
+        if read < raw_size {
+            return Err(refused("trailing_data"));
+        }
+    }
     Ok(stats)
 }
 
@@ -362,14 +395,18 @@ fn check_path(p: &str, limits: &SecurityLimits) -> ExtractResult<()> {
     Ok(())
 }
 
-/// Reader wrapper that counts compressed bytes and enforces the tarball cap.
+/// Reader wrapper that counts bytes read from `inner` and enforces a cap.
+/// Kept for callers that need a hard byte cap on a decompressed stream.
+#[allow(dead_code)]
 struct CountingReader<R> {
     inner: R,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     cap: u64,
 }
 
+#[allow(dead_code)]
 impl<R: Read> CountingReader<R> {
+    #[allow(dead_code)]
     fn new(inner: R, cap: u64, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
         Self {
             inner,
@@ -391,6 +428,22 @@ impl<R: Read> Read for CountingReader<R> {
                 "max_tarball_size exceeded",
             ));
         }
+        Ok(n)
+    }
+}
+
+/// Counting wrapper over a raw (still-compressed) reader: used between the
+/// cache file and the GzDecoder so the counter measures compressed bytes.
+struct CompressedCounter<R> {
+    inner: R,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<R: Read> Read for CompressedCounter<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.counter
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(n)
     }
 }

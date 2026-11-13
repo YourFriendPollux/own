@@ -3,13 +3,15 @@
 ## Summary
 
 ## Spec coverage
-- [ ] Each normative change cites its SPEC.md section / INV-n / error code.
+- [ ] Each normative change cites its spec section / INV-n / error code
+      (SPEC.md is not in the published archive; request it from maintainers).
 - [ ] Tests named after the covered identifiers exist.
 
 ## Checks
 - [ ] `cargo fmt --check`
-- [ ] `cargo clippy -D warnings`
-- [ ] `cargo test`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo test --workspace`
+- [ ] No generated artifacts committed (fuzz/corpus/ is gitignored)
 - [ ] CODEOWNERS review obtained if touching own.toml / own.lock / vendor/own/ / workflows
 
 ## DCO

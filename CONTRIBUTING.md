@@ -7,8 +7,10 @@ Contributions are signed off under the Developer Certificate of Origin
 
 1. Fork, branch, implement.
 2. `cargo fmt --check` and `cargo clippy -D warnings` must pass.
-3. Every normative rule in `SPEC.md` must be covered by at least one test whose
-   name cites its identifier (`INV-n`, error code from §8.0).
+3. Every normative rule must be covered by at least one test whose name cites
+   its identifier (`INV-n`, error code from the error table). Note: the
+   normative SPEC.md is not part of the published archive — request it from the
+   maintainers if you need the full identifier list.
 4. Open a PR. Changes to `own.toml`, `own.lock`, `vendor/own/`, `.github/workflows/`,
    `.gitattributes`, `.gitignore` require CODEOWNERS review.
 
@@ -17,3 +19,5 @@ Contributions are signed off under the Developer Certificate of Origin
 - All code, identifiers, error messages, TOML/JSON keys, commit messages, and
   documentation are in English.
 - `MUST`/`SHOULD`/`MAY` follow RFC 2119.
+- `fuzz/corpus/` is gitignored: never commit generated fuzz artifacts.
+  Regenerate locally with `cargo +nightly fuzz run <target>`.

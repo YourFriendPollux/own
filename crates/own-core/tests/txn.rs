@@ -85,6 +85,82 @@ fn lock_busy_when_held() {
 }
 
 #[test]
+fn lock_taken_before_recovery_so_second_writer_cannot_rollback_active_txn() {
+    // The fcntl lock is per-process on Linux, so a second Txn::begin in THIS
+    // process would succeed. Use a child process to hold the lock instead, and
+    // verify the child's LOCK_BUSY path leaves the parent's live journal intact.
+    let t = fresh_root();
+    // parent holds a live transaction
+    let txn1 = Txn::begin(t.path()).unwrap();
+    txn1.write_file("file.txt", b"in-progress\n").unwrap();
+    let live_txn_dir = t
+        .path()
+        .join(".own/txn")
+        .read_dir()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(live_txn_dir.join("journal.json").exists());
+
+    // child tries to begin while the parent's lock is held
+    let py = r#"import fcntl,subprocess,sys,os
+lockp = sys.argv[1]
+root = sys.argv[2]
+# hold nothing; just try to take the lock the parent holds
+f = open(lockp, 'r+')
+try:
+    fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("ACQUIRED")   # should NOT happen: parent holds it
+except BlockingIOError:
+    print("LOCK_BUSY")
+"#;
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(py)
+        .arg(t.path().join(".own/lock").to_str().unwrap())
+        .arg(t.path().to_str().unwrap())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("LOCK_BUSY"), "expected LOCK_BUSY, got: {s}");
+
+    // the parent's live journal must be untouched
+    assert!(
+        live_txn_dir.join("journal.json").exists(),
+        "second writer destroyed the active transaction's journal"
+    );
+    assert_eq!(
+        fs::read_to_string(t.path().join("file.txt")).unwrap(),
+        "in-progress\n"
+    );
+    txn1.rollback().unwrap();
+    assert_eq!(
+        fs::read_to_string(t.path().join("file.txt")).unwrap(),
+        "original\n"
+    );
+}
+
+#[test]
+fn rollback_preserves_literal_double_underscore_in_names() {
+    // backup flat-names encode '/' as "__"; a real name containing "__" (e.g.
+    // "@types+babel__core") must round-trip, not be split into a directory.
+    let t = fresh_root();
+    let weird = "vendor/own/@types+babel__core@1.0.0/index.js";
+    fs::create_dir_all(t.path().join("vendor/own/@types+babel__core@1.0.0")).unwrap();
+    fs::write(t.path().join(weird), b"original\n").unwrap();
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.write_file(weird, b"changed\n").unwrap();
+    txn.rollback().unwrap();
+    assert_eq!(
+        fs::read_to_string(t.path().join(weird)).unwrap(),
+        "original\n",
+        "rollback must restore the literal '__' path, not vendor/own/@types+babel/core@1.0.0/..."
+    );
+}
+
+#[test]
 fn stale_started_journal_is_recovered_by_next_writer() {
     let t = fresh_root();
     // simulate crash: journal started + backup present, file already modified

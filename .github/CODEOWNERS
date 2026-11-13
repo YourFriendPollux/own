@@ -1,8 +1,8 @@
 # CODEOWNERS (SPEC §11.4)
-own.toml @own-maintainers
-own.lock @own-maintainers
-vendor/own/ @own-maintainers
-.github/workflows/ @own-maintainers
-.gitattributes @own-maintainers
-.gitignore @own-maintainers
-.github/CODEOWNERS @own-maintainers
+own.toml @YourFriendPollux
+own.lock @YourFriendPollux
+vendor/own/ @YourFriendPollux
+.github/workflows/ @YourFriendPollux
+.gitattributes @YourFriendPollux
+.gitignore @YourFriendPollux
+.github/CODEOWNERS @YourFriendPollux

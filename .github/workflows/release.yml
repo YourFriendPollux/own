@@ -14,53 +14,98 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: linux-amd64 }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, asset: linux-arm64 }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, asset: linux-arm64, cross: true }
           - { os: macos-latest, target: aarch64-apple-darwin, asset: darwin-arm64 }
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af685 # v4.2.2 pinned by SHA
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2 pinned by SHA
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 pinned by SHA
         with:
+          toolchain: "1.99.1"
           targets: ${{ matrix.target }}
+      # cross-compile aarch64-linux from x86_64 (no native runner needed)
+      - name: Install cross toolchain for aarch64-linux-gnu
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
       - name: Build reproducible (locked, SOURCE_DATE_EPOCH)
         env:
           SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
           RUSTFLAGS: --remap-path-prefix=$GITHUB_WORKSPACE=/build --remap-path-prefix=$CARGO_HOME=/cargo
-        run: cargo build --release --locked --target ${{ matrix.target }} -p own-cli -p own-verify
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+              cargo build --release --locked --target ${{ matrix.target }} -p own-cli -p own-verify
+          else
+            cargo build --release --locked --target ${{ matrix.target }} -p own-cli -p own-verify
+          fi
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
           tar -czf own-${{ github.ref_name }}-${{ matrix.asset }}.tar.gz own own-verify
           sha256sum own-${{ github.ref_name }}-${{ matrix.asset }}.tar.gz > own-${{ github.ref_name }}-${{ matrix.asset }}.tar.gz.sha256
-      - uses: actions/upload-artifact@ea165f8d65b6e75f540449e92b4886f8bde5b51 # v4 pinned
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 pinned by SHA
         with:
           name: own-${{ matrix.asset }}-${{ github.ref_name }}
           path: target/${{ matrix.target }}/release/own-${{ github.ref_name }}-${{ matrix.asset }}.tar.gz*
 
-  release:
+  provenance:
     needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC for the SLSA generator
+      actions: read
+      contents: read
+    outputs:
+      digests: ${{ steps.hash.outputs.digests }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0 pinned by SHA
+        with:
+          path: dist
+          pattern: own-*
+          merge-multiple: true
+      - name: Hash release artifacts
+        id: hash
+        shell: bash
+        run: |
+          cd dist
+          sha256sum own-*.tar.gz own-*.tar.gz.sha256 > subjects.sha256
+          echo "digests=$(base64 -w0 subjects.sha256)" >> "$GITHUB_OUTPUT"
+      # SLSA provenance via the reusable generator (referenced by TAG, the only
+      # supported pinning for reusable workflows; tag itself is signed by the
+      # slsa-github-generator project).
+      - uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+        with:
+          base64-subjects: ${{ steps.hash.outputs.digests }}
+          upload-assets: true
+
+  release:
+    needs: [build, provenance]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
     steps:
-      - uses: actions/download-artifact@6746f4e0c9c3c4f8e2e2e2e2e2e2e2e2e2e2e2e2 # pinned
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0 pinned by SHA
         with:
           path: dist
           pattern: own-*
-          merge-multiple: false
-      # SLSA provenance via the reusable generator — referenced by TAG on purpose (SPEC §17 exception)
-      - uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+          merge-multiple: true
+      # cosign signature on each tarball (keyless OIDC = this workflow's identity)
+      - uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1 pinned by SHA
         with:
-          subject: dist
-          # ...
-      - name: Sign with cosign keyless
-        uses: sigstore/cosign-installer@dc72c7b4d25d876d5b8d14a1e0396e9f1f4f4f4f # pinned
-      - run: |
-          for f in dist/*/*.tar.gz; do
+          cosign-release: v3.0.5
+      - name: Sign artifacts (cosign keyless, bundle per file)
+        run: |
+          for f in dist/own-*.tar.gz; do
             cosign sign-blob --yes --bundle "$f.bundle" "$f"
           done
-      - uses: softprops/action-gh-release@c95fe1c6d0e1c3a3e0c5e2e2e2e2e2e2e2e2e2e2 # pinned
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3 pinned by SHA
         with:
-          files: dist/*/*
+          files: |
+            dist/own-*.tar.gz
+            dist/own-*.tar.gz.sha256
+            dist/own-*.tar.gz.bundle
