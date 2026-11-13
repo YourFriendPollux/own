@@ -432,6 +432,102 @@ fn pathdiff(base: &Path, p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// SPEC §8.1 `verify --installed`: compare the copies pnpm materialised in
+/// `node_modules/.pnpm` against the manifests. Every **installed** file must
+/// exist in the manifest with the same bytes and size (`DRIFT_INSTALLED`);
+/// files absent from the installed copy are not reported — §5 says pnpm may
+/// install only the publication subset of the directory, and the source of
+/// truth stays `vendor/own/`. Packages that were never installed are skipped
+/// entirely, so the command is meaningful on a repo without `node_modules/`.
+///
+/// `verify()` has already reported a missing or inconsistent manifest; this
+/// function skips those packages rather than reporting twice.
+pub fn verify_installed(root: &Path) -> Result<Vec<Finding>, String> {
+    let lock_text =
+        fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let lock: Lock =
+        crate::lock::parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
+    let mut findings: Vec<Finding> = Vec::new();
+    for pkg in &lock.packages {
+        let label = format!("{}@{}", pkg.name, pkg.version);
+        // pnpm layout: node_modules/.pnpm/<name>@<ver>/node_modules/<name>
+        // (scoped names use @scope+name for the version directory, §5)
+        let installed = root
+            .join("node_modules/.pnpm")
+            .join(crate::lock::dir_name(&pkg.name, &pkg.version))
+            .join("node_modules")
+            .join(&pkg.name);
+        if !installed.is_dir() {
+            continue;
+        }
+        let mpath = root.join("vendor/own/.manifests").join(format!(
+            "{}.toml",
+            crate::lock::dir_name(&pkg.name, &pkg.version)
+        ));
+        let mtext = match fs::read_to_string(&mpath) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let manifest: Manifest = match parse_manifest(&mtext) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let known: std::collections::BTreeMap<&str, (&str, u64)> = manifest
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), (f.sha256.as_str(), f.size)))
+            .collect();
+        for entry in WalkDir::new(&installed).follow_links(false) {
+            let entry = entry.map_err(|e| format!("IO_ERROR: {e}"))?;
+            let rel = match entry.path().strip_prefix(&installed) {
+                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            if rel.is_empty() {
+                continue;
+            }
+            let md = entry.metadata().map_err(|e| format!("IO_ERROR: {e}"))?;
+            if md.is_dir() {
+                continue;
+            }
+            if !md.is_file() {
+                findings.push(Finding::err(
+                    "DRIFT_INSTALLED",
+                    &label,
+                    &rel,
+                    "installed entry is not a regular file",
+                ));
+                continue;
+            }
+            let data = fs::read(entry.path()).map_err(|e| format!("IO_ERROR: {e}"))?;
+            let h = sha256_hex(&data);
+            match known.get(rel.as_str()) {
+                Some((expected, size)) if *expected == h && *size == data.len() as u64 => {}
+                Some(_) => findings.push(Finding::err(
+                    "DRIFT_INSTALLED",
+                    &label,
+                    &rel,
+                    "installed bytes differ from manifest",
+                )),
+                None => findings.push(Finding::err(
+                    "DRIFT_INSTALLED",
+                    &label,
+                    &rel,
+                    "installed file is not in the manifest",
+                )),
+            }
+        }
+    }
+    findings.sort_by(|a, b| {
+        (a.code.as_str(), a.package.as_str(), a.path.as_str()).cmp(&(
+            b.code.as_str(),
+            b.package.as_str(),
+            b.path.as_str(),
+        ))
+    });
+    Ok(findings)
+}
+
 /// Recompute `package_files_sha256` for a directory tree (used by add/update and tests).
 pub fn hash_dir(root: &Path) -> Result<(String, u64, u64), String> {
     let mut files: Vec<(String, String, u64, bool)> = Vec::new();

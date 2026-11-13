@@ -15,16 +15,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lock keeps `provenance_level = "integrity-only"`: `attested` and
   `registry-signed` are never written without the matching verification
   (INV-7). 4 unit tests in `own-cli`.
-- **CLI integration tests**: `crates/own-cli/tests/cli.rs`, 23 offline tests
+- **CLI integration tests**: `crates/own-cli/tests/cli.rs`, 28 offline tests
   driving the real binary — `init` (layout, `.gitignore`/`.gitattributes`,
-  `ALREADY_INITIALIZED`, `--root`), `verify` (clean/deterministic, drift codes,
-  `--installed` warning), uninitialized-directory paths, `ci`, `licenses`,
-  `policy-sync`, `migrate`, `check` (`OSV_MISSING`), `slice`, `sbom`
-  (CycloneDX/OpenVEX + determinism), `eject`, JSON envelope and §8.0 exit codes.
+  transaction lock, `ALREADY_INITIALIZED`, `--root`), `verify`
+  (clean/deterministic, drift codes, `--installed` incl. `DRIFT_INSTALLED`,
+  `--format json`, unknown `--format`), uninitialized-directory preconditions,
+  `ci`, `licenses` (incl. the `Hash` column), `policy-sync`, `migrate`, `check`
+  (`OSV_MISSING`), `slice`, `sbom` (CycloneDX/OpenVEX, stdout and `--output`,
+  determinism), `eject`, JSON envelope and §8.0 exit codes.
 - `.gitignore` now ignores `/fuzz/target/` (cargo-fuzz has its own workspace;
   those artifacts had been committed before the history rewrite).
 
 ### Fixed
+- **CLI conformance (§8.0/§8.1/§8.3)**, from the divergences the integration suite
+  documented:
+  - `NOT_INITIALIZED` (exit 2) is now the answer of every command that needs
+    project state (`verify`, `ci`, `licenses`, `policy-sync`, `migrate`, `slice`,
+    `sbom`, `diff`, `check`, `eject`). `verify` used to report an unmatchable
+    `NOT_INITIALIZED or IO_ERROR: own.toml: …` and exit 1; the others reported a
+    bare `IO_ERROR`.
+  - `--format human|json` is declared by `verify` and validated everywhere
+    (`scan`, `slice`, `diff`, `check`, `ci`): an unknown value is a
+    `USAGE_ERROR` (exit 2) instead of being silently ignored. The result now goes
+    to stdout in human mode too (§8.0: logs on stderr), and the JSON envelope is
+    emitted only with `--format json`.
+  - `verify --installed` is implemented (`own_core::verify::verify_installed`):
+    every file present in `node_modules/.pnpm` must exist in the manifest with
+    the same bytes (`DRIFT_INSTALLED`); files absent from the copy are not
+    reported (§5), and a package that was never installed is skipped.
+  - `init` is transactional (INV-9): it takes `.own/lock`, journals its writes
+    and commits, so a failure (or a signal) leaves the directory untouched
+    instead of half-initialised.
+  - `sbom --format vex` no longer requires `--output`: without it the OpenVEX
+    document goes to stdout, like CycloneDX (§8.3).
+  - `licenses` prints the `Hash` column required by §8.1.
+  - Remaining documented deviation: `ci` requires `pnpm-lock.yaml`, because its
+    overrides/pnpm coherence check needs it; the failure is an `IO_ERROR`
+    (exit 2).
 - **Signal handling (INV-9)**: the SIGINT/SIGTERM handler is now
   async-signal-safe — it only calls `write(2)` and `_exit(128+signal)`. It no
   longer takes the active-transaction mutex, reads the journal or copies files

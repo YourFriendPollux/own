@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use own_core::canonical::{empty_lock, write_lock_canonical};
 use own_core::config::{license_policy_json, DEFAULT_OWN_TOML};
-use own_core::verify::verify;
+use own_core::verify::{verify, verify_installed};
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -48,10 +48,13 @@ enum Commands {
     },
     /// Verify vendored files against own.lock (offline by default) (SPEC §8.1)
     Verify {
+        /// Also compare the copy pnpm installed in node_modules/.pnpm (§8.1)
         #[arg(long)]
         installed: bool,
         #[arg(long)]
         remote: bool,
+        #[arg(long, default_value = "human")]
+        format: String,
     },
     /// List vendored packages' licenses; --write regenerates LICENSES.md (SPEC §8.1)
     Licenses {
@@ -217,118 +220,178 @@ fn cmd_init(root: &std::path::Path, force: bool) -> Result<u8, String> {
     {
         return Err("USAGE_ERROR: --force refused: vendor/own/ is not empty".to_string());
     }
-    // write own.toml
-    if !root.join("own.toml").exists() || force {
-        fs::write(root.join("own.toml"), DEFAULT_OWN_TOML).map_err(|e| format!("IO_ERROR: {e}"))?;
-    }
-    // write empty own.lock with computed digest
-    let overrides = read_overrides(root)?;
-    let lock = empty_lock(env!("CARGO_PKG_VERSION"), "1", &overrides);
-    fs::write(root.join("own.lock"), write_lock_canonical(&lock))
-        .map_err(|e| format!("IO_ERROR: {e}"))?;
-    // .own/ tree
-    for d in ["cache", "tmp", "txn"] {
-        fs::create_dir_all(root.join(".own").join(d)).map_err(|e| format!("IO_ERROR: {e}"))?;
-    }
-    fs::create_dir_all(root.join("vendor/own")).map_err(|e| format!("IO_ERROR: {e}"))?;
-    // .gitignore: append idempotently
-    let gi = root.join(".gitignore");
-    let mut gi_text = fs::read_to_string(&gi).unwrap_or_default();
-    for line in [".own/", "!vendor/own/**"] {
-        if !gi_text.lines().any(|l| l.trim() == line) {
-            if !gi_text.is_empty() && !gi_text.ends_with('\n') {
+    // INV-9 / §8.0: `init` writes project state, so it takes the exclusive lock
+    // and journals its work like every other writing command. A failure (or a
+    // signal) then leaves the directory as it was instead of half-initialised.
+    let txn = own_core::txn::Txn::begin(root)?;
+    let res = (|| -> Result<(), String> {
+        // own.toml
+        if !root.join("own.toml").exists() || force {
+            txn.write_file("own.toml", DEFAULT_OWN_TOML.as_bytes())?;
+        }
+        // empty own.lock with computed digest
+        let overrides = read_overrides(root)?;
+        let lock = empty_lock(env!("CARGO_PKG_VERSION"), "1", &overrides);
+        txn.write_file("own.lock", write_lock_canonical(&lock).as_bytes())?;
+        // .own/ tree (tmp and txn already created by Txn::begin)
+        for d in ["cache", "tmp", "txn"] {
+            fs::create_dir_all(root.join(".own").join(d)).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
+        fs::create_dir_all(root.join("vendor/own")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        // .gitignore: append idempotently
+        let gi = root.join(".gitignore");
+        let mut gi_text = fs::read_to_string(&gi).unwrap_or_default();
+        for line in [".own/", "!vendor/own/**"] {
+            if !gi_text.lines().any(|l| l.trim() == line) {
+                if !gi_text.is_empty() && !gi_text.ends_with('\n') {
+                    gi_text.push('\n');
+                }
+                gi_text.push_str(line);
                 gi_text.push('\n');
             }
-            gi_text.push_str(line);
-            gi_text.push('\n');
         }
-    }
-    fs::write(&gi, gi_text).map_err(|e| format!("IO_ERROR: {e}"))?;
-    // .gitattributes: append idempotently
-    let ga = root.join(".gitattributes");
-    let mut ga_text = fs::read_to_string(&ga).unwrap_or_default();
-    for line in [
-        "vendor/own/** -text",
-        "own.lock text eol=lf",
-        "own.toml text eol=lf",
-    ] {
-        if !ga_text.lines().any(|l| l.trim() == line) {
-            if !ga_text.is_empty() && !ga_text.ends_with('\n') {
+        txn.write_file(".gitignore", gi_text.as_bytes())?;
+        // .gitattributes: append idempotently
+        let ga = root.join(".gitattributes");
+        let mut ga_text = fs::read_to_string(&ga).unwrap_or_default();
+        for line in [
+            "vendor/own/** -text",
+            "own.lock text eol=lf",
+            "own.toml text eol=lf",
+        ] {
+            if !ga_text.lines().any(|l| l.trim() == line) {
+                if !ga_text.is_empty() && !ga_text.ends_with('\n') {
+                    ga_text.push('\n');
+                }
+                ga_text.push_str(line);
                 ga_text.push('\n');
             }
-            ga_text.push_str(line);
-            ga_text.push('\n');
         }
-    }
-    fs::write(&ga, ga_text).map_err(|e| format!("IO_ERROR: {e}"))?;
-    // git check-ignore probe (only if inside a git work tree)
-    if root.join(".git").exists() {
-        let out = std::process::Command::new("git")
-            .args(["check-ignore", "--no-index", "vendor/own/_probe/x"])
-            .current_dir(root)
-            .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                return Err("VENDOR_PATH_IGNORED: un-ignore the parent directory of vendor/ (a negation cannot re-include under an excluded parent)".to_string());
+        txn.write_file(".gitattributes", ga_text.as_bytes())?;
+        // git check-ignore probe (only if inside a git work tree); a failure
+        // rolls the whole initialisation back
+        if root.join(".git").exists() {
+            let out = std::process::Command::new("git")
+                .args(["check-ignore", "--no-index", "vendor/own/_probe/x"])
+                .current_dir(root)
+                .output();
+            if let Ok(o) = out {
+                if o.status.success() {
+                    return Err("VENDOR_PATH_IGNORED: un-ignore the parent directory of vendor/ (a negation cannot re-include under an excluded parent)".to_string());
+                }
             }
         }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            txn.commit()?;
+            Ok(0)
+        }
+        Err(e) => {
+            let _ = txn.rollback();
+            Err(e)
+        }
     }
-    Ok(0)
 }
 
-fn cmd_verify(root: &std::path::Path, installed: bool, remote: bool) -> Result<u8, String> {
+/// §8.0 `NOT_INITIALIZED`: `own.toml` and `own.lock` are the project state, and
+/// only `init` creates them. Every other command must fail with the documented
+/// precondition code (exit 2) instead of a bare `IO_ERROR`.
+fn require_init(root: &std::path::Path) -> Result<(), String> {
+    for f in ["own.toml", "own.lock"] {
+        if !root.join(f).is_file() {
+            return Err(format!(
+                "NOT_INITIALIZED: {f} missing (run `own init` first)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// §8.0: `--format` accepts `human|json`. An unknown value is a usage error
+/// (exit 2), never a value that is silently ignored.
+fn validate_format(format: &str) -> Result<(), String> {
+    match format {
+        "human" | "json" => Ok(()),
+        other => Err(format!(
+            "USAGE_ERROR: --format must be human|json (got `{other}`)"
+        )),
+    }
+}
+
+fn cmd_verify(
+    root: &std::path::Path,
+    installed: bool,
+    remote: bool,
+    format: &str,
+) -> Result<u8, String> {
+    validate_format(format)?;
     if remote {
         return Err(
             "USAGE_ERROR: --remote requires own-net (not yet linked in 0.1 core)".to_string(),
         );
     }
-    if installed {
-        eprintln!("warning: --installed not yet implemented (needs node_modules/.pnpm comparison)");
-    }
+    require_init(root)?;
     let toml_text = std::fs::read_to_string(root.join("own.toml"))
-        .map_err(|e| format!("NOT_INITIALIZED or IO_ERROR: own.toml: {e}"))?;
+        .map_err(|e| format!("IO_ERROR: own.toml: {e}"))?;
     let policy = license_policy_json(&toml_text)?;
     let overrides = read_overrides(root)?;
-    let outcome = verify(root, &policy, &overrides)?;
-    // human output
+    let mut outcome = verify(root, &policy, &overrides)?;
+    // §8.1 `--installed`: every file present in the pnpm copy must exist in the
+    // manifest with the same bytes (DRIFT_INSTALLED). Files absent from the copy
+    // are not reported (§5), and a package that was never installed is skipped.
+    if installed {
+        outcome.findings.extend(verify_installed(root)?);
+        outcome.findings.sort_by(|a, b| {
+            (a.code.as_str(), a.package.as_str(), a.path.as_str()).cmp(&(
+                b.code.as_str(),
+                b.package.as_str(),
+                b.path.as_str(),
+            ))
+        });
+    }
+    let has_error = outcome.findings.iter().any(|f| f.severity == "error");
+    let exit_code = if has_error { 1 } else { 0 };
+    if format == "json" {
+        let findings_json: Vec<serde_json::Value> = outcome
+            .findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "code": f.code, "severity": f.severity, "package": f.package,
+                    "path": f.path, "message": f.message,
+                })
+            })
+            .collect();
+        let status = if has_error { "findings" } else { "ok" };
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1,
+                "command": "verify",
+                "status": status,
+                "exit_code": exit_code,
+                "findings": findings_json,
+                "data": {},
+            })
+        );
+        return Ok(exit_code);
+    }
+    // human: the result goes to stdout, logs go to stderr (§8.0)
     if outcome.findings.is_empty() {
         println!("ok: no findings");
-        return Ok(0);
+    } else {
+        for f in &outcome.findings {
+            println!(
+                "{}: [{}] {} {}",
+                f.severity.to_uppercase(),
+                f.code,
+                f.package,
+                f.path
+            );
+        }
     }
-    for f in &outcome.findings {
-        eprintln!(
-            "{}: [{}] {} {}",
-            f.severity.to_uppercase(),
-            f.code,
-            f.package,
-            f.path
-        );
-    }
-    // JSON envelope on stdout
-    let findings_json: Vec<serde_json::Value> = outcome
-        .findings
-        .iter()
-        .map(|f| {
-            serde_json::json!({
-                "code": f.code, "severity": f.severity, "package": f.package,
-                "path": f.path, "message": f.message,
-            })
-        })
-        .collect();
-    let has_error = outcome.findings.iter().any(|f| f.severity == "error");
-    let status = if has_error { "findings" } else { "ok" };
-    let exit_code = if has_error { 1 } else { 0 };
-    println!(
-        "{}",
-        serde_json::json!({
-            "schema_version": 1,
-            "command": "verify",
-            "status": status,
-            "exit_code": exit_code,
-            "findings": findings_json,
-            "data": {},
-        })
-    );
     Ok(exit_code)
 }
 
@@ -493,10 +556,16 @@ fn main() -> ExitCode {
             };
             add::add(&root, &args).map(|_| 0)
         }
-        Commands::Verify { installed, remote } => cmd_verify(&root, *installed, *remote),
-        Commands::Licenses { write } => licenses::licenses(&root, *write),
-        Commands::PolicySync => licenses::policy_sync(&root),
-        Commands::Migrate => licenses::migrate(&root),
+        Commands::Verify {
+            installed,
+            remote,
+            format,
+        } => cmd_verify(&root, *installed, *remote, format),
+        Commands::Licenses { write } => {
+            require_init(&root).and_then(|()| licenses::licenses(&root, *write))
+        }
+        Commands::PolicySync => require_init(&root).and_then(|()| licenses::policy_sync(&root)),
+        Commands::Migrate => require_init(&root).and_then(|()| licenses::migrate(&root)),
         Commands::OsvFetch => {
             let now = std::env::var("OWN_NOW").ok();
             match osv::osv_fetch(&root, osv::DEFAULT_OSV_URL, 500, now.as_deref()) {
@@ -505,10 +574,14 @@ fn main() -> ExitCode {
             }
         }
         Commands::Slice { format, model } => {
+            if let Err(e) = validate_format(format).and_then(|()| require_init(&root)) {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
             let lock_text = match std::fs::read_to_string(root.join("own.lock")) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("error: IO_ERROR: {e}");
+                    eprintln!("error: IO_ERROR: own.lock: {e}");
                     return ExitCode::from(2);
                 }
             };
@@ -612,7 +685,7 @@ fn main() -> ExitCode {
                 adopt: *adopt,
                 yes: *yes,
             };
-            eject::eject(&root, &args)
+            require_init(&root).and_then(|()| eject::eject(&root, &args))
         }
         Commands::Sbom {
             format,
@@ -629,7 +702,7 @@ fn main() -> ExitCode {
                 author: author.clone(),
                 now: std::env::var("OWN_NOW").ok(),
             };
-            sbom::sbom(&root, &args)
+            require_init(&root).and_then(|()| sbom::sbom(&root, &args))
         }
         Commands::Update {
             spec,
@@ -657,6 +730,10 @@ fn main() -> ExitCode {
             from_cache,
             format,
         } => {
+            if let Err(e) = validate_format(format).and_then(|()| require_init(&root)) {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
             if *from_cache {
                 eprintln!("error: USAGE_ERROR: --from-cache not yet wired");
                 return ExitCode::from(2);
@@ -717,6 +794,10 @@ fn main() -> ExitCode {
             e1,
             e2,
         } => {
+            if let Err(e) = validate_format(format).and_then(|()| require_init(&root)) {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
             if *remote {
                 eprintln!(
                     "error: NETWORK_ERROR: check --remote not yet wired (uses [osv].api_url)"
@@ -788,6 +869,10 @@ fn main() -> ExitCode {
             fail_on_lock_change,
             format,
         } => {
+            if let Err(e) = validate_format(format).and_then(|()| require_init(&root)) {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
             let args = ci::CiArgs {
                 base_ref: base_ref.clone(),
                 fail_on_lock_change: *fail_on_lock_change,

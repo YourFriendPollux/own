@@ -63,7 +63,7 @@ maintainer) until an org team exists.
 
 ## Quality gates (CI)
 
-`cargo fmt --check` · `clippy -D warnings` · `cargo test` (110 tests) ·
+`cargo fmt --check` · `clippy -D warnings` · `cargo test` (115 tests) ·
 `cargo deny check` · `cargo vet --locked` · fuzz smoke (4 targets, cargo-fuzz installed in CI) ·
 determinism check (INV-10, on a real vendored package). Measured `own ci`: **16 ms release / 145 ms debug**
 on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
@@ -85,6 +85,8 @@ on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
   is deliberate — rolling back from a signal handler is not async-signal-safe.
 - `cargo vet` currently ships exemptions only (no audits/imports yet) — the gate
   is structural, not yet a real review.
+- `own ci` requires `pnpm-lock.yaml` (its override/coherence check reads it), so
+  it fails with `IO_ERROR` (exit 2) on a repo that never ran `pnpm install`.
 - Toolchain: `rust-toolchain.toml` pins Rust 1.99.1 (`rustfmt` + `clippy`). The
   MSRV is not declared in `Cargo.toml` yet and no MSRV job runs in CI.
 

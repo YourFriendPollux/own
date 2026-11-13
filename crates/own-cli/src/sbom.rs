@@ -194,17 +194,23 @@ pub fn sbom(root: &Path, args: &SbomArgs) -> Result<u8, String> {
             let doc = openvex(root, args, &alerts)?;
             let s = serde_json::to_string_pretty(&doc).map_err(|e| format!("IO_ERROR: {e}"))?;
             let out_path = if args.format == "both" {
-                args.vex_output
-                    .clone()
-                    .ok_or("USAGE_ERROR: --format both requires --vex-output")?
+                Some(
+                    args.vex_output
+                        .clone()
+                        .ok_or("USAGE_ERROR: --format both requires --vex-output")?,
+                )
             } else {
-                args.output
-                    .clone()
-                    .ok_or("USAGE_ERROR: vex output path required (--output)")?
+                // §8.3: stdout when --output is absent (same rule as cyclonedx)
+                args.output.clone()
             };
-            std::fs::write(root.join(&out_path), format!("{s}\n"))
-                .map_err(|e| format!("IO_ERROR: {e}"))?;
-            println!("wrote {out_path} ({} statements)", alerts.len());
+            match &out_path {
+                Some(p) => {
+                    std::fs::write(root.join(p), format!("{s}\n"))
+                        .map_err(|e| format!("IO_ERROR: {e}"))?;
+                    println!("wrote {p} ({} statements)", alerts.len());
+                }
+                None => println!("{s}"),
+            }
             if args.format == "both" {
                 let cdx = cyclonedx(root, args)?;
                 let s2 =

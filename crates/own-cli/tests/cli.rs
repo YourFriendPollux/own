@@ -373,12 +373,15 @@ fn init_creates_layout_lock_and_git_files() {
     }
 
     // SPEC: écart (INV-9) — §8.0 requires every writing command (explicitly
-    // including `init`) to take `.own/lock` and journal in `.own/txn/<id>/`;
-    // the implementation writes own.toml/own.lock directly and leaves no lock
-    // file behind.
+    // including `init`) to take `.own/lock` and journal in `.own/txn/<id>/`.
     assert!(
-        !dir.join(".own/lock").exists(),
-        "observed: init does not take the .own/lock transaction lock"
+        dir.join(".own/lock").is_file(),
+        "init must take the .own/lock transaction lock"
+    );
+    assert_eq!(
+        fs::read_dir(dir.join(".own/txn")).unwrap().count(),
+        0,
+        "a committed init leaves no journal behind"
     );
 
     let verify = own(dir.path(), &["verify"]);
@@ -460,8 +463,26 @@ fn verify_empty_lock_is_clean_and_deterministic() {
 fn verify_reports_drift_codes_for_tampered_vendor_tree() {
     let dir = drift_project("verify-drift");
 
-    let result = own(dir.path(), &["verify"]);
-    assert_exit(&result, 1, "verify on drifted tree");
+    // human mode: findings are the result, so they go to stdout; the JSON
+    // envelope is emitted only with `--format json` (§8.0).
+    let human = own(dir.path(), &["verify"]);
+    assert_exit(&human, 1, "verify on drifted tree");
+    assert!(
+        human.2.is_empty(),
+        "human mode must not write findings to stderr: {:?}",
+        human.2
+    );
+    for needle in ["DRIFT_MODIFIED", "DRIFT_MISSING", "DRIFT_EXTRA"] {
+        assert!(
+            human.1.contains(needle),
+            "missing {needle} on stdout: {:?}",
+            human.1
+        );
+    }
+
+    let result = own(dir.path(), &["verify", "--format", "json"]);
+    assert_exit(&result, 1, "verify --format json on drifted tree");
+    assert!(result.2.is_empty(), "stderr: {:?}", result.2);
 
     let envelope = parse_json(&result.1, "verify drift");
     assert_eq!(envelope["schema_version"].as_u64(), Some(1));
@@ -490,14 +511,6 @@ fn verify_reports_drift_codes_for_tampered_vendor_tree() {
     assert_eq!(modified["package"].as_str(), Some("fakepkg@1.0.0"));
     assert_eq!(modified["severity"].as_str(), Some("error"));
 
-    for needle in ["DRIFT_MODIFIED", "DRIFT_MISSING", "DRIFT_EXTRA"] {
-        assert!(
-            result.2.contains(needle),
-            "human findings go to stderr; missing {needle} in {:?}",
-            result.2
-        );
-    }
-
     // The synthetic `[[package]]` was appended in canonical layout, so the only
     // digest finding is the unavoidable recomputation mismatch.
     assert!(
@@ -511,23 +524,64 @@ fn verify_reports_drift_codes_for_tampered_vendor_tree() {
 }
 
 #[test]
-fn verify_installed_without_node_modules_only_warns() {
-    let dir = init_project("verify-installed");
+fn verify_installed_without_node_modules_is_clean() {
+    let dir = init_project("verify-installed-clean");
     assert!(!dir.join("node_modules").exists());
 
-    // SPEC: écart (§8.1) — `verify --installed` must compare node_modules/.pnpm
-    // against the manifests and report DRIFT_INSTALLED. The implementation only
-    // prints "warning: --installed not yet implemented" on stderr and skips the
-    // comparison (exit 0).
+    // §8.1: packages that were never installed are skipped, so `--installed` on a
+    // tree without node_modules is as clean as a plain verify — and says so
+    // instead of printing a "not implemented" warning.
     let result = own(dir.path(), &["verify", "--installed"]);
     assert_exit(&result, 0, "verify --installed");
     assert_eq!(result.1, "ok: no findings\n");
+    assert!(result.2.is_empty(), "stderr: {:?}", result.2);
+}
+
+#[test]
+fn verify_installed_reports_drift_installed() {
+    // One vendored package (synthetic manifest) plus a pnpm copy that both adds
+    // an unknown file and disagrees with the manifest bytes.
+    let dir = drift_project("verify-installed-drift");
+    write(
+        dir.path(),
+        "node_modules/.pnpm/fakepkg@1.0.0/node_modules/fakepkg/dist/index.js",
+        "installed bytes differ\n",
+    );
+    write(
+        dir.path(),
+        "node_modules/.pnpm/fakepkg@1.0.0/node_modules/fakepkg/not-in-manifest.txt",
+        "surprise\n",
+    );
+
+    let result = own(dir.path(), &["verify", "--installed", "--format", "json"]);
+    assert_exit(&result, 1, "verify --installed on a drifted pnpm copy");
+
+    let envelope = parse_json(&result.1, "verify --installed");
+    let installed: Vec<&serde_json::Value> = envelope["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"].as_str() == Some("DRIFT_INSTALLED"))
+        .collect();
+    let paths: Vec<&str> = installed
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
     assert!(
-        result
-            .2
-            .contains("warning: --installed not yet implemented"),
-        "stderr: {:?}",
-        result.2
+        paths.contains(&"dist/index.js"),
+        "installed bytes differ from the manifest; paths={paths:?}"
+    );
+    assert!(
+        paths.contains(&"not-in-manifest.txt"),
+        "installed file missing from the manifest; paths={paths:?}"
+    );
+    assert_eq!(installed[0]["package"].as_str(), Some("fakepkg@1.0.0"));
+
+    // A file absent from the installed copy must NOT be reported (§5): the copy
+    // is allowed to be a subset of the manifest.
+    assert!(
+        !paths.contains(&"missing.js"),
+        "absent-from-copy files must not be flagged; paths={paths:?}"
     );
 }
 
@@ -536,19 +590,22 @@ fn verify_installed_without_node_modules_only_warns() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn verify_on_uninitialized_directory_exits_1() {
+fn verify_on_uninitialized_directory_exits_2() {
     let dir = TempDir::new("verify-uninitialized");
     write_package_json(dir.path());
 
-    // SPEC: écart (§8.0/§8.1) — a missing own.toml is the NOT_INITIALIZED
-    // precondition and must exit 2. The implementation reports
-    // "NOT_INITIALIZED or IO_ERROR: own.toml: ..." and the error-code mapper
-    // splits on ':' so the prefix never matches: observed exit 1.
+    // §8.0/§8.1: a missing own.toml is the NOT_INITIALIZED precondition → exit 2
+    // with the catalogued identifier (not a generic IO_ERROR).
     let result = own(dir.path(), &["verify"]);
-    assert_exit(&result, 1, "verify on uninitialized directory");
+    assert_exit(&result, 2, "verify on uninitialized directory");
     assert!(
         result.2.contains("NOT_INITIALIZED"),
         "stderr: {:?}",
+        result.2
+    );
+    assert!(
+        result.2.contains("own.toml"),
+        "the message must name the missing file: {:?}",
         result.2
     );
 }
@@ -558,8 +615,9 @@ fn read_commands_on_uninitialized_directory_exit_2() {
     let dir = TempDir::new("uninitialized-commands");
     write_package_json(dir.path());
 
-    // SPEC: écart (§8.0) — these commands surface `IO_ERROR` (exit 2) instead of
-    // the catalogued `NOT_INITIALIZED` identifier; the exit code matches §8.0.
+    // §8.0: every command that needs project state fails the NOT_INITIALIZED
+    // precondition (exit 2) with the catalogued identifier — never a bare
+    // IO_ERROR, and never exit 1.
     let cases: &[&[&str]] = &[
         &["ci"],
         &["licenses"],
@@ -567,18 +625,16 @@ fn read_commands_on_uninitialized_directory_exit_2() {
         &["migrate"],
         &["slice"],
         &["sbom"],
+        &["diff", "a@1.0.0", "a@1.0.1"],
+        &["eject", "--adopt", "--yes"],
+        &["check"],
     ];
     for args in cases {
         let result = own(dir.path(), args);
         assert_exit(&result, 2, &format!("own {args:?} uninitialized"));
         assert!(
-            result.2.contains("IO_ERROR"),
-            "own {args:?}: expected IO_ERROR, stderr={:?}",
-            result.2
-        );
-        assert!(
-            !result.2.contains("NOT_INITIALIZED"),
-            "own {args:?}: observed IO_ERROR, not NOT_INITIALIZED: {:?}",
+            result.2.contains("NOT_INITIALIZED"),
+            "own {args:?}: expected NOT_INITIALIZED, stderr={:?}",
             result.2
         );
     }
@@ -733,7 +789,7 @@ fn policy_sync_recomputes_license_policy_digest() {
     assert_ne!(config, edited, "fixture: default allow list not found");
     write(dir.path(), "own.toml", &edited);
 
-    let stale = own(dir.path(), &["verify"]);
+    let stale = own(dir.path(), &["verify", "--format", "json"]);
     assert_exit(&stale, 1, "verify after own.toml edit");
     let envelope = parse_json(&stale.1, "verify after policy edit");
     let codes = finding_codes(&envelope);
@@ -941,21 +997,16 @@ fn sbom_cyclonedx_on_empty_lock_is_valid() {
 fn sbom_vex_on_empty_lock_is_valid() {
     let dir = init_project("sbom-vex");
 
-    // SPEC: écart (§8.3) — the spec makes --output optional ("sortie sur stdout
-    // si pas de --output"); the implementation requires an output path for
-    // --format vex and exits 2 with USAGE_ERROR.
-    let missing_output = own(dir.path(), &["sbom", "--format", "vex"]);
-    assert_exit(&missing_output, 2, "sbom --format vex without --output");
-    assert!(
-        missing_output.2.contains("USAGE_ERROR"),
-        "stderr: {:?}",
-        missing_output.2
+    // §8.3: `--output` is optional — without it the document goes to stdout
+    // (covered by `sbom_vex_without_output_prints_to_stdout`).
+    let missing_output = run_own(
+        dir.path(),
+        &[("OWN_NOW", FIXED_NOW)],
+        &["sbom", "--format", "vex"],
     );
-    assert!(
-        missing_output.2.contains("vex output path required"),
-        "stderr: {:?}",
-        missing_output.2
-    );
+    assert_exit(&missing_output, 0, "sbom --format vex without --output");
+    let stdout_doc = parse_json(&missing_output.1, "openvex on stdout");
+    assert_eq!(stdout_doc["timestamp"].as_str(), Some(FIXED_NOW));
 
     let result = run_own(
         dir.path(),
@@ -1097,10 +1148,12 @@ fn usage_errors_exit_2() {
         (&["bogus-command"], "unrecognized subcommand"),
         (&["add"], "required arguments"),
         (&["sbom", "--format", "xml"], "USAGE_ERROR"),
-        // SPEC: écart (§8.0) — every command must accept --format human|json;
-        // `verify` does not declare it and clap rejects it as an unknown flag.
-        (&["verify", "--format", "json"], "unexpected argument"),
-        (&["verify", "--format", "bogus"], "unexpected argument"),
+        // §8.0: an unknown `--format` value is a usage error on every command
+        // that accepts the flag — never silently ignored.
+        (&["verify", "--format", "bogus"], "USAGE_ERROR"),
+        (&["check", "--format", "xml"], "USAGE_ERROR"),
+        (&["slice", "--format", "xml"], "USAGE_ERROR"),
+        (&["ci", "--format", "xml"], "USAGE_ERROR"),
     ];
     for (args, needle) in cases {
         let result = own(dir.path(), args);
@@ -1111,17 +1164,71 @@ fn usage_errors_exit_2() {
             result.2
         );
     }
+}
 
-    // SPEC: écart (§8.0) — unlike `sbom`, `check` does not validate --format:
-    // an unknown value silently falls back to the human output (exit 0).
-    let check = own(
-        dir.path(),
-        &["check", "--allow-missing-osv", "--format", "xml"],
+#[test]
+fn verify_json_format_emits_the_common_envelope() {
+    let dir = init_project("verify-json");
+
+    let result = own(dir.path(), &["verify", "--format", "json"]);
+    assert_exit(&result, 0, "verify --format json");
+    assert!(result.2.is_empty(), "stderr: {:?}", result.2);
+
+    let envelope = parse_json(&result.1, "verify --format json");
+    assert_eq!(envelope["schema_version"].as_u64(), Some(1));
+    assert_eq!(envelope["command"].as_str(), Some("verify"));
+    assert_eq!(envelope["status"].as_str(), Some("ok"));
+    assert_eq!(envelope["exit_code"].as_u64(), Some(0));
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn sbom_vex_without_output_prints_to_stdout() {
+    let dir = init_project("sbom-vex-stdout");
+
+    // §8.3: `--output` is optional; without it the document goes to stdout.
+    let result = own(dir.path(), &["sbom", "--format", "vex"]);
+    assert_exit(&result, 0, "sbom --format vex without --output");
+    assert!(result.2.is_empty(), "stderr: {:?}", result.2);
+
+    let doc = parse_json(&result.1, "openvex on stdout");
+    assert_eq!(
+        doc["@context"].as_str(),
+        Some("https://openvex.dev/ns/v0.2.0")
     );
-    assert_exit(&check, 0, "check --format xml");
+    assert_eq!(doc["version"].as_u64(), Some(1));
+}
+
+#[test]
+fn licenses_table_includes_the_hash_column() {
+    let dir = init_project("licenses-hash");
+
+    // §8.1: Package | Version | SPDX | Policy | licence files | Hash
+    let result = own(dir.path(), &["licenses"]);
+    assert_exit(&result, 0, "licenses");
+    let header = result.1.lines().next().unwrap_or_default();
+    for column in ["Package", "Version", "SPDX", "Policy", "Files", "Hash"] {
+        assert!(header.contains(column), "header={header:?}");
+    }
+}
+
+#[test]
+fn init_is_transactional_and_leaves_no_journal_behind() {
+    let dir = TempDir::new("init-transactional");
+    write_package_json(dir.path());
+
+    let result = own(dir.path(), &["init"]);
+    assert_exit(&result, 0, "init");
+
+    // INV-9/§8.0: `init` writes project state, so it takes the lock and journals
+    // its work. A successful run commits and removes its transaction directory.
     assert!(
-        check.1.contains("ok: no E0 alerts"),
-        "invalid --format silently ignored; stdout={:?}",
-        check.1
+        dir.join(".own/lock").is_file(),
+        "init must create .own/lock (INV-9)"
+    );
+    let leftover_count = fs::read_dir(dir.join(".own/txn")).unwrap().count();
+    assert_eq!(
+        leftover_count, 0,
+        "a committed init must leave no transaction directory behind"
     );
 }

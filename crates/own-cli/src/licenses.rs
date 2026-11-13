@@ -86,20 +86,21 @@ pub fn licenses(root: &Path, write: bool) -> Result<u8, String> {
                 _ => return Err("LICENSES_MD_STALE".to_string()),
             }
         }
-        // print table
+        // print table (§8.1: Package | Version | SPDX | Policy | licence files | Hash)
         let header = format!(
-            "{:<28} {:<10} {:<12} {:<8} {}",
-            "Package", "Version", "SPDX", "Policy", "Files"
+            "{:<28} {:<10} {:<12} {:<8} {:<6} {}",
+            "Package", "Version", "SPDX", "Policy", "Files", "Hash"
         );
         println!("{header}");
         for p in &lock.packages {
             println!(
-                "{:<28} {:<10} {:<12} {:<8} {}",
+                "{:<28} {:<10} {:<12} {:<8} {:<6} {}",
                 p.name,
                 p.version,
                 p.license_expression,
                 p.license_policy,
-                p.license_files.len()
+                p.license_files.len(),
+                short_hash(&p.package_files_sha256)
             );
         }
         return Ok(0);
@@ -208,6 +209,14 @@ pub fn migrate(root: &Path) -> Result<u8, String> {
         lock.metadata.schema_version
     );
     Ok(0)
+}
+
+/// `sha256:<12 hex chars>` — the lock stores the full digest; the table shows a
+/// stable, comparable prefix so the column stays readable (SPEC §8.1).
+fn short_hash(s: &str) -> String {
+    let h = s.strip_prefix("sha256:").unwrap_or(s);
+    let n = h.len().min(12);
+    format!("sha256:{}", &h[..n])
 }
 
 fn read_overrides(root: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
