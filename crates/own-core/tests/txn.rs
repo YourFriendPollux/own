@@ -184,6 +184,161 @@ fn stale_started_journal_is_recovered_by_next_writer() {
     );
 }
 
+/// Child-process helper for the signal tests below. It returns immediately
+/// unless the parent set `OWN_TXN_SIGNAL_CHILD`, so the normal suite only sees
+/// a no-op test. The parent re-executes this same test binary with `--exact`
+/// and the env var, so the child opens a real transaction, modifies a file,
+/// prints READY, then blocks until it is signalled.
+#[test]
+fn txn_signal_child_helper() {
+    let Ok(root) = std::env::var("OWN_TXN_SIGNAL_CHILD") else {
+        return;
+    };
+    let txn = Txn::begin(Path::new(&root)).unwrap();
+    txn.write_file("file.txt", b"interrupted\n").unwrap();
+    use std::io::Write as _;
+    println!("READY");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+struct SignalChild {
+    child: std::process::Child,
+    // kept open on purpose: closing the read end would SIGPIPE the child
+    _out: std::process::ChildStdout,
+    err: std::process::ChildStderr,
+}
+
+/// Spawn `txn_signal_child_helper` in a child process and wait until it prints
+/// READY (so the transaction is live and the journal is on disk).
+fn spawn_signal_child(root: &Path) -> SignalChild {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "txn_signal_child_helper",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("OWN_TXN_SIGNAL_CHILD", root.to_str().unwrap())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let err = child.stderr.take().unwrap();
+    use std::io::Read;
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = out.read(&mut buf).expect("child stdout");
+        assert!(n > 0, "child exited before READY");
+        seen.extend_from_slice(&buf[..n]);
+        if seen.windows(5).any(|w| w == b"READY") {
+            break;
+        }
+    }
+    SignalChild {
+        child,
+        _out: out,
+        err,
+    }
+}
+
+/// Signal the child and return (exit code, stderr). The exit code proves the
+/// async-signal-safe handler ran: `_exit(128 + signal)` instead of the default
+/// disposition (which would report no code at all).
+fn signal_and_collect(mut c: SignalChild, sig: i32) -> (i32, String) {
+    unsafe { libc::kill(c.child.id() as i32, sig) };
+    let status = c.child.wait().unwrap();
+    let code = status
+        .code()
+        .expect("signal handler must _exit(128+sig), not die by default disposition");
+    use std::io::Read;
+    let mut errs = String::new();
+    let mut err = c.err;
+    err.read_to_string(&mut errs).unwrap();
+    (code, errs)
+}
+
+fn journal_state(root: &Path) -> String {
+    let txn_root = root.join(".own/txn");
+    let dir = fs::read_dir(&txn_root)
+        .unwrap()
+        .next()
+        .expect("a journal directory")
+        .unwrap()
+        .path();
+    let raw = fs::read_to_string(dir.join("journal.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v["state"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn sigterm_leaves_started_journal_that_next_writer_restores() {
+    let t = fresh_root();
+    let c = spawn_signal_child(t.path());
+    let (code, errs) = signal_and_collect(c, libc::SIGTERM);
+    assert_eq!(code, 143, "SIGTERM must exit 128+15, stderr: {errs}");
+    assert!(errs.contains("SIGTERM"), "handler message missing: {errs}");
+    // the handler touches nothing: the modified file stays and the journal is
+    // still `started`, which is what makes the next writer restore it
+    assert_eq!(
+        fs::read_to_string(t.path().join("file.txt")).unwrap(),
+        "interrupted\n"
+    );
+    assert_eq!(journal_state(t.path()), "started");
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(
+        fs::read_to_string(t.path().join("file.txt")).unwrap(),
+        "original\n",
+        "the next writing command must restore the backup"
+    );
+}
+
+#[test]
+fn sigint_leaves_started_journal_that_next_writer_restores() {
+    let t = fresh_root();
+    let c = spawn_signal_child(t.path());
+    let (code, errs) = signal_and_collect(c, libc::SIGINT);
+    assert_eq!(code, 130, "SIGINT must exit 128+2, stderr: {errs}");
+    assert!(errs.contains("SIGINT"), "handler message missing: {errs}");
+    assert_eq!(journal_state(t.path()), "started");
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.commit().unwrap();
+    assert_eq!(
+        fs::read_to_string(t.path().join("file.txt")).unwrap(),
+        "original\n"
+    );
+}
+
+#[test]
+fn write_file_publishes_only_synced_content() {
+    // INV-9 durability: `write_file` fsyncs the temporary before the rename and
+    // the parent directory after it. We cannot drop the power on the test
+    // machine, so this asserts the observable part: the published file is the
+    // journal-backed content and the journal records the backup entry that a
+    // recovery would need (i.e. the ordering backup -> journal -> rename held).
+    let t = fresh_root();
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.write_file("sub/dir/file.txt", b"new\n").unwrap();
+    let raw = fs::read_to_string(txn.txn_dir.join("journal.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["state"], "started");
+    assert_eq!(
+        v["backup_files"].as_array().unwrap().len(),
+        1,
+        "every write must be preceded by a durable backup entry"
+    );
+    txn.commit().unwrap();
+    assert_eq!(
+        fs::read_to_string(t.path().join("sub/dir/file.txt")).unwrap(),
+        "new\n"
+    );
+}
+
 #[test]
 fn kill9_recovery_in_child_process() {
     // child starts a txn, writes, then gets SIGKILL; parent then begins a new txn

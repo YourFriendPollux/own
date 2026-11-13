@@ -7,7 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Provenance detection (§8.1 step 4, partial)**: `own add` and `own update`
+  now evaluate what the registry advertises through a single, tested
+  `evaluate_provenance` (npm attestations, registry signatures) and report it as
+  `W_PROVENANCE_UNVERIFIED` instead of silently dropping the information. The
+  lock keeps `provenance_level = "integrity-only"`: `attested` and
+  `registry-signed` are never written without the matching verification
+  (INV-7). 4 unit tests in `own-cli`.
+- **CLI integration tests**: `crates/own-cli/tests/cli.rs`, 23 offline tests
+  driving the real binary — `init` (layout, `.gitignore`/`.gitattributes`,
+  `ALREADY_INITIALIZED`, `--root`), `verify` (clean/deterministic, drift codes,
+  `--installed` warning), uninitialized-directory paths, `ci`, `licenses`,
+  `policy-sync`, `migrate`, `check` (`OSV_MISSING`), `slice`, `sbom`
+  (CycloneDX/OpenVEX + determinism), `eject`, JSON envelope and §8.0 exit codes.
+- `.gitignore` now ignores `/fuzz/target/` (cargo-fuzz has its own workspace;
+  those artifacts had been committed before the history rewrite).
+
 ### Fixed
+- **Signal handling (INV-9)**: the SIGINT/SIGTERM handler is now
+  async-signal-safe — it only calls `write(2)` and `_exit(128+signal)`. It no
+  longer takes the active-transaction mutex, reads the journal or copies files
+  from inside the handler (a signal could interrupt the thread holding that
+  mutex, and none of those calls are in POSIX's async-signal-safe list). An
+  interrupted run leaves the journal `started` and the **next writing command**
+  restores the backup and emits `W_TXN_RECOVERED`, the same path as `kill -9`.
+  New tests `sigterm_leaves_started_journal_that_next_writer_restores` and
+  `sigint_leaves_started_journal_that_next_writer_restores` assert the exit code
+  (143/130), the handler message and the recovery.
+- **Durability (INV-9)**: every journal write, every backup file and every
+  `rename` is now `fsync`ed (file, then parent directory) *before* the work it
+  protects is considered done, so the journal survives a power loss and not only
+  `kill -9`. The ordering enforced is backup durable → journal entry durable →
+  rename → directory sync, in `begin`/`backup`/`write_file`/`move_dir_into`/
+  `commit`/`rollback` (recursive `sync_tree` for prepared trees).
+- **rust-toolchain.toml** was malformed (`channel` without the `[toolchain]`
+  table), so *every* `cargo`/`rustup` invocation inside the repository failed
+  with ``missing field `toolchain` ``. It now declares
+  `[toolchain] channel = "1.99.1"` + `rustfmt`/`clippy`.
 - **Transactions (INV-9)**: `Txn::begin` now takes the exclusive lock **before**
   scanning/recovering journals, so a concurrent `own` gets `LOCK_BUSY` instead of
   rolling back the active transaction. New regression test
@@ -47,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `fuzz/corpus/` (3 449 generated libFuzzer artifacts, ~14 MB) is untracked and
   gitignored; regenerate with `cargo +nightly fuzz run <target>`.
-- README updated: real test count (79), corpus size (250), known limits section,
+- README updated: real test count (110), corpus size (250), known limits section,
   note that SPEC.md/docs are not in the published archive.
 
 ## [0.1.0] - 2026-11-10

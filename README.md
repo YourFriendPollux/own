@@ -38,7 +38,7 @@ own-verify                                # minimal offline verifier (no network
 - **INV-1** byte identity with the published tarball; `own` never writes inside `vendor/own/<dir>/`
 - **INV-2/3** registry URL + SRI sha512 + tarball sha256 verified *before* extraction; extraction reads the verified cache fd (no TOCTOU)
 - **INV-8** `own verify` is fully offline and depends only on disk state
-- **INV-9** every writing command is transactional: the exclusive lock is taken **before** any journal recovery, so a concurrent `own` gets `LOCK_BUSY` instead of rolling back the active transaction; crash recovery (`kill -9`) restores `started` journals on the next writer
+- **INV-9** every writing command is transactional: the exclusive lock is taken **before** any journal recovery, so a concurrent `own` gets `LOCK_BUSY` instead of rolling back the active transaction. The journal, the backups and every `rename` are `fsync`ed (file + parent directory) before the work they protect, so recovery also survives a power loss, not just `kill -9`. SIGINT/SIGTERM leave the journal `started` and the next writing command restores it (`W_TXN_RECOVERED`): the handler is async-signal-safe and touches nothing.
 - **INV-10** byte-reproducible outputs; inject the clock with `OWN_NOW` (RFC 3339 UTC)
 - Golden hash vectors from SPEC §7.3 are unit tests in `own-core`
 
@@ -63,7 +63,7 @@ maintainer) until an org team exists.
 
 ## Quality gates (CI)
 
-`cargo fmt --check` · `clippy -D warnings` · `cargo test` (79 tests) ·
+`cargo fmt --check` · `clippy -D warnings` · `cargo test` (110 tests) ·
 `cargo deny check` · `cargo vet --locked` · fuzz smoke (4 targets, cargo-fuzz installed in CI) ·
 determinism check (INV-10, on a real vendored package). Measured `own ci`: **16 ms release / 145 ms debug**
 on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
@@ -74,11 +74,19 @@ on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
   is only in `own verify --installed`.
 - Integrity anchoring is local (lock + manifests in the same repo): `own verify`
   detects drift, not a malicious commit that updates everything at once.
-- The transaction signal handler is best-effort (async-signal-safety is not
-  guaranteed); durability against power loss relies on the filesystem, fsync is
-  not yet performed on every write.
+- **Provenance is detected, not verified**: when a version ships npm attestations
+  (Sigstore) or a registry ECDSA signature, `own add`/`own update` say so
+  explicitly (`W_PROVENANCE_UNVERIFIED`) and the lock keeps
+  `provenance_level = "integrity-only"` — it never claims `attested` or
+  `registry-signed` without having verified the signature (spec §8.1 step 4 is
+  not implemented yet; INV-7 forbids the shortcut).
+- Interrupting a run (Ctrl-C, SIGTERM) does **not** roll back immediately: the
+  process exits 130/143 and the next writing command restores the backup. This
+  is deliberate — rolling back from a signal handler is not async-signal-safe.
 - `cargo vet` currently ships exemptions only (no audits/imports yet) — the gate
   is structural, not yet a real review.
+- Toolchain: `rust-toolchain.toml` pins Rust 1.99.1 (`rustfmt` + `clippy`). The
+  MSRV is not declared in `Cargo.toml` yet and no MSRV job runs in CI.
 
 ## Status
 

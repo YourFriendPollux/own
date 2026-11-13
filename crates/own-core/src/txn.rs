@@ -1,9 +1,21 @@
 //! Transactions (SPEC §8.0, INV-9): every writing command takes the exclusive
 //! file lock `.own/lock` (LOCK_BUSY if taken, no waiting), journals its work in
 //! `.own/txn/<id>/journal.json`, backs up anything it will modify, writes via
-//! `.own/tmp/` + rename, and rolls back on failure, SIGINT or SIGTERM. A journal
-//! left in `started` state (crash / kill -9) is restored by the next writing
-//! command, which then emits `W_TXN_RECOVERED`.
+//! `.own/tmp/` + rename, and rolls back on failure.
+//!
+//! Durability: every journal write, every backup file and every `rename` is
+//! `fsync`ed (file, then parent directory) *before* the work it protects is
+//! considered done. The journal therefore survives a power loss, not only
+//! `kill -9`: the recovery path never depends on data that is still in the page
+//! cache.
+//!
+//! Signals: the SIGINT/SIGTERM handler is async-signal-safe — it only calls
+//! `write(2)` and `_exit(2)`. It never takes a mutex, reads the journal or
+//! touches the filesystem, because a signal can interrupt the very thread that
+//! holds those locks (deadlock) and none of those calls are in POSIX's
+//! async-signal-safe list. An interrupted run therefore leaves the journal in
+//! `started` state, and the next writing command restores the backup and emits
+//! `W_TXN_RECOVERED` — the same path as a crash or `kill -9`.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -31,17 +43,31 @@ static SIG_HANDLER: OnceLock<()> = OnceLock::new();
 
 fn install_signal_handler() {
     SIG_HANDLER.get_or_init(|| {
-        // minimal SIGINT/SIGTERM handler: on signal, best-effort rollback of the
-        // active txn then re-raise. We keep a global registry of the active txn dir.
-        unsafe {
-            extern "C" fn handler(_sig: i32) {
-                if let Some(dir) = active_txn().lock().unwrap().clone() {
-                    let _ = rollback_dir(&dir);
-                }
-                std::process::exit(130);
+        // Async-signal-safe handler (INV-9 / SPEC §8.0). Everything except
+        // `write(2)` and `_exit(2)` is forbidden here: the signal may interrupt
+        // the thread that holds the active-txn mutex (deadlock) or the one
+        // mid-`rename`, and `read`/`open`/`copy`/`remove_dir_all` are not in
+        // POSIX's async-signal-safe list. So we do NOT roll back here — we
+        // leave the journal in `started` state (already on stable storage) and
+        // exit with the conventional 128+signal. The next writing command
+        // restores the backup under the lock and emits `W_TXN_RECOVERED`.
+        unsafe extern "C" fn handler(sig: i32) {
+            let msg: &[u8] = match sig {
+                libc::SIGINT => b"own: interrupted (SIGINT): transaction journal left in `started` state; the next writing command restores the backup\n",
+                _ => b"own: interrupted (SIGTERM): transaction journal left in `started` state; the next writing command restores the backup\n",
+            };
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                libc::_exit(128 + sig);
             }
-            libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        }
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as *const () as libc::sighandler_t;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
         }
     });
 }
@@ -92,8 +118,17 @@ fn rollback_dir(txn_dir: &Path) -> std::io::Result<()> {
                     fs::create_dir_all(parent)?;
                 }
                 fs::copy(&src, &dst)?;
+                // the restored bytes are what a later `verify` will read: make
+                // them durable before the journal is dropped
+                sync_path(&dst)?;
+                if let Some(parent) = dst.parent() {
+                    sync_dir(parent)?;
+                }
             } else {
                 let _ = fs::remove_file(&dst);
+                if let Some(parent) = dst.parent() {
+                    sync_dir(parent)?;
+                }
             }
         }
     }
@@ -101,7 +136,11 @@ fn rollback_dir(txn_dir: &Path) -> std::io::Result<()> {
     if let Some(dirs) = v["created_dirs"].as_array() {
         for d in dirs {
             if let Some(rel) = d.as_str() {
-                let _ = fs::remove_dir_all(root.join(rel));
+                let p = root.join(rel);
+                let _ = fs::remove_dir_all(&p);
+                if let Some(parent) = p.parent() {
+                    sync_dir(parent)?;
+                }
             }
         }
     }
@@ -117,6 +156,10 @@ impl Txn {
         let own = root.join(".own");
         fs::create_dir_all(own.join("tmp")).map_err(|e| format!("IO_ERROR: {e}"))?;
         fs::create_dir_all(own.join("txn")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        // make the new directory entries themselves durable (best effort: the
+        // strict fsync point is the journal write below)
+        let _ = sync_dir(&own);
+        let _ = sync_dir(&own.join("txn"));
         // exclusive lock — taken before any journal inspection
         let lock_path = own.join("lock");
         #[cfg(unix)]
@@ -199,13 +242,17 @@ impl Txn {
         let dst = self.txn_dir.join("backup").join(&flat);
         if src.is_dir() {
             copy_dir(&src, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
+            sync_tree(&dst).map_err(|e| format!("IO_ERROR: {e}"))?;
         } else if src.exists() {
             if let Some(p) = dst.parent() {
                 fs::create_dir_all(p).map_err(|e| format!("IO_ERROR: {e}"))?;
             }
             fs::copy(&src, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
+            sync_path(&dst).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
-        // journal stores the ORIGINAL relative path alongside the flat name
+        // journal stores the ORIGINAL relative path alongside the flat name.
+        // It is written (and fsynced) only after the backup itself is durable:
+        // recovery must never point at a backup that is not on disk yet.
         let mut j = read_journal(&self.txn_dir)?;
         j["backup_files"]
             .as_array_mut()
@@ -230,12 +277,18 @@ impl Txn {
         {
             let mut f = File::create(&tmp).map_err(|e| format!("IO_ERROR: {e}"))?;
             f.write_all(content).map_err(|e| format!("IO_ERROR: {e}"))?;
+            // the temporary must be durable before the rename publishes it
+            f.sync_all().map_err(|e| format!("IO_ERROR: {e}"))?;
         }
         let dst = self.root.join(rel);
         if let Some(p) = dst.parent() {
             fs::create_dir_all(p).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
         fs::rename(&tmp, &dst).map_err(|e| format!("IO_ERROR: rename across filesystems: {e}"))?;
+        // the rename itself is durable only once its parent directory is synced
+        if let Some(p) = dst.parent() {
+            sync_dir(p).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
         Ok(())
     }
 
@@ -249,7 +302,12 @@ impl Txn {
         if let Some(p) = dst.parent() {
             fs::create_dir_all(p).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
+        // the prepared tree must be on stable storage before it is published
+        sync_tree(src_abs).map_err(|e| format!("IO_ERROR: {e}"))?;
         fs::rename(src_abs, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
+        if let Some(p) = dst.parent() {
+            sync_dir(p).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
         self.note_created_dir(rel)?;
         Ok(())
     }
@@ -259,14 +317,22 @@ impl Txn {
         j["state"] = serde_json::Value::String("committed".to_string());
         write_journal(&self.txn_dir, &j)?;
         *active_txn().lock().unwrap() = None;
+        let parent = self.txn_dir.parent().map(|p| p.to_path_buf());
         fs::remove_dir_all(&self.txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+        if let Some(p) = parent {
+            sync_dir(&p).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
         Ok(())
     }
 
     pub fn rollback(&self) -> Result<(), String> {
         rollback_dir(&self.txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
         *active_txn().lock().unwrap() = None;
+        let parent = self.txn_dir.parent().map(|p| p.to_path_buf());
         let _ = fs::remove_dir_all(&self.txn_dir);
+        if let Some(p) = parent {
+            sync_dir(&p).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
         Ok(())
     }
 }
@@ -279,10 +345,54 @@ fn read_journal(txn_dir: &Path) -> Result<serde_json::Value, String> {
 
 fn write_journal(txn_dir: &Path, j: &serde_json::Value) -> Result<(), String> {
     let c = serde_json::to_string(j).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let mut f = File::create(txn_dir.join("journal.json")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let path = txn_dir.join("journal.json");
+    let mut f = File::create(&path).map_err(|e| format!("IO_ERROR: {e}"))?;
     f.write_all(c.as_bytes())
         .map_err(|e| format!("IO_ERROR: {e}"))?;
+    // Durability (INV-9): the journal must be on stable storage before the work
+    // it describes starts. Without this fsync a power loss can leave a modified
+    // working tree with a journal that never made it to disk.
+    f.sync_all().map_err(|e| format!("IO_ERROR: {e}"))?;
+    drop(f);
+    sync_dir(txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
     Ok(())
+}
+
+/// `fsync` a file so that its bytes are on stable storage.
+fn sync_path(p: &Path) -> std::io::Result<()> {
+    File::open(p)?.sync_all()
+}
+
+/// `fsync` a directory so that creations, renames and removals inside it are
+/// durable (`fsync` on a directory is a no-op on platforms that refuse to open
+/// one, e.g. Windows).
+fn sync_dir(p: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(p)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        Ok(())
+    }
+}
+
+/// `fsync` every regular file of a tree, depth first, then the directories.
+/// Used before a prepared tree is renamed into place or is recorded as the
+/// rollback copy of an existing tree.
+fn sync_tree(dir: &Path) -> std::io::Result<()> {
+    for e in fs::read_dir(dir)? {
+        let e = e?;
+        let ty = e.file_type()?;
+        if ty.is_dir() {
+            sync_tree(&e.path())?;
+            sync_dir(&e.path())?;
+        } else if ty.is_file() {
+            sync_path(&e.path())?;
+        }
+    }
+    sync_dir(dir)
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {

@@ -81,6 +81,11 @@ pub fn update(root: &Path, args: &UpdateArgs) -> Result<u8, String> {
     let dl = fetch_tarball(&client, &cfg, &tarball_url)?;
     let sha512_hex = verify_sri_integrity(&integrity, &dl.bytes)?;
     let vm_hash = crate::add::version_manifest_hash_pub(vobj)?;
+    // provenance §8.1 step 4: detection only, same evaluator as `add`
+    let prov = crate::add::evaluate_provenance(vobj);
+    for w in &prov.warnings {
+        eprintln!("warning: {w}");
+    }
 
     // eligibility on new version
     let vendored: Vec<(String, String)> = lock
@@ -144,6 +149,7 @@ pub fn update(root: &Path, args: &UpdateArgs) -> Result<u8, String> {
         license_policy,
         selected,
         &expr,
+        &prov,
     );
     match res {
         Ok((new_lock, report)) => {
@@ -226,6 +232,7 @@ fn update_inner(
     license_policy: &str,
     license_selected: Option<String>,
     license_expression: &str,
+    prov: &crate::add::Provenance,
 ) -> Result<(Lock, crate::diff::DiffReport), String> {
     // cache
     let cache_dir = root.join(".own/cache");
@@ -315,8 +322,8 @@ fn update_inner(
         integrity: integrity.to_string(),
         tarball_sha256: tarball_sha256.to_string(),
         version_manifest_sha256: vm_hash.to_string(),
-        provenance_level: "integrity-only".into(),
-        provenance_source: None,
+        provenance_level: prov.level.clone(),
+        provenance_source: prov.source.clone(),
         mode: "verbatim".into(),
         roots: old.roots.clone(),
         dependents: old.dependents.clone(),

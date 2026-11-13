@@ -1,5 +1,7 @@
 .own/
 !vendor/own/**
 /target
+# cargo-fuzz has its own workspace: its build artifacts are not the project's
+/fuzz/target/
 # corpus libFuzzer : artefacts générés (hash-nommés), régénérables via cargo fuzz
 /fuzz/corpus/

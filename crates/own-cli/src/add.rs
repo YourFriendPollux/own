@@ -238,6 +238,11 @@ pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
     }
     // version_manifest_sha256: JCS of versions[<ver>] minus mutable fields
     let vm_hash = version_manifest_hash_pub(vobj)?;
+    // provenance §8.1 step 4: detection only, see `evaluate_provenance`
+    let prov = evaluate_provenance(vobj);
+    for w in &prov.warnings {
+        eprintln!("warning: {w}");
+    }
 
     // transaction from here on
     let txn = Txn::begin(root)?;
@@ -254,6 +259,7 @@ pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
         license_policy,
         selected,
         &expr,
+        &prov,
     );
     match res {
         Ok(new_lock) => {
@@ -324,6 +330,7 @@ fn add_inner(
     license_policy: &str,
     license_selected: Option<String>,
     license_expression: &str,
+    prov: &Provenance,
 ) -> Result<Lock, String> {
     // cache the tarball (0444, named by sha512)
     let cache_dir = root.join(".own/cache");
@@ -435,8 +442,8 @@ fn add_inner(
         integrity: integrity.to_string(),
         tarball_sha256: tarball_sha256.to_string(),
         version_manifest_sha256: vm_hash.to_string(),
-        provenance_level: "integrity-only".to_string(),
-        provenance_source: None,
+        provenance_level: prov.level.clone(),
+        provenance_source: prov.source.clone(),
         mode: "verbatim".to_string(),
         roots: vec![".".to_string()],
         dependents: vec!["importer:.".to_string()],
@@ -657,6 +664,64 @@ pub fn version_manifest_hash_pub(vobj: &serde_json::Value) -> Result<String, Str
     ))
 }
 
+/// SPEC §8.1 step 4 — provenance evaluation.
+///
+/// `own` 0.1.0 proves the registry integrity chain (SRI sha512 + tarball
+/// sha256) and nothing more: npm Sigstore attestations and registry ECDSA
+/// signatures are *detected* here but not verified in-process (no crypto stack
+/// in the TCB yet — see README "Known limits"). The lock therefore always
+/// records `integrity-only`: writing `attested` or `registry-signed` without
+/// the matching verification would be exactly the false security INV-7
+/// forbids. A package that does ship provenance is reported explicitly rather
+/// than silently downgraded (INV-5).
+pub const PROVENANCE_LEVEL_INTEGRITY_ONLY: &str = "integrity-only";
+
+#[derive(Debug, Clone)]
+pub struct Provenance {
+    /// value written to the lock's `provenance_level` (spec §7.1)
+    pub level: String,
+    /// attested repository; `None` unless an attestation was actually verified
+    pub source: Option<String>,
+    /// explicit, non-silent degradation notices (INV-5)
+    pub warnings: Vec<String>,
+}
+
+pub fn evaluate_provenance(vobj: &serde_json::Value) -> Provenance {
+    let has_attestations = match vobj.pointer("/dist/attestations") {
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::Object(m)) => !m.is_empty(),
+        Some(serde_json::Value::Null) | None => false,
+        Some(_) => true,
+    };
+    let has_registry_signature = vobj
+        .pointer("/dist/signatures")
+        .and_then(|s| s.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let mut warnings = Vec::new();
+    if has_attestations {
+        warnings.push(
+            "W_PROVENANCE_UNVERIFIED: npm attestation (Sigstore) present for this version but \
+             not verified by own 0.1.0; provenance_level stays \"integrity-only\" (README \
+             \"Known limits\")"
+                .to_string(),
+        );
+    }
+    if has_registry_signature {
+        warnings.push(
+            "W_PROVENANCE_UNVERIFIED: registry signature present for this version but not \
+             verified by own 0.1.0; provenance_level stays \"integrity-only\" (README \"Known \
+             limits\")"
+                .to_string(),
+        );
+    }
+    Provenance {
+        level: PROVENANCE_LEVEL_INTEGRITY_ONLY.to_string(),
+        source: None,
+        warnings,
+    }
+}
+
 fn str_list(v: &serde_json::Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(|a| a.as_array())
@@ -713,4 +778,50 @@ fn update_package_json(
     }
     let out = serde_json::to_string_pretty(&v).map_err(|e| format!("IO_ERROR: {e}"))?;
     txn.write_file(rel, format!("{out}\n").as_bytes())
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn plain_version_has_no_provenance_warning() {
+        let v = json!({ "name": "a", "version": "1.0.0", "dist": { "integrity": "sha512-x" } });
+        let p = evaluate_provenance(&v);
+        assert_eq!(p.level, "integrity-only");
+        assert!(p.source.is_none());
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn registry_signature_is_reported_but_never_claimed_as_verified() {
+        let v = json!({ "dist": { "signatures": [{ "keyid": "SHA256:abc", "sig": "MEUC..." }] } });
+        let p = evaluate_provenance(&v);
+        // never claim registry-signed without verifying the ECDSA signature
+        assert_eq!(p.level, "integrity-only");
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].starts_with("W_PROVENANCE_UNVERIFIED"));
+        assert!(p.warnings[0].contains("registry signature"));
+    }
+
+    #[test]
+    fn npm_attestation_is_reported_but_never_claimed_as_verified() {
+        let v = json!({ "dist": { "attestations": { "url": "https://registry.npmjs.org/-/npm/v1/attestations/a@1.0.0", "provenance": { "predicateType": "https://slsa.dev/provenance/v1" } } } });
+        let p = evaluate_provenance(&v);
+        assert_eq!(p.level, "integrity-only");
+        assert_eq!(
+            p.source, None,
+            "no attested repository may be recorded unverified"
+        );
+        assert_eq!(p.warnings.len(), 1);
+        assert!(p.warnings[0].contains("attestation"));
+    }
+
+    #[test]
+    fn empty_provenance_objects_are_not_reported() {
+        let v = json!({ "dist": { "signatures": [], "attestations": {} } });
+        let p = evaluate_provenance(&v);
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
 }
