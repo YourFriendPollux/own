@@ -1,3 +1,5 @@
 .own/
 !vendor/own/**
 /target
+# corpus libFuzzer : artefacts générés (hash-nommés), régénérables via cargo fuzz
+/fuzz/corpus/
