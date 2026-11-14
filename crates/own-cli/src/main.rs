@@ -980,6 +980,7 @@ fn main() -> ExitCode {
                 | "WORKTREE_DIRTY"
                 | "GIT_ERROR"
                 | "PNPM_UNSUPPORTED"
+                | "ECOSYSTEM_UNSUPPORTED"
                 | "PNPM_FAILED"
                 | "OSV_MISSING"
                 | "OSV_STALE"

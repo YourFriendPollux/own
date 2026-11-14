@@ -361,6 +361,17 @@ fn install_and_verify(txn: &Txn, root: &Path, pkg: &str, no_install: bool) -> Re
 }
 
 pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
+    // §8.1 names `--ecosystem pypi` as a Phase 2 surface; nothing implements it
+    // yet. Refusing here keeps the npm path (and its pnpm-lock precondition) from
+    // reporting a misleading missing-file error for a package that has no
+    // pnpm-lock.yaml at all.
+    if args.ecosystem != "npm" {
+        return Err(format!(
+            "ECOSYSTEM_UNSUPPORTED: {} vendoring is a Phase 2 surface and is not \
+             implemented; only npm is supported",
+            args.ecosystem
+        ));
+    }
     let lock_text =
         std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
     let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;

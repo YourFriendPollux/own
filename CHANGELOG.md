@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those artifacts had been committed before the history rewrite).
 
 ### Fixed
+- **`add --ecosystem pypi` failed with a pnpm-lock error instead of a refusal**:
+  the flag is documented as a Phase 2 surface, but nothing implemented it, so the
+  npm path ran and died on `IO_ERROR: pnpm-lock.yaml: No such file or directory`
+  — a file a Python package never has. `add` now returns `ECOSYSTEM_UNSUPPORTED`
+  (exit 2, "pypi vendoring is a Phase 2 surface and is not implemented") before
+  reading any lock; test `add_refuses_pypi_with_a_clear_code_inv4`.
 - **`check --format json` hid its own failure**: the envelope said
   `"status": "findings"` with `"exit_code": 1` while `findings` was a hardcoded
   empty array — everything lived in `data.alerts`, so any consumer reading the

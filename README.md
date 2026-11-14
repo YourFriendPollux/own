@@ -159,8 +159,13 @@ Phase 1 (slicing) still requires the §4 gate (>= 70% code reduction on the
 corpus). Phase 2 surfaces are present: E1/E2 reachability evidence
 (`own check --e1/--e2`, Annexes G/H) and `vendor-all` resolution from
 `pnpm-lock.yaml`; their presence does not certify the full phase's acceptance
-criteria. Python vendoring is not implemented end to end. The referenced
-Annexes G/H are not present in the supplied normative source; the phase-2
+criteria. On the four real advisories that affect lodash 4.17.20 — none of which
+carry file or function hints — `--e1` and `--e2` keep every alert at E0, so the
+conservative rule holds and no downgrade is invented from missing information.
+Python vendoring is not implemented: `own add --ecosystem pypi` refuses with
+`ECOSYSTEM_UNSUPPORTED` (exit 2) rather than failing on a pnpm lock that a Python
+package never has. The referenced Annexes G/H are not present in the supplied
+normative source, and the source itself covers only Phase 0; the phase-2
 validation contract must therefore state these extensions and their proofs
 explicitly rather than claiming annex conformance.
 

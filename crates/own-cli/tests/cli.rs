@@ -887,6 +887,31 @@ fn migrate_on_schema_version_1_is_a_no_op() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn add_refuses_pypi_with_a_clear_code_inv4() {
+    let dir = init_project("add-pypi");
+    // No pnpm-lock.yaml here on purpose: a Python package has none, so the npm
+    // path used to fail with a misleading IO_ERROR about that file.
+    let result = own(dir.path(), &["add", "six@1.16.0", "--ecosystem", "pypi"]);
+    assert_exit(&result, 2, "add --ecosystem pypi");
+    assert!(
+        result.2.contains("ECOSYSTEM_UNSUPPORTED"),
+        "stderr: {:?}",
+        result.2
+    );
+    assert!(
+        result.2.contains("Phase 2"),
+        "the refusal must name the phase: {:?}",
+        result.2
+    );
+    assert!(
+        !result.2.contains("pnpm-lock.yaml"),
+        "a Python package has no pnpm-lock: {:?}",
+        result.2
+    );
+    assert!(!dir.path().join("vendor/own/six@1.16.0").exists());
+}
+
+#[test]
 fn check_without_osv_json_fails_osv_missing() {
     let dir = init_project("check-missing-osv");
     assert!(!dir.join(".own/osv.json").exists());
