@@ -351,11 +351,13 @@ pub fn verify(
         }
     }
 
-    // overrides == lock packages.
-    // vendor-all (Phase 2 §9.2): several versions of one package cannot be
-    // expressed as a single file: override in pnpm.overrides — the package is
-    // then expected to be ABSENT from overrides, so compare only packages that
-    // appear exactly once in the lock.
+    // overrides == lock packages, one key per vendored package *version*.
+    // vendor-all (Phase 2 §9.2): several versions of one name cannot be
+    // expressed by a single bare `file:` override — that key would pin every
+    // version to one directory — so each version carries the `name@version` key
+    // pnpm applies per resolved version. A bare key for a multi-version name is
+    // therefore a mismatch, not something to skip: skipping it is what left
+    // vendor-all packages unverified.
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for p in &lock.packages {
         *counts.entry(p.name.as_str()).or_insert(0) += 1;
@@ -363,26 +365,16 @@ pub fn verify(
     let lock_overrides: serde_json::Map<String, serde_json::Value> = lock
         .packages
         .iter()
-        .filter(|p| counts.get(p.name.as_str()) == Some(&1))
-        .map(|p| (p.name.clone(), serde_json::json!(format!("file:{}", p.dir))))
+        .map(|p| {
+            let key = if counts.get(p.name.as_str()) == Some(&1) {
+                p.name.clone()
+            } else {
+                crate::lock::versioned_override_key(&p.name, &p.version)
+            };
+            (key, serde_json::json!(format!("file:{}", p.dir)))
+        })
         .collect();
-    // vendor-all packages (several lock entries, one name) may still carry a
-    // legacy single override — ignore those keys on both sides.
-    let multi: std::collections::HashSet<&str> = counts
-        .iter()
-        .filter(|(_, c)| **c > 1)
-        .map(|(n, _)| *n)
-        .collect();
-    let ov_filtered: serde_json::Map<String, serde_json::Value> = overrides
-        .iter()
-        .filter(|(k, _)| !multi.contains(k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let lock_filtered: serde_json::Map<String, serde_json::Value> = lock_overrides
-        .into_iter()
-        .filter(|(k, _)| !multi.contains(k.as_str()))
-        .collect();
-    if lock_filtered != ov_filtered {
+    if lock_overrides != *overrides {
         findings.push(Finding::err(
             "OVERRIDE_MISMATCH",
             "",
@@ -713,6 +705,150 @@ mod tests {
             out.findings
                 .iter()
                 .any(|f| f.code == "DRIFT_MODIFIED" && f.path == "dist/index.js"),
+            "{:?}",
+            out.findings
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Two versions of one name in the lock, each with its own dir and manifest,
+    /// plus the override map the lock digest is computed over.
+    fn two_version_tree(
+        tmp: &Path,
+        overrides: &serde_json::Map<String, serde_json::Value>,
+    ) -> crate::lock::Lock {
+        fs::create_dir_all(tmp.join("vendor/own/.manifests")).unwrap();
+        let mut lock = empty_lock("0.1.0", "1", &serde_json::Map::new());
+        for version in ["1.0.0", "2.0.0"] {
+            let dir = format!("vendor/own/a@{version}");
+            let pdir = make_pkg_dir(tmp, &dir);
+            let (pfs, count, size) = hash_dir(&pdir).unwrap();
+            let mut w = crate::toml_write::TomlWriter::new();
+            w.section("[manifest]")
+                .key_int("schema_version", 1)
+                .key_string("package", &format!("a@{version}"))
+                .key_string("package_files_sha256", &pfs)
+                .key_int("file_count", count)
+                .key_int("total_size", size);
+            for f in walkdir::WalkDir::new(&pdir)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+            {
+                let rel = f
+                    .path()
+                    .strip_prefix(&pdir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let data = fs::read(f.path()).unwrap();
+                w.section("[[file]]")
+                    .key_string("path", &rel)
+                    .key_string("sha256", &sha256_hex(&data))
+                    .key_int("size", data.len() as u64)
+                    .key_value("exec", "false");
+            }
+            fs::write(
+                tmp.join(format!("vendor/own/.manifests/a@{version}.toml")),
+                w.finish(),
+            )
+            .unwrap();
+            let license_hash = sha256_hex(b"MIT License\n");
+            lock.packages.push(crate::lock::Package {
+                name: "a".into(),
+                ecosystem: "npm".into(),
+                version: version.into(),
+                dir,
+                registry: "https://registry.npmjs.org".into(),
+                integrity: "sha512-x".into(),
+                tarball_sha256: "sha256:00".into(),
+                version_manifest_sha256: "sha256:00".into(),
+                provenance_level: "integrity-only".into(),
+                provenance_source: None,
+                mode: "verbatim".into(),
+                roots: vec![".".into()],
+                dependents: vec!["importer:.".into()],
+                license_expression: "MIT".into(),
+                license_selected: None,
+                license_policy: "allow".into(),
+                license_files: vec![crate::lock::LicenseFile {
+                    path: "LICENSE".into(),
+                    sha256: license_hash,
+                }],
+                package_files_sha256: pfs,
+                file_count: count,
+                total_size: size,
+                diamond_resolution: None,
+                unified_ranges: None,
+            });
+        }
+        lock.metadata.vendor_files_sha256 =
+            crate::canonical::compute_vendor_files_sha256(&lock.packages);
+        lock.metadata.lock_digest = crate::canonical::compute_lock_digest(&lock, overrides);
+        fs::write(
+            tmp.join("own.lock"),
+            crate::canonical::write_lock_canonical(&lock),
+        )
+        .unwrap();
+        lock
+    }
+
+    fn versioned_overrides() -> serde_json::Map<String, serde_json::Value> {
+        let mut ov = serde_json::Map::new();
+        ov.insert(
+            "a@1.0.0".to_string(),
+            serde_json::json!("file:vendor/own/a@1.0.0"),
+        );
+        ov.insert(
+            "a@2.0.0".to_string(),
+            serde_json::json!("file:vendor/own/a@2.0.0"),
+        );
+        ov
+    }
+
+    #[test]
+    fn override_check_covers_every_vendored_version_inv5() {
+        let tmp = std::env::temp_dir().join(format!("own-test-multi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let ov = versioned_overrides();
+        let mut lock = two_version_tree(&tmp, &ov);
+        let out = verify(&tmp, &crate::canonical::default_license_policy(), &ov).unwrap();
+        assert!(out.findings.is_empty(), "findings: {:?}", out.findings);
+
+        // A single bare override cannot express two versions: it pins both to one
+        // directory, so it must be reported instead of skipped.
+        let mut bare = serde_json::Map::new();
+        bare.insert(
+            "a".to_string(),
+            serde_json::json!("file:vendor/own/a@1.0.0"),
+        );
+        lock.metadata.lock_digest = crate::canonical::compute_lock_digest(&lock, &bare);
+        fs::write(
+            tmp.join("own.lock"),
+            crate::canonical::write_lock_canonical(&lock),
+        )
+        .unwrap();
+        let out = verify(&tmp, &crate::canonical::default_license_policy(), &bare).unwrap();
+        assert!(
+            out.findings.iter().any(|f| f.code == "OVERRIDE_MISMATCH"),
+            "{:?}",
+            out.findings
+        );
+
+        // Dropping one version's key must be caught as well.
+        let mut partial = versioned_overrides();
+        partial.remove("a@2.0.0");
+        lock.metadata.lock_digest = crate::canonical::compute_lock_digest(&lock, &partial);
+        fs::write(
+            tmp.join("own.lock"),
+            crate::canonical::write_lock_canonical(&lock),
+        )
+        .unwrap();
+        let out = verify(&tmp, &crate::canonical::default_license_policy(), &partial).unwrap();
+        assert!(
+            out.findings.iter().any(|f| f.code == "OVERRIDE_MISMATCH"),
             "{:?}",
             out.findings
         );

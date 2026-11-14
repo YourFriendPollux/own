@@ -24,14 +24,33 @@ pub struct AddArgs {
     pub allow_untested_pnpm: bool,
 }
 
-pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
+/// Everything one version needs, computed without writing anything.
+///
+/// Splitting preparation from application is what lets a multi-version run
+/// check every version before it mutates the tree: a refusal on the last
+/// version must not leave the earlier ones vendored (SPEC §9.2 vendor-all).
+pub struct Prepared {
+    pub dir: String,
+    pub tarball: Vec<u8>,
+    pub sha512_hex: String,
+    pub tarball_sha256: String,
+    pub vm_hash: String,
+    pub integrity: String,
+    pub license_policy: &'static str,
+    pub license_selected: Option<String>,
+    pub license_expression: String,
+    pub prov: Provenance,
+}
+
+/// Local, pre-network refusals for one version (SPEC §9.1/§9.2 preconditions).
+///
+/// Kept apart from the download so a multi-version run can reject every version
+/// whose local state is wrong before it fetches anything or writes anything.
+fn check_local(root: &Path, args: &AddArgs, lock: &Lock) -> Result<(), String> {
     // preconditions
     if !root.join("own.toml").exists() || !root.join("own.lock").exists() {
         return Err("NOT_INITIALIZED".to_string());
     }
-    let lock_text =
-        std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
     // vendor-all (Phase 2, §9.2) vendors several versions of the same package:
     // the duplicate check is then on (name, version), not name alone.
     let already = if args.allow_diamond.as_deref() == Some("vendor-all") {
@@ -153,7 +172,18 @@ pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
 
+fn prepare(root: &Path, args: &AddArgs, lock: &Lock) -> Result<Prepared, String> {
+    check_local(root, args, lock)?;
+    let dir = format!(
+        "vendor/own/{}",
+        own_core::lock::dir_name(&args.pkg, &args.version)
+    );
+    let pnpm_lock_text = std::fs::read_to_string(root.join("pnpm-lock.yaml"))
+        .map_err(|e| format!("IO_ERROR: pnpm-lock.yaml: {e}"))?;
+    let pnpm_lock = parse_pnpm_lock(&pnpm_lock_text)?;
     // network: packument + tarball
     let cfg = NetConfig::default();
     let client = build_client(&cfg)?;
@@ -243,71 +273,184 @@ pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
     for w in &prov.warnings {
         eprintln!("warning: {w}");
     }
+    Ok(Prepared {
+        dir,
+        tarball: dl.bytes,
+        sha512_hex,
+        tarball_sha256: dl.sha256.clone(),
+        vm_hash,
+        integrity,
+        license_policy,
+        license_selected: selected,
+        license_expression: expr,
+        prov,
+    })
+}
 
-    // transaction from here on
+/// Apply one prepared version inside `txn` and return the lock it produces.
+fn apply(
+    txn: &Txn,
+    root: &Path,
+    lock: &Lock,
+    args: &AddArgs,
+    prepared: &Prepared,
+    vendor_all: bool,
+) -> Result<Lock, String> {
+    let new_lock = add_inner(
+        txn,
+        root,
+        lock,
+        args,
+        &prepared.tarball,
+        &prepared.sha512_hex,
+        &prepared.tarball_sha256,
+        &prepared.vm_hash,
+        &prepared.integrity,
+        prepared.license_policy,
+        prepared.license_selected.clone(),
+        &prepared.license_expression,
+        &prepared.prov,
+    )?;
+    // package.json override FIRST, so the lock digest sees it (§7.3 overrides field)
+    update_package_json(
+        txn,
+        root,
+        &args.pkg,
+        &args.version,
+        &prepared.dir,
+        vendor_all,
+    )?;
+    let overrides = read_overrides_json(root)?;
+    let mut new_lock = new_lock;
+    new_lock.metadata.lock_digest = compute_lock_digest(&new_lock, &overrides);
+    let canonical = write_lock_canonical(&new_lock);
+    txn.write_file("own.lock", canonical.as_bytes())?;
+    Ok(new_lock)
+}
+
+/// pnpm install + post-install verification (SPEC §8.1 step 6).
+fn install_and_verify(txn: &Txn, root: &Path, pkg: &str, no_install: bool) -> Result<(), String> {
+    if no_install {
+        eprintln!("warning: --no-install: post-install verification not performed");
+        return Ok(());
+    }
+    let st = std::process::Command::new("pnpm")
+        .arg("install")
+        .current_dir(root)
+        .status()
+        .map_err(|e| format!("PNPM_FAILED: {e}"))?;
+    if !st.success() {
+        return Err("PNPM_FAILED".to_string());
+    }
+    let out = std::process::Command::new("pnpm")
+        .args(["install", "--reporter=ndjson", "--force"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("PNPM_FAILED: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lifecycle = stdout
+        .lines()
+        .filter(|l| l.contains("pnpm:lifecycle"))
+        .filter(|l| l.contains(pkg))
+        .count();
+    if lifecycle > 0 {
+        return Err("INSTALL_VERIFY_FAILED: lifecycle script ran".to_string());
+    }
+    let _ = txn;
+    Ok(())
+}
+
+pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
+    let lock_text =
+        std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
+    let prepared = prepare(root, args, &lock)?;
     let txn = Txn::begin(root)?;
-    let res = add_inner(
+    let res = apply(
         &txn,
         root,
         &lock,
         args,
-        &dl.bytes,
-        &sha512_hex,
-        &dl.sha256.clone(),
-        &vm_hash,
-        &integrity,
-        license_policy,
-        selected,
-        &expr,
-        &prov,
-    );
+        &prepared,
+        args.allow_diamond.as_deref() == Some("vendor-all"),
+    )
+    .and_then(|_| install_and_verify(&txn, root, &args.pkg, args.no_install));
     match res {
-        Ok(new_lock) => {
-            // package.json override FIRST, so the lock digest sees it (§7.3 overrides field)
-            update_package_json(
-                &txn,
-                root,
-                &args.pkg,
-                &dir,
-                args.allow_diamond.as_deref() == Some("vendor-all"),
-            )?;
-            let overrides = read_overrides_json(root)?;
-            let mut new_lock = new_lock;
-            new_lock.metadata.lock_digest = compute_lock_digest(&new_lock, &overrides);
-            let canonical = write_lock_canonical(&new_lock);
-            txn.write_file("own.lock", canonical.as_bytes())?;
-            // pnpm install + post-install verification
-            if !args.no_install {
-                let st = std::process::Command::new("pnpm")
-                    .arg("install")
-                    .current_dir(root)
-                    .status()
-                    .map_err(|e| format!("PNPM_FAILED: {e}"))?;
-                if !st.success() {
-                    let _ = txn.rollback();
-                    return Err("PNPM_FAILED".to_string());
-                }
-                let out = std::process::Command::new("pnpm")
-                    .args(["install", "--reporter=ndjson", "--force"])
-                    .current_dir(root)
-                    .output()
-                    .map_err(|e| format!("PNPM_FAILED: {e}"))?;
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let lifecycle = stdout
-                    .lines()
-                    .filter(|l| l.contains("pnpm:lifecycle"))
-                    .filter(|l| l.contains(&args.pkg))
-                    .count();
-                if lifecycle > 0 {
-                    let _ = txn.rollback();
-                    return Err("INSTALL_VERIFY_FAILED: lifecycle script ran".to_string());
-                }
-            } else {
-                eprintln!("warning: --no-install: post-install verification not performed");
-            }
+        Ok(()) => {
             txn.commit()?;
-            println!("added {}@{} -> {}", args.pkg, args.version, dir);
+            println!("added {}@{} -> {}", args.pkg, args.version, prepared.dir);
             Ok(())
+        }
+        Err(e) => {
+            let _ = txn.rollback();
+            Err(e)
+        }
+    }
+}
+
+/// SPEC §9.2 vendor-all (Phase 2): vendor every resolved version of one package.
+///
+/// Every version is prepared before the first write, so a version that cannot be
+/// vendored leaves the tree untouched; the writes of all versions then share a
+/// single transaction, so a failure anywhere rolls the whole run back instead of
+/// leaving a partial set of versions.
+pub fn add_vendor_all(root: &Path, base: &AddArgs, versions: &[String]) -> Result<usize, String> {
+    let lock_text =
+        std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
+    // A version already in the lock is vendored: re-running vendor-all after a
+    // dependent introduced a new version must vendor that version, not fail on
+    // the ones already done.
+    let pending: Vec<&String> = versions
+        .iter()
+        .filter(|version| {
+            !lock
+                .packages
+                .iter()
+                .any(|p| p.name == base.pkg && &p.version == *version)
+        })
+        .collect();
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let args_for: Vec<AddArgs> = versions
+        .iter()
+        .filter(|version| pending.iter().any(|p| p == version))
+        .map(|version| AddArgs {
+            pkg: base.pkg.clone(),
+            version: version.clone(),
+            ecosystem: base.ecosystem.clone(),
+            allow_diamond: Some("vendor-all".to_string()),
+            license_override: base.license_override,
+            no_install: base.no_install,
+            allow_untested_pnpm: base.allow_untested_pnpm,
+        })
+        .collect();
+    // Every version's local preconditions first: no download and, above all, no
+    // write happens while a version in the set is already known to be unusable.
+    for args in &args_for {
+        check_local(root, args, &lock)?;
+    }
+    let mut planned: Vec<(AddArgs, Prepared)> = Vec::new();
+    for args in args_for {
+        let prepared = prepare(root, &args, &lock)?;
+        planned.push((args, prepared));
+    }
+    let txn = Txn::begin(root)?;
+    let res = (|| -> Result<(), String> {
+        let mut accumulated = lock.clone();
+        for (args, prepared) in &planned {
+            accumulated = apply(&txn, root, &accumulated, args, prepared, true)?;
+        }
+        install_and_verify(&txn, root, &base.pkg, base.no_install)
+    })();
+    match res {
+        Ok(()) => {
+            txn.commit()?;
+            for (args, prepared) in &planned {
+                println!("added {}@{} -> {}", args.pkg, args.version, prepared.dir);
+            }
+            Ok(planned.len())
         }
         Err(e) => {
             let _ = txn.rollback();
@@ -713,6 +856,7 @@ fn update_package_json(
     txn: &Txn,
     root: &Path,
     pkg: &str,
+    version: &str,
     dir: &str,
     vendor_all: bool,
 ) -> Result<(), String> {
@@ -731,18 +875,23 @@ fn update_package_json(
         .or_insert_with(|| serde_json::json!({}));
     let ov = overrides.as_object_mut().ok_or("PARSE_ERROR: overrides")?;
     let val = format!("file:{dir}");
-    if let Some(existing) = ov.get(pkg).and_then(|e| e.as_str()) {
+    // vendor-all (Phase 2 §9.2): one name mapped to several versions cannot be
+    // expressed by a single bare `file:` key — that key would pin every version
+    // to one directory — so each vendored version gets the `name@version` key
+    // pnpm applies per resolved version. The bare key is removed: leaving it
+    // would keep overriding the versions the scoped keys are meant to separate.
+    let key = if vendor_all {
+        ov.remove(pkg);
+        own_core::lock::versioned_override_key(pkg, version)
+    } else {
+        pkg.to_string()
+    };
+    if let Some(existing) = ov.get(&key).and_then(|e| e.as_str()) {
         if existing != val {
-            // vendor-all (Phase 2 §9.2): one pkg mapped to several versions —
-            // a single file: override cannot express it; pnpm resolves via
-            // pnpm.overrides, so we skip the package.json override entirely.
-            if vendor_all {
-                return Ok(());
-            }
             return Err("OVERRIDE_CONFLICT".to_string());
         }
     } else {
-        ov.insert(pkg.to_string(), serde_json::Value::String(val));
+        ov.insert(key, serde_json::Value::String(val));
         // sort keys byte-wise
         let mut keys: Vec<String> = ov.keys().cloned().collect();
         keys.sort();
@@ -754,6 +903,194 @@ fn update_package_json(
     }
     let out = serde_json::to_string_pretty(&v).map_err(|e| format!("IO_ERROR: {e}"))?;
     txn.write_file(rel, format!("{out}\n").as_bytes())
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+    use own_core::txn::Txn;
+
+    fn fixture(overrides: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "own-override-{}-{}",
+            std::process::id(),
+            overrides.len()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            format!("{{\"name\":\"fixture\",\"pnpm\":{{\"overrides\":{overrides}}}}}\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    fn read_overrides(root: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(root.join("package.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["pnpm"]["overrides"].clone()
+    }
+
+    fn package(name: &str, version: &str) -> own_core::lock::Package {
+        own_core::lock::Package {
+            name: name.into(),
+            ecosystem: "npm".into(),
+            version: version.into(),
+            dir: format!("vendor/own/{name}@{version}"),
+            registry: "https://registry.npmjs.org".into(),
+            integrity: "sha512-x".into(),
+            tarball_sha256: "sha256:00".into(),
+            version_manifest_sha256: "sha256:00".into(),
+            provenance_level: "integrity-only".into(),
+            provenance_source: None,
+            mode: "verbatim".into(),
+            roots: vec![".".into()],
+            dependents: vec!["importer:.".into()],
+            license_expression: "MIT".into(),
+            license_selected: None,
+            license_policy: "allow".into(),
+            license_files: vec![own_core::lock::LicenseFile {
+                path: "LICENSE".into(),
+                sha256: "sha256:00".into(),
+            }],
+            package_files_sha256: "sha256:00".into(),
+            file_count: 0,
+            total_size: 0,
+            diamond_resolution: None,
+            unified_ranges: None,
+        }
+    }
+
+    #[test]
+    fn vendor_all_writes_one_versioned_override_per_version_p2_06() {
+        // Starts from a bare key, as a single-version `add` would have written it.
+        let root = fixture("{\"a\":\"file:vendor/own/a@1.0.0\"}");
+        let txn = Txn::begin(&root).unwrap();
+        for version in ["1.0.0", "2.0.0"] {
+            update_package_json(
+                &txn,
+                &root,
+                "a",
+                version,
+                &format!("vendor/own/a@{version}"),
+                true,
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(
+            read_overrides(&root),
+            serde_json::json!({
+                "a@1.0.0": "file:vendor/own/a@1.0.0",
+                "a@2.0.0": "file:vendor/own/a@2.0.0",
+            })
+        );
+    }
+
+    #[test]
+    fn single_add_keeps_the_bare_override_and_refuses_a_conflict_p2_06() {
+        let root = fixture("{}");
+        let txn = Txn::begin(&root).unwrap();
+        update_package_json(&txn, &root, "a", "1.0.0", "vendor/own/a@1.0.0", false).unwrap();
+        // Same target twice is idempotent; a different directory is a conflict.
+        update_package_json(&txn, &root, "a", "1.0.0", "vendor/own/a@1.0.0", false).unwrap();
+        let conflict = update_package_json(&txn, &root, "a", "2.0.0", "vendor/own/a@2.0.0", false);
+        assert_eq!(conflict.unwrap_err(), "OVERRIDE_CONFLICT");
+        txn.commit().unwrap();
+        assert_eq!(
+            read_overrides(&root),
+            serde_json::json!({"a": "file:vendor/own/a@1.0.0"})
+        );
+    }
+
+    #[test]
+    fn vendor_all_skips_versions_already_in_the_lock_p2_06() {
+        let root = std::env::temp_dir().join(format!("own-vendor-all-done-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("own.toml"), own_core::config::DEFAULT_OWN_TOML).unwrap();
+        let mut lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+        // Vendor-all already covered 1.0.0; only 2.0.0 is new.
+        lock.packages.push(package("a", "1.0.0"));
+        std::fs::write(
+            root.join("own.lock"),
+            own_core::canonical::write_lock_canonical(&lock),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            "{\"name\":\"fixture\",\"pnpm\":{\"overrides\":{\"a@1.0.0\":\"file:vendor/own/a@1.0.0\"}}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: ^1.0.0\n        version: 1.0.0\npackages:\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n",
+        )
+        .unwrap();
+        let before = std::fs::read(root.join("own.lock")).unwrap();
+        let base = AddArgs {
+            pkg: "a".into(),
+            version: "1.0.0".into(),
+            ecosystem: "npm".into(),
+            allow_diamond: Some("vendor-all".into()),
+            license_override: false,
+            no_install: true,
+            allow_untested_pnpm: true,
+        };
+        let count = add_vendor_all(&root, &base, &["1.0.0".to_string()]).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(std::fs::read(root.join("own.lock")).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vendor_all_refuses_before_writing_anything_p2_06() {
+        let root = std::env::temp_dir().join(format!("own-vendor-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("own.toml"), own_core::config::DEFAULT_OWN_TOML).unwrap();
+        let lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+        std::fs::write(
+            root.join("own.lock"),
+            own_core::canonical::write_lock_canonical(&lock),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            "{\"name\":\"fixture\",\"pnpm\":{\"overrides\":{}}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: ^1.0.0\n        version: 1.0.0\npackages:\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n  a@2.0.0:\n    resolution: {integrity: sha512-x}\n",
+        )
+        .unwrap();
+        // The second version's dir already exists: the run must stop before it
+        // vendors the first version or rewrites the lock and the overrides.
+        std::fs::create_dir_all(root.join("vendor/own/a@2.0.0")).unwrap();
+        let before_lock = std::fs::read(root.join("own.lock")).unwrap();
+        let before_pkg = std::fs::read(root.join("package.json")).unwrap();
+        let base = AddArgs {
+            pkg: "a".into(),
+            version: "1.0.0".into(),
+            ecosystem: "npm".into(),
+            allow_diamond: Some("vendor-all".into()),
+            license_override: false,
+            no_install: true,
+            allow_untested_pnpm: true,
+        };
+        let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+        let error = add_vendor_all(&root, &base, &versions).unwrap_err();
+        assert_eq!(error, "VENDOR_DIR_EXISTS");
+        assert_eq!(std::fs::read(root.join("own.lock")).unwrap(), before_lock);
+        assert_eq!(
+            std::fs::read(root.join("package.json")).unwrap(),
+            before_pkg
+        );
+        assert!(!root.join("vendor/own/a@1.0.0").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]

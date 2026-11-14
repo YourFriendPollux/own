@@ -105,6 +105,16 @@ pub fn dir_name(name: &str, version: &str) -> String {
     }
 }
 
+/// pnpm override key for one vendored package version.
+///
+/// A name vendored in several versions cannot use the bare `name` key: pnpm
+/// applies `name@version` per resolved version, while a bare key would pin
+/// every version to one directory. Unlike [`dir_name`], scoped names keep the
+/// `/` here because this is a package spec, not a directory name.
+pub fn versioned_override_key(name: &str, version: &str) -> String {
+    format!("{name}@{version}")
+}
+
 /// Parse a lock from TOML text (reading only; writing is canonical via toml_write).
 pub fn parse_lock(text: &str) -> Result<Lock, toml::de::Error> {
     toml::from_str(text)

@@ -64,6 +64,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-identical output, settling the counter-review claim that the OpenVEX
   `@id` would drift with a `HashSet`-ordered reachable set. 9 new tests. These
   changes do not certify phase 2.
+- **vendor-all keeps and verifies every version (§9.2, INV-5)**: a name
+  vendored in several versions now carries one `name@version` override per
+  version. The previous code skipped the override whenever a bare key already
+  existed, and a bare `file:` key pins every version to one directory, so the
+  second version was never reachable. `own verify` and `own ci` compare the
+  versioned shape, so a missing, stale or bare key for a multi-version package
+  is `OVERRIDE_MISMATCH` instead of being skipped — that skip is what left
+  vendor-all packages unverified. `own update` rewrites the key for the version
+  it moves, collapses back to the bare key when one version remains, and
+  refuses to overwrite an override own did not write. Every version's local
+  preconditions are checked before the first write and all writes share one
+  transaction, so a refusal leaves no partial set of versions; re-running
+  vendor-all vendors only the versions that are new. 7 new tests. The
+  end-to-end pnpm 9/10 run against a local registry is still open.
 - **Manifest integrity anchor (INV-8)**: recompute the digest, file count and
   total size of the actual manifest records against `own.lock`. Changing a file
   and its manifest hash no longer bypasses verification while the lock stays

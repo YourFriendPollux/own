@@ -158,7 +158,15 @@ pub fn update(root: &Path, args: &UpdateArgs) -> Result<u8, String> {
                 "vendor/own/{}",
                 own_core::lock::dir_name(&args.pkg, &args.new_version)
             );
-            update_override(&txn, root, &args.pkg, &new_dir)?;
+            update_override(
+                &txn,
+                root,
+                &new_lock,
+                &args.pkg,
+                &old.version,
+                &args.new_version,
+                &new_dir,
+            )?;
             let overrides = read_overrides(root)?;
             let mut new_lock = new_lock;
             new_lock.metadata.lock_digest = compute_lock_digest(&new_lock, &overrides);
@@ -441,7 +449,15 @@ fn create_pr(
     Ok(())
 }
 
-fn update_override(txn: &Txn, root: &Path, pkg: &str, new_dir: &str) -> Result<(), String> {
+fn update_override(
+    txn: &Txn,
+    root: &Path,
+    lock: &Lock,
+    pkg: &str,
+    old_version: &str,
+    new_version: &str,
+    new_dir: &str,
+) -> Result<(), String> {
     let rel = "package.json";
     let text = std::fs::read_to_string(root.join(rel)).map_err(|e| format!("IO_ERROR: {e}"))?;
     let mut v: serde_json::Value =
@@ -452,13 +468,29 @@ fn update_override(txn: &Txn, root: &Path, pkg: &str, new_dir: &str) -> Result<(
         .and_then(|o| o.as_object_mut())
     {
         let val = format!("file:{new_dir}");
-        if let Some(existing) = ov.get(pkg).and_then(|e| e.as_str()) {
-            if existing != val && existing.starts_with("file:vendor/own/") {
-                ov.insert(pkg.to_string(), serde_json::Value::String(val));
-            }
+        // The key shape follows the lock that is about to be written: one version
+        // of a name keeps the bare key, several need one versioned key each.
+        // verify compares the same shape, so leaving the old spelling behind is a
+        // hard OVERRIDE_MISMATCH rather than a silent drift.
+        let versions = lock.packages.iter().filter(|p| p.name == pkg).count();
+        let key = if versions > 1 {
+            own_core::lock::versioned_override_key(pkg, new_version)
         } else {
-            ov.insert(pkg.to_string(), serde_json::Value::String(val));
+            pkg.to_string()
+        };
+        for stale in [
+            pkg.to_string(),
+            own_core::lock::versioned_override_key(pkg, old_version),
+        ] {
+            if let Some(existing) = ov.get(&stale).and_then(|e| e.as_str()) {
+                if !existing.starts_with("file:vendor/own/") {
+                    // never clobber an override own did not write
+                    return Err("OVERRIDE_CONFLICT".to_string());
+                }
+                ov.remove(&stale);
+            }
         }
+        ov.insert(key, serde_json::Value::String(val));
         let mut keys: Vec<String> = ov.keys().cloned().collect();
         keys.sort();
         let sorted: serde_json::Map<String, serde_json::Value> = keys
@@ -544,4 +576,135 @@ fn author_email(a: &str) -> &str {
         .nth(1)
         .and_then(|e| e.split('>').next())
         .unwrap_or("own-bot@localhost")
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    fn package(name: &str, version: &str) -> Package {
+        Package {
+            name: name.into(),
+            ecosystem: "npm".into(),
+            version: version.into(),
+            dir: format!("vendor/own/{name}@{version}"),
+            registry: "https://registry.npmjs.org".into(),
+            integrity: "sha512-x".into(),
+            tarball_sha256: "sha256:00".into(),
+            version_manifest_sha256: "sha256:00".into(),
+            provenance_level: "integrity-only".into(),
+            provenance_source: None,
+            mode: "verbatim".into(),
+            roots: vec![".".into()],
+            dependents: vec!["importer:.".into()],
+            license_expression: "MIT".into(),
+            license_selected: None,
+            license_policy: "allow".into(),
+            license_files: vec![LicenseFile {
+                path: "LICENSE".into(),
+                sha256: "sha256:00".into(),
+            }],
+            package_files_sha256: "sha256:00".into(),
+            file_count: 0,
+            total_size: 0,
+            diamond_resolution: None,
+            unified_ranges: None,
+        }
+    }
+
+    fn fixture(tag: &str, overrides: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("own-update-override-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            format!("{{\"name\":\"f\",\"pnpm\":{{\"overrides\":{overrides}}}}}\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    fn read_overrides(root: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(root.join("package.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["pnpm"]["overrides"].clone()
+    }
+
+    #[test]
+    fn update_keeps_one_versioned_key_per_version_p2_06() {
+        let root = fixture(
+            "multi",
+            "{\"a@1.0.0\":\"file:vendor/own/a@1.0.0\",\"a@2.0.0\":\"file:vendor/own/a@2.0.0\"}",
+        );
+        let mut lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+        lock.packages.push(package("a", "1.0.0"));
+        lock.packages.push(package("a", "2.1.0"));
+        let txn = Txn::begin(&root).unwrap();
+        update_override(
+            &txn,
+            &root,
+            &lock,
+            "a",
+            "2.0.0",
+            "2.1.0",
+            "vendor/own/a@2.1.0",
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            read_overrides(&root),
+            serde_json::json!({
+                "a@1.0.0": "file:vendor/own/a@1.0.0",
+                "a@2.1.0": "file:vendor/own/a@2.1.0",
+            })
+        );
+    }
+
+    #[test]
+    fn update_collapses_to_the_bare_key_when_one_version_remains_p2_06() {
+        let root = fixture("single", "{\"a@2.0.0\":\"file:vendor/own/a@2.0.0\"}");
+        let mut lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+        lock.packages.push(package("a", "2.1.0"));
+        let txn = Txn::begin(&root).unwrap();
+        update_override(
+            &txn,
+            &root,
+            &lock,
+            "a",
+            "2.0.0",
+            "2.1.0",
+            "vendor/own/a@2.1.0",
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            read_overrides(&root),
+            serde_json::json!({"a": "file:vendor/own/a@2.1.0"})
+        );
+    }
+
+    #[test]
+    fn update_refuses_to_clobber_a_foreign_override_p2_06() {
+        let root = fixture("foreign", "{\"a\":\"npm:other@1.0.0\"}");
+        let mut lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+        lock.packages.push(package("a", "2.1.0"));
+        let txn = Txn::begin(&root).unwrap();
+        let error = update_override(
+            &txn,
+            &root,
+            &lock,
+            "a",
+            "2.0.0",
+            "2.1.0",
+            "vendor/own/a@2.1.0",
+        )
+        .unwrap_err();
+        assert_eq!(error, "OVERRIDE_CONFLICT");
+        let _ = txn.rollback();
+        assert_eq!(
+            read_overrides(&root),
+            serde_json::json!({"a": "npm:other@1.0.0"})
+        );
+    }
 }

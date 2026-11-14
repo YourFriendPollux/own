@@ -538,33 +538,27 @@ fn main() -> ExitCode {
                 if versions.is_empty() {
                     versions.push(version.to_string());
                 }
-                let mut last_err: Option<String> = None;
-                let mut ok = 0;
-                for v in &versions {
-                    let args = add::AddArgs {
-                        pkg: pkg.to_string(),
-                        version: v.clone(),
-                        ecosystem: ecosystem.clone(),
-                        allow_diamond: Some("vendor-all".to_string()),
-                        license_override: license_override
-                            .as_deref()
-                            .map(|s| s.starts_with("human-review:"))
-                            .unwrap_or(false),
-                        no_install: *no_install,
-                        allow_untested_pnpm: *allow_untested_pnpm,
-                    };
-                    match add::add(&root, &args) {
-                        Ok(()) => ok += 1,
-                        Err(e) => last_err = Some(e),
+                let base = add::AddArgs {
+                    pkg: pkg.to_string(),
+                    version: version.to_string(),
+                    ecosystem: ecosystem.clone(),
+                    allow_diamond: Some("vendor-all".to_string()),
+                    license_override: license_override
+                        .as_deref()
+                        .map(|s| s.starts_with("human-review:"))
+                        .unwrap_or(false),
+                    no_install: *no_install,
+                    allow_untested_pnpm: *allow_untested_pnpm,
+                };
+                return match add::add_vendor_all(&root, &base, &versions) {
+                    Ok(count) => {
+                        println!(
+                            "vendor-all: {count}/{} versions of {pkg} vendored",
+                            versions.len()
+                        );
+                        ExitCode::from(0)
                     }
-                }
-                println!(
-                    "vendor-all: {ok}/{} versions of {pkg} vendored",
-                    versions.len()
-                );
-                return match last_err {
-                    None => ExitCode::from(0),
-                    Some(e) => {
+                    Err(e) => {
                         eprintln!("error: {e}");
                         ExitCode::from(1)
                     }
