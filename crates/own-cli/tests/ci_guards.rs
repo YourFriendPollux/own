@@ -461,10 +461,27 @@ fn ci_large_ignored_vendor_does_not_deadlock_inv5() {
 }
 
 #[test]
-fn ci_git_error_is_not_a_clean_ignore_check_inv5() {
+fn ci_without_a_repository_has_nothing_to_ignore() {
     let fixture = Fixture::new();
     fs::remove_dir_all(fixture.0.join(".git")).unwrap();
     let out = fixture.run(&["ci"]);
+    // Outside a work tree git has no rules to apply: nothing can be ignored, so
+    // the probe answers "nothing ignored" instead of failing the run. The
+    // remaining checks still decide the exit code.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("GIT_ERROR"));
+}
+
+#[test]
+fn ci_git_unavailable_is_not_a_clean_ignore_check_inv5() {
+    let fixture = Fixture::new();
+    // A git that cannot run at all is unknown, never "nothing ignored" (INV-4).
+    let out = fixture.run_env(&["ci"], &[("PATH", "/nonexistent")]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("GIT_ERROR"));
 }

@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Corpus rebuilt from measured data, J1 eligibility measured**
+  (`scripts/corpus-build.py`, `scripts/e2e-pnpm.sh`): the committed corpus was
+  250 `name@version` lines with no header, so `day1.sh`'s `npm view
+  "$pkg@latest"` skipped every entry and the acceptance line counted 0 packages.
+  The corpus is now 250 bare names ranked by measured weekly downloads
+  (`api.npmjs.org`), with a dated header naming the ranking source, and
+  `corpus-build.py` regenerates it and measures §9.1 eligibility with the same
+  criteria as `own-policy`. Running `day1.sh` step 1 verbatim on it reports
+  **106 / 250 eligible** (0 skipped, threshold 15) — GO; the packument criteria
+  alone give 122 / 250. A second run reproduced the same set, the same two
+  numbers. `e2e-pnpm.sh` drives the real registry end to end on pnpm 9.15.9 and
+  10.34.9: install, `--frozen-lockfile`, `require`, byte-identical installed
+  copy, `verify --installed`, `DRIFT_MODIFIED`/`DRIFT_EXTRA` on tamper, clean
+  again after restore, and `own-verify` agreement. It also pins the lifecycle
+  question: pnpm 9 runs a `file:` dependency's `postinstall` (2
+  `pnpm:lifecycle` events, detector satisfied) and pnpm 10 ignores build
+  scripts (0 events).
 - **Provenance detection (§8.1 step 4, partial)**: `own add` and `own update`
   now evaluate what the registry advertises through a single, tested
   `evaluate_provenance` (npm attestations, registry signatures) and report it as
@@ -27,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those artifacts had been committed before the history rewrite).
 
 ### Fixed
+- **Git-ignore probe outside a repository (`add` step 5, `ci`)**: git exits 128
+  with "not a git repository" when asked about a directory that is not a work
+  tree, and every such refusal was surfaced as `GIT_ERROR`, so `own add` could
+  not vendor into a project without git even though `own init` accepts one. The
+  probe now answers "nothing ignored" for exactly that refusal (a work tree with
+  no rules hides nothing either), while an unavailable git, a corrupt repository
+  or any other failure stays a hard `GIT_ERROR` — the distinction is the exit
+  code *and* git's message, not the exit code alone. 3 unit tests plus the
+  rewritten `ci_guards` pair (`ci_without_a_repository_has_nothing_to_ignore`,
+  `ci_git_unavailable_is_not_a_clean_ignore_check_inv5`, the latter with `PATH`
+  emptied so git cannot spawn).
 - **OSV cache and policy checks (partial)**: validate snapshot/advisory
   structure and UTC dates; compare elapsed seconds using the system clock
   when `OWN_NOW` is absent. `check` and VEX share configured cache paths, age
