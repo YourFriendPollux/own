@@ -29,19 +29,24 @@ fn reduce_advisory(a: &Value) -> Option<Value> {
     let mut affected_out = Vec::new();
     if let Some(affected) = a.get("affected").and_then(|x| x.as_array()) {
         for aff in affected {
-            let pkg = aff
-                .get("package")
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())?
-                .to_string();
             let ecosystem = aff
                 .get("package")
                 .and_then(|p| p.get("ecosystem"))
                 .and_then(|e| e.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Ecosystem first: a non-npm record must never make the npm
+            // reduction of the same advisory depend on its own fields.
             if ecosystem != "npm" {
                 continue;
+            }
+            let pkg = aff
+                .get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())?
+                .to_string();
+            if pkg.is_empty() {
+                return None;
             }
             let mut ranges_out = Vec::new();
             if let Some(ranges) = aff.get("ranges").and_then(|r| r.as_array()) {
@@ -93,6 +98,116 @@ fn reduce_advisory(a: &Value) -> Option<Value> {
     Some(obj)
 }
 
+/// Reduce one raw dump record, refusing anything structurally invalid.
+///
+/// The published dump is machine-generated: an entry that cannot be reduced is
+/// evidence of a corrupt or truncated mirror, not something to drop quietly.
+/// A dropped record would leave a snapshot that looks complete while missing an
+/// advisory (`OSV_INCOMPLETE` only detects absent package names) — INV-5.
+fn reduce_advisory_checked(raw: &Value) -> Result<Option<Value>, String> {
+    if raw.get("withdrawn").and_then(Value::as_str).is_some() {
+        return Ok(None); // §8.2: withdrawn advisories are ignored
+    }
+    if raw
+        .get("id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err("PARSE_ERROR: OSV advisory without a usable id".to_string());
+    }
+    let affected = raw
+        .get("affected")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "PARSE_ERROR: OSV advisory without affected records".to_string())?;
+    for record in affected {
+        let ecosystem = record
+            .get("package")
+            .and_then(|p| p.get("ecosystem"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if ecosystem != "npm" {
+            continue;
+        }
+        if record
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err("PARSE_ERROR: OSV npm record without a package name".to_string());
+        }
+    }
+    match reduce_advisory(raw) {
+        Some(reduced) => {
+            validate_advisory(&reduced)?;
+            Ok(Some(reduced))
+        }
+        None => Err("PARSE_ERROR: OSV advisory could not be reduced".to_string()),
+    }
+}
+
+/// Read every zip entry in memory (§11.2 guards, never extracted to disk) and
+/// keep the reduced advisories that touch a covered package.
+fn collect_advisories(
+    bytes: &[u8],
+    covered: &std::collections::HashSet<&String>,
+) -> Result<Vec<Value>, String> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|e| format!("PARSE_ERROR: osv zip: {e}"))?;
+    let max_entries = 2_000_000usize; // OSV npm dump has ~100k+ entries
+    let mut advisories = Vec::new();
+    for (entries, i) in (0..archive.len()).enumerate() {
+        if entries > max_entries {
+            return Err("NETWORK_ERROR: osv dump exceeds entry cap".to_string());
+        }
+        let mut f = archive
+            .by_index(i)
+            .map_err(|e| format!("IO_ERROR: osv zip entry: {e}"))?;
+        if f.size() > 5 * 1_048_576 {
+            // individual advisory files are small
+            continue;
+        }
+        let mut s = String::new();
+        f.read_to_string(&mut s)
+            .map_err(|e| format!("IO_ERROR: osv entry: {e}"))?;
+        let raw: Value = serde_json::from_str(&s)
+            .map_err(|e| format!("PARSE_ERROR: osv zip entry {i} is not valid JSON: {e}"))?;
+        let Some(reduced) = reduce_advisory_checked(&raw)? else {
+            continue;
+        };
+        let touches = reduced
+            .get("affected")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter().any(|aff| {
+                    aff.get("package")
+                        .and_then(Value::as_str)
+                        .map(|name| covered.contains(&name.to_string()))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if touches {
+            advisories.push(reduced);
+        }
+    }
+    Ok(advisories)
+}
+
+/// Convert an HTTP `Last-Modified` header to the canonical RFC 3339 UTC form
+/// written to `source_last_modified` (SPEC §8.2).
+fn source_date_to_utc(header: &str) -> Result<String, String> {
+    let date = httpdate::parse_http_date(header)
+        .map_err(|e| format!("PARSE_ERROR: OSV Last-Modified: {e}"))?;
+    let seconds = match date.duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => i64::try_from(elapsed.as_secs()),
+        Err(before) => i64::try_from(before.duration().as_secs()).map(|seconds| -seconds),
+    }
+    .map_err(|e| format!("PARSE_ERROR: OSV Last-Modified: {e}"))?;
+    Ok(crate::sbom::epoch_to_rfc3339(seconds))
+}
+
 /// `own osv fetch`: download dump, filter to lock packages, write .own/osv.json.
 pub fn osv_fetch(
     root: &Path,
@@ -112,60 +227,10 @@ pub fn osv_fetch(
     let source_last_modified = download
         .last_modified
         .as_deref()
-        .map(|header| {
-            let date = httpdate::parse_http_date(header)
-                .map_err(|e| format!("PARSE_ERROR: OSV Last-Modified: {e}"))?;
-            let seconds = match date.duration_since(std::time::UNIX_EPOCH) {
-                Ok(elapsed) => i64::try_from(elapsed.as_secs()),
-                Err(before) => i64::try_from(before.duration().as_secs()).map(|seconds| -seconds),
-            }
-            .map_err(|e| format!("PARSE_ERROR: OSV Last-Modified: {e}"))?;
-            Ok::<_, String>(crate::sbom::epoch_to_rfc3339(seconds))
-        })
+        .map(source_date_to_utc)
         .transpose()?;
-    let cursor = std::io::Cursor::new(&download.bytes);
-    let mut archive =
-        zip::ZipArchive::new(cursor).map_err(|e| format!("PARSE_ERROR: osv zip: {e}"))?;
-    let mut advisories: Vec<Value> = Vec::new();
     let covered_set: std::collections::HashSet<&String> = covered.iter().collect();
-    let max_entries = 2_000_000usize; // OSV npm dump has ~100k+ entries
-    for (entries, i) in (0..archive.len()).enumerate() {
-        if entries > max_entries {
-            return Err("NETWORK_ERROR: osv dump exceeds entry cap".to_string());
-        }
-        let mut f = archive
-            .by_index(i)
-            .map_err(|e| format!("IO_ERROR: osv zip entry: {e}"))?;
-        if f.size() > 5 * 1_048_576 {
-            // individual advisory files are small
-            continue;
-        }
-        let mut s = String::new();
-        f.read_to_string(&mut s)
-            .map_err(|e| format!("IO_ERROR: osv entry: {e}"))?;
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
-            // OSV dump zip: one advisory per file; filter by affected package name
-            let touches = v
-                .get("affected")
-                .and_then(|a| a.as_array())
-                .map(|arr| {
-                    arr.iter().any(|aff| {
-                        aff.get("package")
-                            .and_then(|p| p.get("name"))
-                            .and_then(|n| n.as_str())
-                            .map(|n| covered_set.contains(&n.to_string()))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            if touches {
-                if let Some(red) = reduce_advisory(&v) {
-                    validate_advisory(&red)?;
-                    advisories.push(red);
-                }
-            }
-        }
-    }
+    let mut advisories = collect_advisories(&download.bytes, &covered_set)?;
     advisories.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     let generated_at = match now {
         Some(now) => {
@@ -496,10 +561,20 @@ pub fn check(
         return Err("PARSE_ERROR: OSV generated_at is in the future".to_string());
     }
     // §8.2 risk table ("a mirror that lies about its dates"): a source date
-    // later than the injected clock is refused, and --allow-stale-osv, which
-    // only downgrades OSV_STALE, cannot mask it.
-    if source_time.is_some_and(|source_time| source_time > now_time) {
-        return Err("PARSE_ERROR: OSV source_last_modified is in the future".to_string());
+    // later than the real clock is refused, and --allow-stale-osv, which only
+    // downgrades OSV_STALE, cannot mask it. The mirror cannot know an injected
+    // OWN_NOW, so this plausibility check reads the system clock, never
+    // `args.now` — otherwise a live fetch under a pinned CI clock would be
+    // rejected for telling the truth.
+    if let Some(source_time) = source_time {
+        let real_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("IO_ERROR: clock: {e}"))?;
+        if i64::try_from(real_now.as_secs()).map_err(|e| format!("IO_ERROR: clock: {e}"))?
+            < source_time.seconds
+        {
+            return Err("PARSE_ERROR: OSV source_last_modified is in the future".to_string());
+        }
     }
     let age_seconds = now_time.seconds - snapshot_time.seconds;
     let max_age_days = config.max_age_days.unwrap_or(args.max_age_days);
@@ -669,6 +744,99 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in entries {
+            writer
+                .start_file(
+                    *name,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            std::io::Write::write_all(&mut writer, body).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn covered_one() -> std::collections::HashSet<&'static String> {
+        static A: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "a".to_string());
+        [&*A].into_iter().collect()
+    }
+
+    #[test]
+    fn http_source_date_is_written_as_canonical_utc_p2_02() {
+        // Real header shape served by the OSV mirror.
+        assert_eq!(
+            source_date_to_utc("Sat, 14 Nov 2026 08:33:14 GMT").unwrap(),
+            "2026-11-14T08:33:14Z"
+        );
+        assert_eq!(
+            source_date_to_utc("Thu, 01 Jan 1970 00:00:00 GMT").unwrap(),
+            "1970-01-01T00:00:00Z"
+        );
+        // A pre-epoch header is refused, never wrapped into 1970.
+        assert!(source_date_to_utc("Wed, 31 Dec 1969 23:59:59 GMT")
+            .expect_err("pre-epoch date is refused")
+            .starts_with("PARSE_ERROR"));
+        let error = source_date_to_utc("not a date").expect_err("garbage must be refused");
+        assert!(error.starts_with("PARSE_ERROR"), "{error}");
+    }
+
+    #[test]
+    fn corrupt_osv_zip_entry_is_refused_not_skipped_p2_02() {
+        let bytes = zip_of(&[
+            ("GHSA-ok.json", br#"{"id":"GHSA-ok","affected":[{"package":{"ecosystem":"npm","name":"a"},"versions":["1.0.0"]}]}"#),
+            ("truncated.json", b"{\"id\":\"GHSA-broken\",\"affected\":["),
+        ]);
+        let error = collect_advisories(&bytes, &covered_one())
+            .expect_err("a truncated dump member must not be dropped silently");
+        assert!(error.starts_with("PARSE_ERROR"), "{error}");
+    }
+
+    #[test]
+    fn malformed_npm_record_for_unvendored_package_is_refused_p2_02() {
+        // The record names no package, so it cannot be attributed: skipping it
+        // would hide corruption for a package that may be vendored later.
+        let bytes = zip_of(&[(
+            "GHSA-nameless.json",
+            br#"{"id":"GHSA-nameless","affected":[{"package":{"ecosystem":"npm"},"versions":["1.0.0"]}]}"#,
+        )]);
+        let error = collect_advisories(&bytes, &covered_one())
+            .expect_err("a nameless npm record must not be dropped silently");
+        assert!(error.starts_with("PARSE_ERROR"), "{error}");
+    }
+
+    #[test]
+    fn well_formed_advisory_for_unvendored_package_is_skipped_without_error_p2_02() {
+        let bytes = zip_of(&[
+            (
+                "GHSA-other.json",
+                br#"{"id":"GHSA-other","affected":[{"package":{"ecosystem":"npm","name":"z-other"},"versions":["2.0.0"]}]}"#,
+            ),
+            (
+                "GHSA-a.json",
+                br#"{"id":"GHSA-a","affected":[{"package":{"ecosystem":"npm","name":"a"},"versions":["1.0.0"]}]}"#,
+            ),
+        ]);
+        let kept = collect_advisories(&bytes, &covered_one()).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["id"], "GHSA-a");
+    }
+
+    #[test]
+    fn non_npm_record_cannot_break_the_npm_reduction_p2_04() {
+        // Reordering the ecosystem filter must keep a malformed non-npm record
+        // from discarding the npm record of the same advisory.
+        let bytes = zip_of(&[(
+            "GHSA-mixed.json",
+            br#"{"id":"GHSA-mixed","affected":[{"package":{"ecosystem":"PyPI"}},{"package":{"ecosystem":"npm","name":"a"},"versions":["1.0.0"]}]}"#,
+        )]);
+        let kept = collect_advisories(&bytes, &covered_one()).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["affected"][0]["package"], "a");
+    }
 
     #[test]
     fn reduced_hints_stay_with_their_package_after_ecosystem_filtering_p2_04() {

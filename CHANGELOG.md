@@ -42,14 +42,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   precision, so the inclusive deadline is decided exactly. A snapshot dated
   in the future is refused (`PARSE_ERROR ... in the future`) for both
   `generated_at` and `source_last_modified`, and `--allow-stale-osv` cannot
-  mask it: the §8.2 risk table names a mirror that lies about its dates.
+  mask it: the §8.2 risk table names a mirror that lies about its dates. The
+  mirror's own date is judged against the system clock, never an injected
+  `OWN_NOW`, which the mirror cannot know.
+- **Strict dump validation (§8.2, INV-5)**: every zip member is now validated
+  before the package filter. A truncated or non-JSON member, a nameless npm
+  record, or an advisory without an id is a hard `PARSE_ERROR` instead of a
+  silently dropped record — a dropped record would leave a snapshot that looks
+  complete while missing an advisory. Well-formed advisories for packages
+  outside the lock are still skipped, and the non-npm filter now runs before
+  the npm field extraction so a malformed non-npm record cannot discard the npm
+  record of the same advisory. The whole published dump passes this validation
+  in the live fetch test.
   `--allow-missing-osv` no longer masks a snapshot that exists but is
   unreadable. Ecosystem filtering keeps `database_specific` and
   `ecosystem_specific` attached to their own affected record, so a hint can
   no longer move onto another package. Two opt-in network tests exercise the
   real HTTPS mirror: a four-byte ranged fetch for the transport header, and
-  a full `osv fetch` writing to a configured path. 6 new tests. These changes
-  do not certify phase 2.
+  a full `osv fetch` writing to a configured path. A VEX regression test drives
+  `sbom --format vex --e1` twice through the real binary and requires
+  byte-identical output, settling the counter-review claim that the OpenVEX
+  `@id` would drift with a `HashSet`-ordered reachable set. 9 new tests. These
+  changes do not certify phase 2.
 - **Manifest integrity anchor (INV-8)**: recompute the digest, file count and
   total size of the actual manifest records against `own.lock`. Changing a file
   and its manifest hash no longer bypasses verification while the lock stays

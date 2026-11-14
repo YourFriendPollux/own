@@ -213,10 +213,12 @@ fn check_osv_fractional_utc_age_preserves_exact_deadline_inv5() {
 #[test]
 fn future_source_date_is_refused_even_with_stale_optout_inv5() {
     // §8.2 risk table: a mirror that lies about its dates must not pass silently.
+    // The rule reads the system clock (a mirror cannot know OWN_NOW), so the
+    // fixture uses a date no real clock can reach.
     let fixture = Fixture::new();
     fixture.osv_with_source_date(
         "2025-01-02T03:04:05Z",
-        serde_json::json!("2026-01-01T00:00:00Z"),
+        serde_json::json!("2099-01-01T00:00:00Z"),
         serde_json::json!([]),
     );
     for args in [
@@ -279,8 +281,53 @@ fn real_osv_fetch_keeps_source_date_at_configured_path_inv10() {
     assert_eq!(snapshot["generated_at"], "2025-01-02T03:04:05Z");
     assert_eq!(snapshot["covered_packages"], serde_json::json!(["a"]));
     assert!(!fixture.0.join(".own/osv.json").exists());
+    // The mirror's own date is compared against the system clock, not the
+    // injected OWN_NOW, so a live fetch under a pinned CI clock stays usable.
     let check = fixture.run(&["check"]);
     assert!(matches!(check.status.code(), Some(0 | 1)), "{check:?}");
+}
+
+#[test]
+fn inv10_e1_vex_id_is_byte_stable_across_runs() {
+    // Counter-review claim: VEX @id would drift because the reachable set comes
+    // from a HashSet. The alert hash sorts before hashing; this observes it
+    // end to end through the real binary instead of trusting the reading.
+    let fixture = Fixture::new();
+    let pkg = fixture.0.join("vendor/own/a@1.0.0");
+    fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"a","version":"1.0.0","main":"index.js"}"#,
+    )
+    .unwrap();
+    fs::write(pkg.join("index.js"), "require('./a.js');\n").unwrap();
+    fs::write(pkg.join("a.js"), "module.exports = 1;\n").unwrap();
+    fs::write(pkg.join("vuln.js"), "module.exports = 'vulnerable';\n").unwrap();
+    fixture.osv(
+        "2025-01-02T03:04:05Z",
+        serde_json::json!([{
+            "id": "GHSA-e1-fixture",
+            "aliases": [],
+            "affected": [{
+                "package": "a",
+                "versions": ["1.0.0"],
+                "ranges": [],
+                "database_specific": {"vulnerable_files": ["vuln.js"]},
+            }],
+            "severity": null,
+        }]),
+    );
+    let first = fixture.run(&["sbom", "--format", "vex", "--e1"]);
+    success(&first);
+    let second = fixture.run(&["sbom", "--format", "vex", "--e1"]);
+    success(&second);
+    assert_eq!(
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&second.stdout),
+        "INV-10: two VEX runs under the same OWN_NOW must be byte-identical"
+    );
+    let vex = String::from_utf8_lossy(&first.stdout);
+    assert!(vex.contains("evidence_level=E1"), "{vex}");
+    assert!(vex.contains("reachable_set_sha256="), "{vex}");
 }
 
 #[test]
