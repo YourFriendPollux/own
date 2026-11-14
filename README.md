@@ -14,7 +14,11 @@ OWN_VERSION=v0.1.0 ./scripts/install-own.sh   # verifies cosign signature + SLSA
 The installer defaults to `OWN_REPO=YourFriendPollux/own` and verifies the
 cosign keyless bundle (`<asset>.bundle`) and the SLSA provenance attestation
 before installing anything. It fetches the correct cosign build per OS
-(linux/darwin, amd64/arm64).
+(linux/darwin, amd64/arm64) and expects the generator's `multiple.intoto.jsonl`
+(override with `OWN_PROVENANCE_ASSET`). Release targets are `linux-amd64`,
+`linux-arm64` (cross-compiled) and `darwin-arm64` — there is no Windows and no
+`darwin-x64` build. **None of this has been exercised against a real release**:
+no release exists yet, and this host has no cosign.
 
 ## Quick start
 
@@ -126,7 +130,16 @@ on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
   is deliberate — rolling back from a signal handler is not async-signal-safe.
 - `cargo vet` currently fails on dependencies without audit coverage. Existing
   exemptions are not independent audits; new exemptions are not added just to
-  make the gate green.
+  make the gate green. The count is **22** unvetted crates (as of 2026-11-14).
+  Importing Mozilla's audit set was measured and does not clear them: `cargo-vet`
+  refuses to persist `imports.lock` while the run fails, so the import cannot be
+  adopted until the gap is closed — and trusting an individual reviewer
+  (`cargo vet trust`) is a maintainer decision, not a gate-flipping trick.
+- `own verify-signature` shells out to `cosign` (SPEC §8.3). No cosign is
+  installed here, so only the refusals are observed: a missing path is named
+  (`IO_ERROR: <path> not readable`, exit 2) and an absent cosign is
+  `IO_ERROR: cosign binary not found` (exit 2). Keyless verification of a real
+  bundle, and the installer's signature + provenance steps, remain unexercised.
 - `own ci` requires `pnpm-lock.yaml` (its override/coherence check reads it), so
   it fails with `IO_ERROR` (exit 2) on a repo that never ran `pnpm install`.
 - Toolchain: `rust-toolchain.toml` pins Rust 1.99.1 (`rustfmt` + `clippy`). The

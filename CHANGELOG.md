@@ -44,6 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those artifacts had been committed before the history rewrite).
 
 ### Fixed
+- **Installer asked for a provenance asset the release never publishes**: step 5
+  fetched `<asset>.intoto.jsonl`, but the SLSA generic generator signs one
+  attestation for all subjects and uploads `multiple.intoto.jsonl`. It also ran
+  its first verification against a `.bundle` that had not been downloaded yet,
+  behind `2>/dev/null`, in an `a || b && c` chain that ran the second
+  verification even when the first succeeded. Now the attestation and its bundle
+  are fetched explicitly (`OWN_PROVENANCE_ASSET` overrides the name), a missing
+  asset stops the installer with a message naming it, and the verification runs
+  once with its errors visible. Still unexercised: no release and no cosign exist
+  here.
+- **`verify-signature` said "file not readable" without saying which**: it now
+  names the missing path, and has its first tests (missing bundle names the path;
+  no cosign on `PATH` is `IO_ERROR: cosign binary not found`, both exit 2).
 - **`add --ecosystem pypi` failed with a pnpm-lock error instead of a refusal**:
   the flag is documented as a Phase 2 surface, but nothing implemented it, so the
   npm path ran and died on `IO_ERROR: pnpm-lock.yaml: No such file or directory`

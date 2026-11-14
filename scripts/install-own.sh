@@ -57,22 +57,26 @@ sha256sum -c "$ASSET.sha256"
   "$ASSET"
 
 # 5. verify SLSA provenance attestation (generator: slsa-github-generator).
-#    The release workflow uploads the provenance as <asset>.intoto.jsonl.
-PROV="${ASSET}.intoto.jsonl"
-curl -fsSL "${BASE}/${PROV}" -o "$PROV"
+#    The generator signs ONE attestation for all release subjects, so its default
+#    asset name is `multiple.intoto.jsonl` — not `<asset>.intoto.jsonl`, which the
+#    previous version of this script asked for and could never find. Override with
+#    OWN_PROVENANCE_ASSET when a release renames it.
+PROV="${OWN_PROVENANCE_ASSET:-multiple.intoto.jsonl}"
+fetch() { # $1 = asset name; never leaves a half-written file behind
+  curl -fsSL "${BASE}/$1" -o "$1" || {
+    echo "install-own: release ${OWN_VERSION} does not publish '$1'" >&2
+    echo "install-own: set OWN_PROVENANCE_ASSET to the attestation asset name" >&2
+    exit 2
+  }
+}
+fetch "$PROV"
+fetch "$PROV.bundle"
 "$COSIGN" verify-blob-attestation \
   --certificate-identity-regexp "^https://github.com/slsa-framework/slsa-github-generator/\\.github/workflows/.*@refs/tags/v.*$" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   --type "https://slsa.dev/provenance/v1" \
   --bundle "$PROV.bundle" \
-  "$PROV" 2>/dev/null || \
-curl -fsSL "${BASE}/${PROV}.bundle" -o "$PROV.bundle" && \
-"$COSIGN" verify-blob-attestation \
-  --certificate-identity-regexp "^https://github.com/slsa-framework/slsa-github-generator/\\.github/workflows/.*@refs/tags/v.*$" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --type "https://slsa.dev/provenance/v1" \
-  --bundle "$PROV.bundle" \
-  "$PROV" | python3 -c "import json,sys; p=json.load(sys.stdin); print('SLSA predicateType:', p['predicateType'])"
+  "$PROV"
 
 # 6. only now: extract and install
 tar -xzf "$ASSET"

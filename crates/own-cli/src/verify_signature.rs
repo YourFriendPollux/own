@@ -20,9 +20,11 @@ pub struct VerifySignatureArgs {
 pub fn verify_signature(root: &Path, args: &VerifySignatureArgs) -> Result<u8, String> {
     let file = root.join(&args.file);
     let bundle = root.join(&args.bundle);
-    for p in [&file, &bundle] {
+    // Name the missing path: "file not readable" alone does not say whether the
+    // artifact or the bundle is the one that is absent.
+    for (p, given) in [(&file, &args.file), (&bundle, &args.bundle)] {
         if !p.is_file() {
-            return Err("IO_ERROR: file not readable".to_string());
+            return Err(format!("IO_ERROR: {given} not readable"));
         }
     }
     let cosign = Command::new("cosign")

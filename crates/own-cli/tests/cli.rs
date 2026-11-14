@@ -912,6 +912,43 @@ fn add_refuses_pypi_with_a_clear_code_inv4() {
 }
 
 #[test]
+fn verify_signature_names_the_missing_file_and_refuses_without_cosign_inv4() {
+    let dir = init_project("verify-signature");
+    fs::write(dir.path().join("blob.bin"), b"payload").unwrap();
+    let args = |bundle: &'static str| -> Vec<&'static str> {
+        vec![
+            "verify-signature",
+            "blob.bin",
+            "--bundle",
+            bundle,
+            "--identity",
+            "^https://github.com/x/y/.*$",
+            "--issuer",
+            "https://token.actions.githubusercontent.com",
+        ]
+    };
+
+    // Missing bundle: the message must say which path is absent (exit 2).
+    let missing = own(dir.path(), &args("absent.bundle"));
+    assert_exit(&missing, 2, "verify-signature without a bundle");
+    assert!(
+        missing.2.contains("absent.bundle"),
+        "stderr must name the missing path: {:?}",
+        missing.2
+    );
+
+    // Present files but no cosign on PATH: an explicit IO_ERROR, never a pass.
+    fs::write(dir.path().join("b.bundle"), b"bundle").unwrap();
+    let no_cosign = run_own(dir.path(), &[("PATH", "/nonexistent")], &args("b.bundle"));
+    assert_exit(&no_cosign, 2, "verify-signature without cosign");
+    assert!(
+        no_cosign.2.contains("cosign binary not found"),
+        "stderr: {:?}",
+        no_cosign.2
+    );
+}
+
+#[test]
 fn check_without_osv_json_fails_osv_missing() {
     let dir = init_project("check-missing-osv");
     assert!(!dir.join(".own/osv.json").exists());
