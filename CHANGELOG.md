@@ -52,16 +52,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the fixed versions), and `data.alerts` keeps the full detail. Found by
   running `own check` against the real OSV dump for lodash 4.17.20 and reading
   the JSON; test `check_json_lists_every_alert_as_a_finding`.
-- **Git-ignore probe outside a repository (`add` step 5, `ci`)**: git exits 128
-  with "not a git repository" when asked about a directory that is not a work
-  tree, and every such refusal was surfaced as `GIT_ERROR`, so `own add` could
-  not vendor into a project without git even though `own init` accepts one. The
-  probe now answers "nothing ignored" for exactly that refusal (a work tree with
-  no rules hides nothing either), while an unavailable git, a corrupt repository
-  or any other failure stays a hard `GIT_ERROR` — the distinction is the exit
-  code *and* git's message, not the exit code alone. 3 unit tests plus the
-  rewritten `ci_guards` pair (`ci_without_a_repository_has_nothing_to_ignore`,
-  `ci_git_unavailable_is_not_a_clean_ignore_check_inv5`, the latter with `PATH`
+- **Git-ignore probe says what to do outside a repository (`add` step 5, `ci`)**:
+  a directory that is not a work tree made `git check-ignore` exit 128 and the
+  command failed with git's raw "fatal: not a git repository", which no longer
+  says what to fix now that `git >= 2.30` is a documented prerequisite of
+  `add`/`update`/`eject`/`ci` (§5). The refusal stays a `GIT_ERROR` (measured: an
+  earlier attempt to treat it as "nothing ignored" contradicted §5 and was
+  reverted); the message now reads "not a git repository — git >= 2.30 is
+  required for add/update/eject/ci (SPEC §5); run `git init` first". Unit test
+  `outside_a_repository_is_a_git_error_not_a_clean_check` plus
+  `ci_git_error_is_not_a_clean_ignore_check_inv5` and
+  `ci_git_unavailable_is_not_a_clean_ignore_check_inv5` (the latter with `PATH`
   emptied so git cannot spawn).
 - **OSV cache and policy checks (partial)**: validate snapshot/advisory
   structure and UTC dates; compare elapsed seconds using the system clock

@@ -86,6 +86,9 @@ Measured on 2026-11-14 against the public npm registry:
   vendored file gives `DRIFT_MODIFIED` (exit 1), an unlisted file gives
   `DRIFT_EXTRA`, restoring the bytes returns exit 0, and `own-verify` reports the
   same finding from the same lock.
+- The same script also pins the §5 prerequisite: in a directory that is not a
+  work tree, `own add` exits 2 with a `GIT_ERROR` naming `git init` and vendors
+  nothing.
 - Lifecycle probe (§9.1, the `[À VALIDER J1]` line): pnpm 9 **does** run a
   `file:` dependency's `postinstall` (marker written, 2 `pnpm:lifecycle` events
   seen, so the detector's ≥ 1 requirement holds); pnpm 10 reports "Ignored build
@@ -106,11 +109,10 @@ on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
 
 - `own-verify --installed` uses the same offline installed-file comparison as
   `own verify --installed`; malformed or missing project inputs are explicit errors.
-- The git-ignore probe (`add` step 5, `ci`) needs a work tree: inside one it
-  reports the files git would hide, and outside one git has no rules to apply, so
-  the probe answers "nothing ignored" and the command proceeds (`own init`
-  accepts a directory that is not a repository). A git that cannot run at all, or
-  fails for any other reason, is still a hard `GIT_ERROR` — never a clean check.
+- `git` (>= 2.30) is a prerequisite of `add`, `update`, `eject` and `ci`, and any
+  failing git command is a `GIT_ERROR` (SPEC §5). A directory that is not a work
+  tree therefore fails the git-ignore probe with "not a git repository — run
+  `git init` first", even though `own init` itself accepts such a directory.
 - Integrity anchoring is local (lock + manifests in the same repo): `own verify`
   detects drift, not a malicious commit that updates everything at once.
 - **Provenance is detected, not verified**: when a version ships npm attestations

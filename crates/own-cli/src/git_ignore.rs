@@ -32,23 +32,25 @@ pub fn ignored_paths(root: &Path, paths: &[String]) -> Result<Vec<String>, Strin
             .map_err(|_| "GIT_ERROR: stdin writer panicked".to_string())?;
         let output = output.map_err(|e| format!("GIT_ERROR: {e}"))?;
         if !matches!(output.status.code(), Some(0 | 1)) {
-            // Outside a work tree git refuses to answer at all (exit 128,
-            // "fatal: not a git repository"). Nothing can be ignored without a
-            // repository, so the probe answers "nothing ignored" rather than
-            // failing the command: a project with no VCS is legitimate and
-            // `own init` accepts one. Every other failure stays an error — a
-            // corrupt repository, a dubious-ownership config or a missing git
-            // must not be read as "no ignore rules" (INV-4: doubt fails closed).
-            let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-            if output.status.code() == Some(128) && stderr.contains("not a git repository") {
-                // The writer's broken pipe is expected here: git exits before it
-                // reads stdin, so it must not turn this answer into an error.
-                return Ok(output);
+            // `git` is a prerequisite of add/update/eject/ci and every failing git
+            // command is a GIT_ERROR (SPEC §5), so a directory that is not a work
+            // tree is a refusal, not "nothing ignored" (INV-4). Say what to do:
+            // git's own wording here is "fatal: not a git repository", which does
+            // not tell the user that `git init` is the fix.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.code() == Some(128)
+                && stderr.to_ascii_lowercase().contains("not a git repository")
+            {
+                return Err(
+                    "GIT_ERROR: not a git repository — git >= 2.30 is required for \
+                     add/update/eject/ci (SPEC §5); run `git init` first"
+                        .to_string(),
+                );
             }
             return Err(format!(
                 "GIT_ERROR: check-ignore exited {}: {}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                stderr.trim()
             ));
         }
         written.map_err(|e| format!("GIT_ERROR: {e}"))?;
@@ -86,13 +88,16 @@ mod tests {
     }
 
     #[test]
-    fn outside_a_repository_nothing_is_ignored_and_nothing_fails() {
+    fn outside_a_repository_is_a_git_error_not_a_clean_check() {
         let dir = tmp("norepo");
         let paths = vec!["vendor/own/a/index.js".to_string()];
-        let ignored = ignored_paths(&dir, &paths).expect("a missing repository is not an error");
+        // git is a prerequisite of add/update/eject/ci and any failing git command
+        // is a GIT_ERROR (SPEC §5): "not a git repository" must not read as clean.
+        let err = ignored_paths(&dir, &paths).expect_err("a missing work tree must fail");
+        assert!(err.starts_with("GIT_ERROR"), "got {err}");
         assert!(
-            ignored.is_empty(),
-            "expected no ignored paths, got {ignored:?}"
+            err.contains("git init"),
+            "the error must say what to do: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,6 +14,23 @@ note() { echo "NOTE  $*"; }
 
 echo "workdir: $W"
 $OWN --version
+
+# SPEC §5: git >= 2.30 is a prerequisite of add. A project outside a work tree
+# must fail loudly with an actionable GIT_ERROR, never vendor silently.
+mkdir -p "$W/nogit"; cd "$W/nogit"
+printf '{"name":"nogit","version":"0.0.0","private":true}\n' > package.json
+npx --yes pnpm@10 add zod@3.22.4 >/dev/null 2>&1
+"$OWN" init --root . >/dev/null 2>&1
+"$OWN" add zod@3.22.4 --root . > nogit.out 2>&1; RC=$?
+if [ $RC -eq 2 ] && grep -q 'GIT_ERROR' nogit.out && grep -q 'git init' nogit.out; then
+  pass "no work tree: add refuses with an actionable GIT_ERROR (exit 2)"
+else
+  fail "no work tree: expected exit 2 + GIT_ERROR + 'git init', got exit $RC"; tail -3 nogit.out
+fi
+# `own init` creates the vendor/own layout, so the check is on the package dir.
+[ -d "vendor/own/zod@3.22.4" ] && fail "no work tree: a package was vendored anyway" \
+  || pass "no work tree: no package vendored"
+
 for V in 9 10; do
   D=$W/pnpm$V; mkdir -p "$D"; cd "$D"
   # SPEC §: `pnpm --version` is authoritative for own, so the whole iteration
@@ -27,6 +44,7 @@ for V in 9 10; do
   echo
   echo "=== pnpm@$V ($("${PNPM[@]}" --version 2>/dev/null)) ==="
   printf '{"name":"e2e","version":"0.0.0","private":true}\n' > package.json
+  git init -q
 
   "${PNPM[@]}" add zod@3.22.4 >/dev/null 2>&1 && pass "pnpm@$V: add zod@3.22.4 (registry)" \
     || fail "pnpm@$V: add zod@3.22.4 (registry)"
