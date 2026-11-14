@@ -487,6 +487,47 @@ fn ci_git_unavailable_is_not_a_clean_ignore_check_inv5() {
 }
 
 #[test]
+fn check_json_lists_every_alert_as_a_finding() {
+    let fixture = Fixture::new();
+    fixture.osv(
+        "2025-01-02T03:04:05Z",
+        serde_json::json!([{
+            "id": "GHSA-fixture-check",
+            "aliases": ["CVE-2025-0001"],
+            "affected": [{
+                "package": "a",
+                "versions": ["1.0.0"],
+                "ranges": [],
+                "database_specific": serde_json::Value::Null,
+            }],
+            "severity": null,
+        }]),
+    );
+    let out = fixture.run(&["check", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["status"].as_str(), Some("findings"));
+    let findings = doc["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no findings array: {doc}"));
+    // §8.0: the public list must carry what decides the exit code; an alert that
+    // only lives in data.alerts leaves `findings` empty on a failing run.
+    assert_eq!(findings.len(), 1, "expected one finding, got {doc}");
+    assert_eq!(findings[0]["code"].as_str(), Some("CVE_ALERT"));
+    assert_eq!(findings[0]["severity"].as_str(), Some("error"));
+    assert_eq!(findings[0]["package"].as_str(), Some("a@1.0.0"));
+    assert!(findings[0]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("GHSA-fixture-check"));
+    assert_eq!(
+        doc["data"]["alerts"].as_array().map(Vec::len),
+        Some(1),
+        "the detailed payload stays available"
+    );
+}
+
+#[test]
 fn verify_rejects_file_and_manifest_rewrite_without_lock_change_inv8() {
     let fixture = Fixture::new();
     let lock_before = read(&fixture.0, "own.lock");

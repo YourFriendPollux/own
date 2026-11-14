@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those artifacts had been committed before the history rewrite).
 
 ### Fixed
+- **`check --format json` hid its own failure**: the envelope said
+  `"status": "findings"` with `"exit_code": 1` while `findings` was a hardcoded
+  empty array — everything lived in `data.alerts`, so any consumer reading the
+  §8.0 public list saw a failing run with nothing in it. Each alert is now also a
+  finding (`CVE_ALERT`, `error`, `<pkg>@<version>`, message naming the advisory
+  and the fixed versions), and `data.alerts` keeps the full detail. Found by
+  running `own check` against the real OSV dump for lodash 4.17.20 and reading
+  the JSON; test `check_json_lists_every_alert_as_a_finding`.
 - **Git-ignore probe outside a repository (`add` step 5, `ci`)**: git exits 128
   with "not a git repository" when asked about a directory that is not a work
   tree, and every such refusal was surfaced as `GIT_ERROR`, so `own add` could

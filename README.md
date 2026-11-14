@@ -94,6 +94,10 @@ Measured on 2026-11-14 against the public npm registry:
 - `scripts/day1.sh` step 1 on the committed corpus: **106 / 250 eligible**
   (license allowlist included), 0 packages skipped, threshold 15 — GO. With the
   §9.1 packument criteria alone (no license, no size) it is 122 / 250.
+- OSV end to end: `own osv-fetch` against the configured public source took
+  14 s and wrote a 13 KB dump covering the single vendored package; `own check`
+  exited 1 with the four advisories affecting lodash 4.17.20, each also present
+  in the JSON `findings` list (not only in `data.alerts`).
 
 Historical measurement of `own ci`: **16 ms release / 145 ms debug**
 on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
@@ -139,10 +143,13 @@ The next conformance priorities are:
   id/alias exceptions. Expired exceptions retain the alert and emit
   `W_IGNORE_EXPIRED`; stale overrides emit `W_OSV_STALE`. Cache paths must be
   project-relative and contain no parent components. VEX refuses missing/stale
-  snapshots by default. Remaining work includes timestamp fractions, future
+  snapshots by default. The download path is now exercised end to end against
+  the public source (lodash 4.17.20: a 14 s fetch wrote a 13 KB dump covering
+  the only vendored package, and `check` reported the four advisories that
+  affect that version). Remaining work includes timestamp fractions, future
   dates, unsupported-range handling, JSON warning coverage, explicit VEX
-  opt-outs and end-to-end OSV download/publication validation. No alert is still
-  not a security guarantee.
+  opt-outs, and publishing a dump — there is no publication feature at all. No
+  alert is still not a security guarantee.
 - Complete signature/provenance verification rather than upgrading detected
   metadata into verified trust levels; close the outstanding dependency audits.
 

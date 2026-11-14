@@ -856,12 +856,36 @@ fn main() -> ExitCode {
                                 })
                             })
                             .collect();
+                        // §8.0: `findings` is the public list, so an alert that
+                        // decides the exit code must appear there too — an empty
+                        // array beside `"status": "findings"` tells a consumer
+                        // nothing failed. `data.alerts` keeps the full detail.
+                        let findings: Vec<serde_json::Value> = alerts
+                            .iter()
+                            .map(|a| {
+                                serde_json::json!({
+                                    "code": "CVE_ALERT",
+                                    "severity": "error",
+                                    "package": format!("{}@{}", a.package, a.current_version),
+                                    "path": "",
+                                    "message": format!(
+                                        "{}: {} ({}) affects {}@{}; fixed in {:?}",
+                                        a.evidence_level,
+                                        a.advisory_id,
+                                        a.aliases.join(", "),
+                                        a.package,
+                                        a.current_version,
+                                        a.fixed_versions
+                                    ),
+                                })
+                            })
+                            .collect();
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "schema_version": 1, "command": "check",
                                 "status": if code == 0 { "ok" } else { "findings" },
-                                "exit_code": code, "findings": [],
+                                "exit_code": code, "findings": findings,
                                 "data": { "alerts": data },
                             }))
                             .unwrap()
