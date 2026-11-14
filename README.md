@@ -37,7 +37,8 @@ own-verify                                # minimal offline verifier (no network
 
 - **INV-1** byte identity with the published tarball; `own` never writes inside `vendor/own/<dir>/`
 - **INV-2/3** registry URL + SRI sha512 + tarball sha256 verified *before* extraction; extraction reads the verified cache fd (no TOCTOU)
-- **INV-8** `own verify` is fully offline and depends only on disk state
+- **INV-8** `own verify` is fully offline and binds the actual manifest records
+  (digest, file count, total size) to `own.lock` before checking disk state
 - **INV-9** every writing command is transactional: the exclusive lock is taken **before** any journal recovery, so a concurrent `own` gets `LOCK_BUSY` instead of rolling back the active transaction. The journal, the backups and every `rename` are `fsync`ed (file + parent directory) before the work they protect, so recovery also survives a power loss, not just `kill -9`. SIGINT/SIGTERM leave the journal `started` and the next writing command restores it (`W_TXN_RECOVERED`): the handler is async-signal-safe and touches nothing.
 - **INV-10** byte-reproducible outputs; inject the clock with `OWN_NOW` (RFC 3339 UTC)
 - Golden hash vectors from SPEC §7.3 are unit tests in `own-core`
@@ -63,15 +64,25 @@ maintainer) until an org team exists.
 
 ## Quality gates (CI)
 
-`cargo fmt --check` · `clippy -D warnings` · `cargo test` (115 tests) ·
-`cargo deny check` · `cargo vet --locked` · fuzz smoke (4 targets, cargo-fuzz installed in CI) ·
-determinism check (INV-10, on a real vendored package). Measured `own ci`: **16 ms release / 145 ms debug**
+`cargo fmt --check` · `clippy -D warnings` · `cargo test --workspace --locked` ·
+`cargo deny check` · `cargo vet --locked` (audit coverage remains incomplete) ·
+fuzz smoke (4 targets, cargo-fuzz installed in CI) ·
+determinism check (INV-10, non-empty synthetic offline fixture; compares verifier
+output and CycloneDX bytes and asserts the component is present).
+Current local verification: **155 workspace tests pass**; 3 opt-in network
+tests are excluded from this count. Their earlier successful run predates the
+latest OSV changes and does not validate the configured OSV download path.
+`cargo deny` passes with duplicate-version warnings; `cargo vet` reports
+21 dependencies lacking audit coverage. These are local results, not evidence
+that hosted CI or release signing passed.
+
+Historical measurement of `own ci`: **16 ms release / 145 ms debug**
 on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
 
 ## Known limits (honest)
 
-- `own-verify --installed` prints a warning: the node_modules/.pnpm comparison
-  is only in `own verify --installed`.
+- `own-verify --installed` uses the same offline installed-file comparison as
+  `own verify --installed`; malformed or missing project inputs are explicit errors.
 - Integrity anchoring is local (lock + manifests in the same repo): `own verify`
   detects drift, not a malicious commit that updates everything at once.
 - **Provenance is detected, not verified**: when a version ships npm attestations
@@ -83,8 +94,9 @@ on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
 - Interrupting a run (Ctrl-C, SIGTERM) does **not** roll back immediately: the
   process exits 130/143 and the next writing command restores the backup. This
   is deliberate — rolling back from a signal handler is not async-signal-safe.
-- `cargo vet` currently ships exemptions only (no audits/imports yet) — the gate
-  is structural, not yet a real review.
+- `cargo vet` currently fails on dependencies without audit coverage. Existing
+  exemptions are not independent audits; new exemptions are not added just to
+  make the gate green.
 - `own ci` requires `pnpm-lock.yaml` (its override/coherence check reads it), so
   it fails with `IO_ERROR` (exit 2) on a repo that never ran `pnpm install`.
 - Toolchain: `rust-toolchain.toml` pins Rust 1.99.1 (`rustfmt` + `clippy`). The
@@ -92,7 +104,32 @@ on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
 
 ## Status
 
-Phase 0 (spec weeks 1-14) implemented: Day-1 GO recorded, 0.1 Core, hardening (fuzz + vet + own-verify), 0.2 (OSV/check/diff/update), 0.3 (sbom/eject/verify-signature). Phase 1 (slicing) requires the §4 gate (>= 70% code reduction on the corpus) — not yet met. Phase 2: E1/E2 reachability evidence (`own check --e1/--e2`, SPEC Annexes G/H) and `vendor-all` (`own add <pkg>@<ver> --allow-diamond=vendor-all` vendors every version of the package resolved in `pnpm-lock.yaml`).
+Phase 0's command set (spec weeks 1-14) is present: 0.1 Core, hardening,
+`own-verify`, 0.2 (OSV/check/diff/update), 0.3 (sbom/eject/verify-signature).
+This is not a claim of full spec conformance or a completed release audit.
+The next conformance priorities are:
+
+- OSV now checks snapshot/advisory structure and UTC timestamps, measures
+  elapsed age, and uses the system clock when `OWN_NOW` is absent. `check` and
+  VEX honor `local_path`, `max_age_days`, environment overrides and dated
+  id/alias exceptions. Expired exceptions retain the alert and emit
+  `W_IGNORE_EXPIRED`; stale overrides emit `W_OSV_STALE`. Cache paths must be
+  project-relative and contain no parent components. VEX refuses missing/stale
+  snapshots by default. Remaining work includes timestamp fractions, future
+  dates, unsupported-range handling, JSON warning coverage, explicit VEX
+  opt-outs and end-to-end OSV download/publication validation. No alert is still
+  not a security guarantee.
+- Complete signature/provenance verification rather than upgrading detected
+  metadata into verified trust levels; close the outstanding dependency audits.
+
+Phase 1 (slicing) still requires the §4 gate (>= 70% code reduction on the
+corpus). Phase 2 surfaces are present: E1/E2 reachability evidence
+(`own check --e1/--e2`, Annexes G/H) and `vendor-all` resolution from
+`pnpm-lock.yaml`; their presence does not certify the full phase's acceptance
+criteria. Python vendoring is not implemented end to end. The referenced
+Annexes G/H are not present in the supplied normative source; the phase-2
+validation contract must therefore state these extensions and their proofs
+explicitly rather than claiming annex conformance.
 
 ## License
 

@@ -71,34 +71,25 @@ fn reduce_advisory(a: &Value) -> Option<Value> {
                         .collect()
                 })
                 .unwrap_or_default();
-            affected_out
-                .push(json!({ "package": pkg, "ranges": ranges_out, "versions": versions }));
+            let mut reduced = json!({ "package": pkg, "ranges": ranges_out, "versions": versions });
+            // Keep hints attached to the original affected record: filtering
+            // other ecosystems must never shift an E1 hint onto another package.
+            for key in ["database_specific", "ecosystem_specific"] {
+                if let Some(value) = aff.get(key) {
+                    reduced[key] = value.clone();
+                }
+            }
+            affected_out.push(reduced);
         }
     }
     let severity = a.get("severity").cloned();
     // Phase 2 (Annexe G): keep file-level hints for E1 evidence evaluation
-    let mut obj = json!({
+    let obj = json!({
         "id": id,
         "aliases": aliases,
         "affected": affected_out,
         "severity": severity,
     });
-    // F-01 (deepseek review): match by INDEX — source package is an object,
-    // reduced package is a string, so value comparison never matched.
-    if let (Some(src_aff), Some(out_aff)) = (
-        a.get("affected").and_then(|x| x.as_array()),
-        obj["affected"].as_array_mut(),
-    ) {
-        for (i, aff_in) in src_aff.iter().enumerate() {
-            if let Some(aout) = out_aff.get_mut(i) {
-                for key in ["database_specific", "ecosystem_specific"] {
-                    if let Some(v) = aff_in.get(key) {
-                        aout[key] = v.clone();
-                    }
-                }
-            }
-        }
-    }
     Some(obj)
 }
 
@@ -113,9 +104,26 @@ pub fn osv_fetch(
         std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
     let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
     let covered: Vec<String> = lock.packages.iter().map(|p| p.name.clone()).collect();
+    let config = read_config(root)?;
+    let output = config.local_path.as_deref().unwrap_or(".own/osv.json");
+    let output_path = root.join(output);
     let client = build_client(&NetConfig::default())?;
-    let zip_bytes = fetch_osv_dump(&client, osv_url, max_download_mb)?;
-    let cursor = std::io::Cursor::new(&zip_bytes);
+    let download = fetch_osv_dump(&client, osv_url, max_download_mb)?;
+    let source_last_modified = download
+        .last_modified
+        .as_deref()
+        .map(|header| {
+            let date = httpdate::parse_http_date(header)
+                .map_err(|e| format!("PARSE_ERROR: OSV Last-Modified: {e}"))?;
+            let seconds = match date.duration_since(std::time::UNIX_EPOCH) {
+                Ok(elapsed) => i64::try_from(elapsed.as_secs()),
+                Err(before) => i64::try_from(before.duration().as_secs()).map(|seconds| -seconds),
+            }
+            .map_err(|e| format!("PARSE_ERROR: OSV Last-Modified: {e}"))?;
+            Ok::<_, String>(crate::sbom::epoch_to_rfc3339(seconds))
+        })
+        .transpose()?;
+    let cursor = std::io::Cursor::new(&download.bytes);
     let mut archive =
         zip::ZipArchive::new(cursor).map_err(|e| format!("PARSE_ERROR: osv zip: {e}"))?;
     let mut advisories: Vec<Value> = Vec::new();
@@ -152,31 +160,54 @@ pub fn osv_fetch(
                 .unwrap_or(false);
             if touches {
                 if let Some(red) = reduce_advisory(&v) {
+                    validate_advisory(&red)?;
                     advisories.push(red);
                 }
             }
         }
     }
     advisories.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    let generated_at = now.unwrap_or("").to_string();
+    let generated_at = match now {
+        Some(now) => {
+            timestamp_utc(now)?;
+            now.to_string()
+        }
+        None => {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("IO_ERROR: clock: {e}"))?
+                .as_secs();
+            crate::sbom::epoch_to_rfc3339(
+                i64::try_from(seconds).map_err(|e| format!("IO_ERROR: clock: {e}"))?,
+            )
+        }
+    };
     let doc = json!({
         "schema_version": 1,
         "generated_at": generated_at,
         "source": osv_url,
-        "source_last_modified": Value::Null,
+        "source_last_modified": source_last_modified,
         "covered_packages": covered,
         "advisories": advisories,
     });
     // compact deterministic JSON (keys sorted via JCS)
     let canon = own_core::jcs::canonicalize(&doc).map_err(|e| format!("IO_ERROR: jcs: {e}"))?;
-    let own_dir = root.join(".own");
-    std::fs::create_dir_all(&own_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| "IO_ERROR: OSV path has no parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("IO_ERROR: {e}"))?;
     // atomic write
-    let tmp = own_dir.join("osv.json.tmp");
+    let mut temp_name = output_path
+        .file_name()
+        .ok_or_else(|| "IO_ERROR: invalid OSV path".to_string())?
+        .to_os_string();
+    temp_name.push(".tmp");
+    let tmp = output_path.with_file_name(temp_name);
     std::fs::write(&tmp, canon.as_bytes()).map_err(|e| format!("IO_ERROR: {e}"))?;
-    std::fs::rename(&tmp, own_dir.join("osv.json")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    std::fs::rename(&tmp, output_path).map_err(|e| format!("IO_ERROR: {e}"))?;
     println!(
-        "wrote .own/osv.json ({} advisories for {} packages)",
+        "wrote {} ({} advisories for {} packages)",
+        output,
         advisories.len(),
         covered.len()
     );
@@ -208,6 +239,208 @@ pub struct Alert {
     pub reachable_sha256: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct Snapshot {
+    schema_version: u32,
+    generated_at: String,
+    source: String,
+    source_last_modified: Option<String>,
+    covered_packages: Vec<String>,
+    advisories: Vec<Value>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct OsvConfig {
+    local_path: Option<String>,
+    max_age_days: Option<u32>,
+    #[serde(default)]
+    ignore: Vec<OsvIgnore>,
+}
+
+#[derive(serde::Deserialize)]
+struct OsvIgnore {
+    id: String,
+    reason: String,
+    expires: String,
+}
+
+fn read_config(root: &Path) -> Result<OsvConfig, String> {
+    #[derive(serde::Deserialize)]
+    struct Config {
+        #[serde(default)]
+        osv: OsvConfig,
+    }
+    let text = std::fs::read_to_string(root.join("own.toml"))
+        .map_err(|e| format!("IO_ERROR: own.toml: {e}"))?;
+    let mut config: Config =
+        toml::from_str(&text).map_err(|e| format!("PARSE_ERROR: own.toml: {e}"))?;
+    for key in ["OWN_OSV_LOCAL_PATH", "OWN_OSV_MAX_AGE_DAYS"] {
+        match std::env::var(key) {
+            Ok(value) => {
+                if key == "OWN_OSV_LOCAL_PATH" {
+                    config.osv.local_path = Some(value);
+                } else {
+                    config.osv.max_age_days = Some(
+                        value
+                            .parse()
+                            .map_err(|e| format!("PARSE_ERROR: {key}: {e}"))?,
+                    );
+                }
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(_) => return Err(format!("PARSE_ERROR: {key}: invalid UTF-8")),
+        }
+    }
+    for entry in &config.osv.ignore {
+        if entry.id.trim().is_empty() || entry.reason.trim().is_empty() {
+            return Err("PARSE_ERROR: OSV ignore requires a nonempty id and reason".to_string());
+        }
+        timestamp_utc(&format!("{}T00:00:00Z", entry.expires))?;
+    }
+    if let Some(path) = &config.osv.local_path {
+        let path = Path::new(path);
+        if path.file_name().is_none()
+            || !path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err("PARSE_ERROR: OSV local_path must be a project-relative file path without parent components".to_string());
+        }
+    }
+    Ok(config.osv)
+}
+
+fn validate_advisory(raw: &Value) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct Advisory {
+        id: String,
+        #[serde(default)]
+        aliases: Vec<String>,
+        affected: Vec<Affected>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Affected {
+        package: String,
+        #[serde(default)]
+        versions: Vec<String>,
+        #[serde(default)]
+        ranges: Vec<Range>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Range {
+        #[serde(rename = "type")]
+        kind: String,
+        events: Vec<std::collections::BTreeMap<String, String>>,
+    }
+    let advisory: Advisory = serde_json::from_value(raw.clone())
+        .map_err(|e| format!("PARSE_ERROR: OSV advisory: {e}"))?;
+    let invalid = || "PARSE_ERROR: invalid OSV advisory".to_string();
+    if advisory.id.is_empty() || advisory.aliases.iter().any(String::is_empty) {
+        return Err(invalid());
+    }
+    for affected in advisory.affected {
+        if affected.package.is_empty() || affected.versions.iter().any(String::is_empty) {
+            return Err(invalid());
+        }
+        for range in affected.ranges {
+            if !matches!(range.kind.as_str(), "SEMVER" | "ECOSYSTEM" | "GIT")
+                || range.events.is_empty()
+            {
+                return Err(invalid());
+            }
+            for event in range.events {
+                if event.len() != 1
+                    || event.iter().any(|(key, value)| {
+                        !matches!(
+                            key.as_str(),
+                            "introduced" | "fixed" | "last_affected" | "limit"
+                        ) || value.is_empty()
+                    })
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct UtcTimestamp {
+    seconds: i64,
+    // Canonical decimal fraction without trailing zeros. Lexical ordering is
+    // exact for any precision and does not round values at the age deadline.
+    fraction: String,
+}
+
+fn timestamp_utc(text: &str) -> Result<UtcTimestamp, String> {
+    let invalid = || "PARSE_ERROR: invalid UTC RFC3339 timestamp".to_string();
+    if !text.is_ascii() {
+        return Err(invalid());
+    }
+    let core = text
+        .strip_suffix('Z')
+        .or_else(|| text.strip_suffix("+00:00"))
+        .ok_or_else(invalid)?;
+    if core.len() < 19 {
+        return Err(invalid());
+    }
+    let fraction = match &core[19..] {
+        "" => String::new(),
+        suffix => {
+            let digits = suffix.strip_prefix('.').ok_or_else(invalid)?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            digits.trim_end_matches('0').to_string()
+        }
+    };
+    let b = core.as_bytes();
+    for (i, delimiter) in [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')] {
+        if b[i] != delimiter {
+            return Err(invalid());
+        }
+    }
+    let number = |range: std::ops::Range<usize>| -> Result<i64, String> {
+        if !b[range.clone()].iter().all(u8::is_ascii_digit) {
+            return Err(invalid());
+        }
+        text[range].parse().map_err(|_| invalid())
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return Err(invalid()),
+    };
+    if !(1..=max_day).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return Err(invalid());
+    }
+    // Gregorian civil date to Unix days, inverse of the SBOM formatter.
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Ok(UtcTimestamp {
+        seconds: (era * 146_097 + doe - 719_468) * 86_400 + hour * 3600 + minute * 60 + second,
+        fraction,
+    })
+}
+
 /// `own check` (offline, E0): evaluate .own/osv.json against the lock (§8.2).
 pub fn check(
     root: &Path,
@@ -217,61 +450,89 @@ pub fn check(
     let lock_text =
         std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
     let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
-    let path = root.join(osv_local_path);
+    let config = read_config(root)?;
+    let path = root.join(config.local_path.as_deref().unwrap_or(osv_local_path));
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(_) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if args.allow_missing_osv {
                 return Ok((vec![], vec!["W_OSV_MISSING".to_string()]));
             }
             return Err("OSV_MISSING".to_string());
         }
+        Err(error) => return Err(format!("IO_ERROR: OSV snapshot: {error}")),
     };
-    let doc: Value =
+    let doc: Snapshot =
         serde_json::from_str(&text).map_err(|e| format!("PARSE_ERROR: osv.json: {e}"))?;
+    if doc.schema_version != 1 || doc.source.is_empty() {
+        return Err("PARSE_ERROR: invalid OSV snapshot schema or source".to_string());
+    }
+    for advisory in &doc.advisories {
+        validate_advisory(advisory)?;
+    }
+    let snapshot_time = timestamp_utc(&doc.generated_at)?;
+    let source_time = doc
+        .source_last_modified
+        .as_deref()
+        .map(timestamp_utc)
+        .transpose()?;
     // freshness
-    let generated_at = doc
-        .get("generated_at")
-        .and_then(|g| g.as_str())
-        .unwrap_or("");
-    if !generated_at.is_empty() {
-        if let Some(now) = &args.now {
-            let age_days = days_between(generated_at, now);
-            if age_days > args.max_age_days as i64 {
-                if args.allow_stale_osv {
-                    // warning only
-                } else {
-                    return Err("OSV_STALE".to_string());
-                }
+    let now_time = match &args.now {
+        Some(now) => timestamp_utc(now)?,
+        None => {
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("IO_ERROR: clock: {e}"))?;
+            UtcTimestamp {
+                seconds: i64::try_from(elapsed.as_secs())
+                    .map_err(|e| format!("IO_ERROR: clock: {e}"))?,
+                fraction: format!("{:09}", elapsed.subsec_nanos())
+                    .trim_end_matches('0')
+                    .to_string(),
             }
+        }
+    };
+    if snapshot_time > now_time {
+        return Err("PARSE_ERROR: OSV generated_at is in the future".to_string());
+    }
+    // §8.2 risk table ("a mirror that lies about its dates"): a source date
+    // later than the injected clock is refused, and --allow-stale-osv, which
+    // only downgrades OSV_STALE, cannot mask it.
+    if source_time.is_some_and(|source_time| source_time > now_time) {
+        return Err("PARSE_ERROR: OSV source_last_modified is in the future".to_string());
+    }
+    let age_seconds = now_time.seconds - snapshot_time.seconds;
+    let max_age_days = config.max_age_days.unwrap_or(args.max_age_days);
+    let max_age_seconds = i64::from(max_age_days) * 86_400;
+    let mut warnings = Vec::new();
+    if age_seconds > max_age_seconds
+        || (age_seconds == max_age_seconds && now_time.fraction > snapshot_time.fraction)
+    {
+        if args.allow_stale_osv {
+            warnings.push("W_OSV_STALE".to_string());
+        } else {
+            return Err("OSV_STALE".to_string());
         }
     }
     // completeness: every lock package must be covered
-    let covered: Vec<String> = doc
-        .get("covered_packages")
-        .and_then(|c| c.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let covered = &doc.covered_packages;
     for p in &lock.packages {
         if !covered.contains(&p.name) {
             return Err("OSV_INCOMPLETE".to_string());
         }
     }
-    let ignores: Vec<(String, String)> = vec![]; // [osv].ignore parsed from own.toml — wired in CLI
-    let _ = ignores;
+    let mut ignored_ids = Vec::new();
+    for entry in &config.ignore {
+        let expiration = timestamp_utc(&format!("{}T00:00:00Z", entry.expires))?.seconds + 86_400;
+        if now_time.seconds < expiration {
+            ignored_ids.push(entry.id.as_str());
+        } else {
+            warnings.push(format!("W_IGNORE_EXPIRED: {}", entry.id));
+        }
+    }
     let mut alerts = Vec::new();
-    let warnings: Vec<String> = Vec::new();
     for p in &lock.packages {
-        let advisories = doc
-            .get("advisories")
-            .and_then(|a| a.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for adv in &advisories {
+        for adv in &doc.advisories {
             let id = adv
                 .get("id")
                 .and_then(|i| i.as_str())
@@ -286,6 +547,13 @@ pub fn check(
                         .collect()
                 })
                 .unwrap_or_default();
+            if ignored_ids.contains(&id.as_str())
+                || aliases
+                    .iter()
+                    .any(|alias| ignored_ids.contains(&alias.as_str()))
+            {
+                continue;
+            }
             for aff in adv
                 .get("affected")
                 .and_then(|a| a.as_array())
@@ -395,18 +663,54 @@ pub fn check(
             }
         }
     }
-    let _ = warnings;
     Ok((alerts, warnings))
 }
 
-fn days_between(a: &str, b: &str) -> i64 {
-    // RFC 3339 dates only; compare by parsing YYYY-MM-DD prefix
-    let pa: Vec<i64> = a[..10].split('-').filter_map(|x| x.parse().ok()).collect();
-    let pb: Vec<i64> = b[..10].split('-').filter_map(|x| x.parse().ok()).collect();
-    if pa.len() != 3 || pb.len() != 3 {
-        return 0;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduced_hints_stay_with_their_package_after_ecosystem_filtering_p2_04() {
+        let advisory = json!({
+            "id": "GHSA-fixture-package-hints",
+            "affected": [
+                {
+                    "package": {"name": "python-fixture", "ecosystem": "PyPI"},
+                    "database_specific": {"vulnerable_files": ["python-only.py"]},
+                    "ecosystem_specific": {"vulnerable_files": ["wrong-npm-file.js"]}
+                },
+                {
+                    "package": {"name": "a", "ecosystem": "npm"},
+                    "versions": ["1.0.0"],
+                    "database_specific": {"vulnerable_files": ["a.js"]},
+                    "ecosystem_specific": {"vulnerable_files": ["a-extra.js"]}
+                },
+                {
+                    "package": {"name": "b", "ecosystem": "npm"},
+                    "versions": ["2.0.0"],
+                    "database_specific": {"vulnerable_files": ["b.js"]}
+                }
+            ]
+        });
+        let reduced = reduce_advisory(&advisory).unwrap();
+        let affected = reduced["affected"].as_array().unwrap();
+        assert_eq!(affected.len(), 2);
+        assert_eq!(affected[0]["package"], "a");
+        assert_eq!(
+            affected[0]["database_specific"]["vulnerable_files"],
+            json!(["a.js"])
+        );
+        assert_eq!(
+            affected[0]["ecosystem_specific"]["vulnerable_files"],
+            json!(["a-extra.js"])
+        );
+        assert_eq!(affected[1]["package"], "b");
+        assert_eq!(
+            affected[1]["database_specific"]["vulnerable_files"],
+            json!(["b.js"])
+        );
+        assert!(affected[1].get("ecosystem_specific").is_none());
+        validate_advisory(&reduced).unwrap();
     }
-    let da = pa[0] * 365 + pa[1] * 30 + pa[2];
-    let db = pb[0] * 365 + pb[1] * 30 + pb[2];
-    db - da
 }

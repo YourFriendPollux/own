@@ -35,22 +35,5 @@ jobs:
           cargo +nightly fuzz run packument -- -max_total_time=20
           cargo +nightly fuzz run spdx_expr -- -max_total_time=20
           cargo +nightly fuzz run osv_json -- -max_total_time=20
-      - name: Determinism check (INV-10)
-        run: |
-          cargo build --workspace
-          OWN=$GITHUB_WORKSPACE/target/debug/own
-          cd /tmp && rm -rf own-det && mkdir own-det && cd own-det
-          git init -q .
-          printf '{"name":"det","version":"0.0.0","private":true}\n' > package.json
-          $OWN init >/dev/null
-          # vendor one tiny real package so verify has actual state to hash
-          OWN_NOW=2026-11-10T00:00:00Z $OWN add is-odd@3.0.1 >/dev/null 2>&1 || true
-          OWN_NOW=2026-11-10T00:00:00Z $OWN verify >/dev/null
-          sha256sum own.lock > run1.sha
-          OWN_NOW=2026-11-10T00:00:00Z $OWN verify >/dev/null
-          sha256sum own.lock > run2.sha
-          diff run1.sha run2.sha
-          # a second run on the same tree must produce byte-identical lock output
-          OWN_NOW=2026-11-10T00:00:00Z $OWN sbom --format json --output sbom1.json >/dev/null 2>&1 || true
-          OWN_NOW=2026-11-10T00:00:00Z $OWN sbom --format json --output sbom2.json >/dev/null 2>&1 || true
-          if [ -f sbom1.json ] && [ -f sbom2.json ]; then diff sbom1.json sbom2.json; fi
+      - name: Determinism check (INV-10, non-empty offline fixture)
+        run: cargo test --locked -p own-cli --test ci_guards inv10_nonempty_vendor_verify_and_sbom_are_byte_reproducible -- --exact

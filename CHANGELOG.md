@@ -27,6 +27,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those artifacts had been committed before the history rewrite).
 
 ### Fixed
+- **OSV cache and policy checks (partial)**: validate snapshot/advisory
+  structure and UTC dates; compare elapsed seconds using the system clock
+  when `OWN_NOW` is absent. `check` and VEX share configured cache paths, age
+  limits, environment overrides and id/alias exceptions requiring a reason
+  and valid expiry date. Expired exceptions retain alerts with
+  `W_IGNORE_EXPIRED`; stale overrides retain `W_OSV_STALE`. Reject absolute
+  or parent-traversing cache paths. VEX no longer implicitly bypasses
+  missing/stale snapshots.
+- **OSV source date and real-age comparison (§8.2, INV-5/INV-10)**:
+  `fetch_osv_dump` now returns the `Last-Modified` header with the archive
+  bytes, and `own osv fetch` writes it to `source_last_modified` as RFC 3339
+  UTC instead of a constant `null`. Age comparison keeps sub-second
+  precision, so the inclusive deadline is decided exactly. A snapshot dated
+  in the future is refused (`PARSE_ERROR ... in the future`) for both
+  `generated_at` and `source_last_modified`, and `--allow-stale-osv` cannot
+  mask it: the §8.2 risk table names a mirror that lies about its dates.
+  `--allow-missing-osv` no longer masks a snapshot that exists but is
+  unreadable. Ecosystem filtering keeps `database_specific` and
+  `ecosystem_specific` attached to their own affected record, so a hint can
+  no longer move onto another package. Two opt-in network tests exercise the
+  real HTTPS mirror: a four-byte ranged fetch for the transport header, and
+  a full `osv fetch` writing to a configured path. 6 new tests. These changes
+  do not certify phase 2.
+- **Manifest integrity anchor (INV-8)**: recompute the digest, file count and
+  total size of the actual manifest records against `own.lock`. Changing a file
+  and its manifest hash no longer bypasses verification while the lock stays
+  unchanged. Both verifier binaries use this shared check.
+- **Git pipe deadlock (INV-5)**: `add` and `ci` share a NUL-delimited ignore
+  probe that feeds stdin while draining stdout/stderr. Regression test with
+  3,000 ignored files; Git failures remain explicit errors.
+- **Git safety and transactional initialization (INV-1/5/9)**: `init` keeps the
+  vendor negation last, preserves unreadable Git configuration by refusing the
+  operation, checks repositories in parent directories, and rolls back on Git
+  errors. `VENDOR_PATH_IGNORED` uses exit 1. `add` and `ci` no longer confuse
+  failed ignore checks with clean results; `ci` checks project-relative paths.
+- **CI JSON output**: `--base-ref` change notes stay inside `data.notes`, not
+  before the JSON document. Human findings are results on stdout.
+- **Minimal verifier**: `own-verify --installed` performs the installed-file
+  comparison. Missing configuration/lock and unreadable or malformed inputs
+  are explicit errors, not empty policy/override values. JSON error envelopes
+  and sorted findings use the same output contract as successful verification.
+- **Determinism gate**: replace the ineffective network setup and swallowed
+  errors with an offline, non-empty fixture comparing verify and SBOM output.
+- **Dependency advisories**: upgrade `zip` from 2.6.1 to 9.5.1 for
+  RUSTSEC-2026-0367/0368/0369/0429; remove its unused dependency from `own-net`.
+  OSV still reads ZIP entries in memory, never using disk extraction APIs.
 - **CLI conformance (§8.0/§8.1/§8.3)**, from the divergences the integration suite
   documented:
   - `NOT_INITIALIZED` (exit 2) is now the answer of every command that needs
@@ -92,8 +138,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rule_non_utf8_path_refused` (18 → 23 hostile tests).
 - **Verify (CRLF)**: the CRLF→LF normalization no longer doubles `\n`, so
   `LINE_ENDINGS_REWRITTEN` actually fires.
-- **own-verify**: `--installed` now prints a warning instead of being silently
-  ignored.
 - **Release workflow**: all `uses:` refs pinned to real, verified 40-char commit
   SHAs (checkout v4.2.2, upload-artifact v4.6.2, download-artifact v4.3.0,
   cosign-installer v4.1.1, action-gh-release v3.0.3, dtolnay/rust-toolchain v1).
@@ -104,9 +148,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-OS (darwin/linux); the non-existent detached `.sig` is gone — verification
   uses the `.bundle` produced by the release; SLSA attestation is fetched as
   `<asset>.intoto.jsonl`.
-- **CI**: installs `cargo-deny`, `cargo-vet` and `cargo-fuzz` before use; the
-  determinism check now runs `own init` + `own add` on a real package instead
-  of verifying an empty repo twice.
+- **CI**: installs `cargo-deny`, `cargo-vet` and `cargo-fuzz` before use.
 
 ### Changed
 - `fuzz/corpus/` (3 449 generated libFuzzer artifacts, ~14 MB) is untracked and

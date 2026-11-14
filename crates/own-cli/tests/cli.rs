@@ -195,6 +195,22 @@ fn write_empty_pnpm_lock(root: &Path) {
     );
 }
 
+fn write_empty_osv(root: &Path) {
+    write(
+        root,
+        ".own/osv.json",
+        serde_json::json!({
+            "schema_version": 1,
+            "generated_at": FIXED_NOW,
+            "source": "https://example.invalid/npm/all.zip",
+            "source_last_modified": null,
+            "covered_packages": [],
+            "advisories": [],
+        })
+        .to_string(),
+    );
+}
+
 fn init_project(label: &str) -> TempDir {
     let dir = TempDir::new(label);
     write_package_json(dir.path());
@@ -996,6 +1012,7 @@ fn sbom_cyclonedx_on_empty_lock_is_valid() {
 #[test]
 fn sbom_vex_on_empty_lock_is_valid() {
     let dir = init_project("sbom-vex");
+    write_empty_osv(dir.path());
 
     // §8.3: `--output` is optional — without it the document goes to stdout
     // (covered by `sbom_vex_without_output_prints_to_stdout`).
@@ -1040,6 +1057,7 @@ fn sbom_vex_on_empty_lock_is_valid() {
 #[test]
 fn sbom_output_is_byte_identical_with_fixed_own_now() {
     let dir = init_project("sbom-determinism");
+    write_empty_osv(dir.path());
     let lock_before = read_bytes(dir.path(), "own.lock");
 
     for (first, second) in [("cdx-a.json", "cdx-b.json")] {
@@ -1185,9 +1203,14 @@ fn verify_json_format_emits_the_common_envelope() {
 #[test]
 fn sbom_vex_without_output_prints_to_stdout() {
     let dir = init_project("sbom-vex-stdout");
+    write_empty_osv(dir.path());
 
     // §8.3: `--output` is optional; without it the document goes to stdout.
-    let result = own(dir.path(), &["sbom", "--format", "vex"]);
+    let result = run_own(
+        dir.path(),
+        &[("OWN_NOW", FIXED_NOW)],
+        &["sbom", "--format", "vex"],
+    );
     assert_exit(&result, 0, "sbom --format vex without --output");
     assert!(result.2.is_empty(), "stderr: {:?}", result.2);
 
@@ -1231,4 +1254,81 @@ fn init_is_transactional_and_leaves_no_journal_behind() {
         leftover_count, 0,
         "a committed init must leave no transaction directory behind"
     );
+}
+
+#[test]
+fn init_inv1_keeps_vendor_negation_last_after_existing_ignore_rules() {
+    let dir = TempDir::new("init-ignore-order");
+    git_init(dir.path());
+    write_package_json(dir.path());
+    write(dir.path(), ".gitignore", "!vendor/own/**\ndist/\n");
+
+    assert_exit(&own(dir.path(), &["init"]), 0, "init with earlier negation");
+    assert_eq!(
+        read(dir.path(), ".gitignore").lines().last(),
+        Some("!vendor/own/**")
+    );
+    let out = Command::new("git")
+        .args([
+            "check-ignore",
+            "--no-index",
+            "vendor/own/a@1.0.0/dist/index.js",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "vendor file must not be ignored"
+    );
+}
+
+#[test]
+fn init_git_error_rolls_back_inv9() {
+    let dir = TempDir::new("init-broken-git");
+    write_package_json(dir.path());
+    fs::create_dir(dir.join(".git")).unwrap();
+    write(dir.path(), ".gitignore", "dist/\n");
+
+    let result = own(dir.path(), &["init"]);
+    assert_exit(&result, 2, "init in invalid git repository");
+    assert!(result.2.contains("GIT_ERROR"), "{result:?}");
+    assert!(!dir.join("own.lock").exists());
+    assert!(!dir.join("own.toml").exists());
+    assert_eq!(read(dir.path(), ".gitignore"), "dist/\n");
+}
+
+#[test]
+fn init_io_error_preserves_non_utf8_git_configuration_inv5_inv9() {
+    for rel in [".gitignore", ".gitattributes"] {
+        let dir = TempDir::new("init-invalid-utf8");
+        write_package_json(dir.path());
+        let original = b"keep-this-rule\n\xff\n";
+        write(dir.path(), rel, original);
+
+        let result = own(dir.path(), &["init"]);
+        assert_exit(&result, 2, "init with unreadable git configuration");
+        assert!(result.2.contains("IO_ERROR"), "{result:?}");
+        assert_eq!(read_bytes(dir.path(), rel), original);
+        assert!(!dir.join("own.lock").exists());
+        assert!(!dir.join("own.toml").exists());
+    }
+}
+
+#[test]
+fn init_vendor_path_ignored_in_parent_repository_rolls_back_inv9() {
+    let repo = TempDir::new("init-parent-repo");
+    git_init(repo.path());
+    write(repo.path(), ".gitignore", "vendor/\n");
+    let root = repo.join("packages/app");
+    fs::create_dir_all(&root).unwrap();
+    write_package_json(&root);
+
+    let result = own(&root, &["init"]);
+    assert_exit(&result, 1, "init under parent repository's ignored vendor");
+    assert!(result.2.contains("VENDOR_PATH_IGNORED"), "{result:?}");
+    assert!(!root.join("own.lock").exists());
+    assert!(!root.join("own.toml").exists());
+    assert!(!root.join(".gitignore").exists());
 }

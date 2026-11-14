@@ -351,36 +351,12 @@ fn add_inner(
     let mut paths: Vec<String> = Vec::new();
     collect_files(&tmp_extract, &tmp_extract, &mut paths);
     if !paths.is_empty() {
-        use std::io::Write;
-        let mut child = std::process::Command::new("git")
-            .args(["check-ignore", "--no-index", "--stdin"])
-            .current_dir(root)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("GIT_ERROR: {e}"))?;
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(
-                paths
-                    .iter()
-                    .map(|p| {
-                        format!(
-                            "vendor/own/{}/{}\n",
-                            own_core::lock::dir_name(&args.pkg, &args.version),
-                            p
-                        )
-                    })
-                    .collect::<String>()
-                    .as_bytes(),
-            )
-            .map_err(|e| format!("GIT_ERROR: {e}"))?;
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("GIT_ERROR: {e}"))?;
-        if !out.stdout.is_empty() {
+        let vendor_dir = own_core::lock::dir_name(&args.pkg, &args.version);
+        let vendor_paths: Vec<_> = paths
+            .iter()
+            .map(|p| format!("vendor/own/{vendor_dir}/{p}"))
+            .collect();
+        if !crate::git_ignore::ignored_paths(root, &vendor_paths)?.is_empty() {
             return Err("VENDOR_PATH_IGNORED: a vendored file is git-ignored; add '!vendor/own/**' as the last line of .gitignore".to_string());
         }
     }

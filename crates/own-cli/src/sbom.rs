@@ -33,7 +33,7 @@ fn now_rfc3339(now: &Option<String>) -> String {
     epoch_to_rfc3339(secs)
 }
 
-fn epoch_to_rfc3339(secs: i64) -> String {
+pub(crate) fn epoch_to_rfc3339(secs: i64) -> String {
     // civil-from-days algorithm (Howard Hinnant), no chrono dependency
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -185,12 +185,15 @@ pub fn sbom(root: &Path, args: &SbomArgs) -> Result<u8, String> {
                 e1: args.e1,
                 e2: false,
                 remote: false,
-                allow_stale_osv: true,
-                allow_missing_osv: true,
+                allow_stale_osv: false,
+                allow_missing_osv: false,
                 now: args.now.clone(),
                 max_age_days: 7,
             };
-            let (alerts, _w) = crate::osv::check(root, &check_args, ".own/osv.json")?;
+            let (alerts, warnings) = crate::osv::check(root, &check_args, ".own/osv.json")?;
+            for warning in warnings {
+                eprintln!("warning: {warning}");
+            }
             let doc = openvex(root, args, &alerts)?;
             let s = serde_json::to_string_pretty(&doc).map_err(|e| format!("IO_ERROR: {e}"))?;
             let out_path = if args.format == "both" {

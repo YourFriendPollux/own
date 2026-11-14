@@ -229,14 +229,20 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Fetch the OSV npm dump zip (SPEC §8.2), capped by max_download_mb, and
-/// return the raw zip bytes (never extracted to disk here; the caller reads
-/// entries in memory with the same size/ratio guards as §11.2).
+#[derive(Debug, serde::Serialize)]
+pub struct OsvDump {
+    pub bytes: Vec<u8>,
+    /// Original HTTP source date, converted to UTC by the snapshot writer.
+    pub last_modified: Option<String>,
+}
+
+/// Fetch capped OSV zip bytes and retain the source's Last-Modified header.
+/// No archive entry is extracted to disk by this transport function.
 pub fn fetch_osv_dump(
     client: &Client,
     osv_url: &str,
     max_download_mb: u64,
-) -> Result<Vec<u8>, String> {
+) -> Result<OsvDump, String> {
     let url = Url::parse(osv_url).map_err(|e| format!("USAGE_ERROR: osv url: {e}"))?;
     if url.scheme() != "https" {
         return Err("NETWORK_ERROR: osv url must be https".to_string());
@@ -254,6 +260,15 @@ pub fn fetch_osv_dump(
                 if !status.is_success() {
                     return Err(format!("NETWORK_ERROR: HTTP {status}"));
                 }
+                let last_modified =
+                    resp.headers()
+                        .get(reqwest::header::LAST_MODIFIED)
+                        .map(|value| {
+                            value.to_str().map(str::to_owned).map_err(|_| {
+                                "NETWORK_ERROR: invalid Last-Modified header".to_string()
+                            })
+                        })
+                        .transpose()?;
                 let mut resp = resp;
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 65536];
@@ -269,7 +284,10 @@ pub fn fetch_osv_dump(
                     }
                     buf.extend_from_slice(&chunk[..n]);
                 }
-                return Ok(buf);
+                return Ok(OsvDump {
+                    bytes: buf,
+                    last_modified,
+                });
             }
             Err(e) if (e.is_timeout() || e.is_connect()) && attempt < 3 => {
                 last_err = format!("NETWORK_ERROR: {e}");

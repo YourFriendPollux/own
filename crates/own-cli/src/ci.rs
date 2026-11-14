@@ -232,38 +232,16 @@ pub fn ci(root: &Path, args: &CiArgs) -> Result<(Vec<Finding>, Vec<String>), Str
         let mut paths = Vec::new();
         for p in &lock.packages {
             let base = root.join(&p.dir);
-            collect_files(&base, &base, &mut paths);
+            collect_files(root, &base, &mut paths);
         }
         if !paths.is_empty() {
-            use std::io::Write;
-            let mut child = Command::new("git")
-                .args(["check-ignore", "--no-index", "--stdin"])
-                .current_dir(root)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("GIT_ERROR: {e}"))?;
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(
-                    paths
-                        .iter()
-                        .map(|p| format!("{p}\n"))
-                        .collect::<String>()
-                        .as_bytes(),
-                )
-                .map_err(|e| format!("GIT_ERROR: {e}"))?;
-            let out = child
-                .wait_with_output()
-                .map_err(|e| format!("GIT_ERROR: {e}"))?;
-            if !out.stdout.is_empty() {
+            let ignored = crate::git_ignore::ignored_paths(root, &paths)?;
+            for path in ignored {
                 findings.push(Finding {
                     code: "VENDOR_PATH_IGNORED".to_string(),
                     severity: "error".to_string(),
                     package: String::new(),
-                    path: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                    path,
                     message: "a vendored file is git-ignored; add '!vendor/own/**' as the last .gitignore line".to_string(),
                 });
             }
@@ -287,6 +265,9 @@ pub fn ci(root: &Path, args: &CiArgs) -> Result<(Vec<Finding>, Vec<String>), Str
                 .current_dir(root)
                 .output()
                 .map_err(|e| format!("GIT_ERROR: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("GIT_ERROR: diff exited {}", out.status));
+            }
             if !out.stdout.is_empty() {
                 notes.push(format!("changed: {f} since {mb}"));
                 if args.fail_on_lock_change {
@@ -301,6 +282,7 @@ pub fn ci(root: &Path, args: &CiArgs) -> Result<(Vec<Finding>, Vec<String>), Str
             }
         }
     }
+    findings.sort_by(|a, b| (&a.code, &a.package, &a.path).cmp(&(&b.code, &b.package, &b.path)));
     Ok((findings, notes))
 }
 
@@ -312,11 +294,7 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<String>) {
                 collect_files(base, &p, out);
             } else if p.is_file() {
                 if let Ok(rel) = p.strip_prefix(base) {
-                    out.push(format!(
-                        "{}/{}",
-                        base.file_name().unwrap_or_default().to_string_lossy(),
-                        rel.to_string_lossy()
-                    ));
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
                 }
             }
         }

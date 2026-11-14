@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use own_core::config::license_policy_json;
-use own_core::verify::verify;
+use own_core::verify::{verify, verify_installed};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -21,59 +21,115 @@ struct Cli {
     format: String,
 }
 
-fn read_overrides(root: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+fn read_overrides(
+    root: &std::path::Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let text = std::fs::read_to_string(root.join("package.json"))
+        .map_err(|e| format!("IO_ERROR: package.json: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("PARSE_ERROR: package.json: {e}"))?;
+    let object = v
+        .as_object()
+        .ok_or("PARSE_ERROR: package.json: expected an object")?;
     let mut out = serde_json::Map::new();
-    if let Ok(text) = std::fs::read_to_string(root.join("package.json")) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(ov) = v
-                .get("pnpm")
-                .and_then(|p| p.get("overrides"))
-                .and_then(|o| o.as_object())
-            {
-                for (k, val) in ov {
-                    if let Some(s) = val.as_str() {
-                        if s.starts_with("file:vendor/own/") {
-                            out.insert(k.clone(), serde_json::Value::String(s.to_string()));
-                        }
-                    }
+    if let Some(pnpm) = object.get("pnpm") {
+        let pnpm = pnpm
+            .as_object()
+            .ok_or("PARSE_ERROR: package.json: pnpm must be an object")?;
+        if let Some(overrides) = pnpm.get("overrides") {
+            let overrides = overrides
+                .as_object()
+                .ok_or("PARSE_ERROR: package.json: pnpm.overrides must be an object")?;
+            for (key, value) in overrides {
+                let value = value.as_str().ok_or_else(|| {
+                    format!("PARSE_ERROR: package.json: pnpm.overrides[{key:?}] must be a string")
+                })?;
+                if value.starts_with("file:vendor/own/") {
+                    out.insert(key.clone(), serde_json::Value::String(value.to_string()));
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let root = cli.root.unwrap_or_else(|| std::env::current_dir().unwrap());
-    let policy = std::fs::read_to_string(root.join("own.toml"))
-        .ok()
-        .and_then(|t| license_policy_json(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let overrides = read_overrides(&root);
-    match verify(&root, &policy, &overrides) {
-        Ok(outcome) => {
-            let code = if outcome.findings.iter().any(|f| f.severity == "error") {
-                1
-            } else {
-                0
-            };
-            if cli.installed {
-                eprintln!("warning: --installed not implemented in own-verify 0.1 (offline-only core); run `own verify --installed` for the node_modules/.pnpm comparison");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if !error.use_stderr() {
+                error.exit();
             }
+            let args: Vec<_> = std::env::args_os()
+                .skip(1)
+                .take_while(|arg| arg != "--")
+                .collect();
+            let json = args.iter().any(|arg| arg == "--format=json")
+                || args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--format" && pair[1] == "json");
+            return report_error(json, &format!("USAGE_ERROR: {error}"));
+        }
+    };
+    let root = cli.root.unwrap_or_else(|| std::env::current_dir().unwrap());
+    let result = (|| {
+        if cli.format != "human" && cli.format != "json" {
+            return Err(format!(
+                "USAGE_ERROR: --format must be human or json, got {:?}",
+                cli.format
+            ));
+        }
+        for file in ["own.toml", "own.lock"] {
+            std::fs::metadata(root.join(file)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    format!("NOT_INITIALIZED: {file} missing (run `own init` first)")
+                } else {
+                    format!("IO_ERROR: {file}: {e}")
+                }
+            })?;
+        }
+        let config = std::fs::read_to_string(root.join("own.toml"))
+            .map_err(|e| format!("IO_ERROR: own.toml: {e}"))?;
+        let policy = license_policy_json(&config)?;
+        let overrides = read_overrides(&root)?;
+        let mut outcome = verify(&root, &policy, &overrides)?;
+        if cli.installed {
+            outcome.findings.extend(verify_installed(&root)?);
+        }
+        outcome
+            .findings
+            .sort_by(|a, b| (&a.code, &a.package, &a.path).cmp(&(&b.code, &b.package, &b.path)));
+        Ok::<_, String>(outcome)
+    })();
+    match result {
+        Ok(outcome) => {
+            let code = outcome
+                .findings
+                .iter()
+                .filter(|f| f.severity == "error")
+                .map(|f| match f.code.as_str() {
+                    "IO_ERROR"
+                    | "PARSE_ERROR"
+                    | "LOCK_NOT_CANONICAL"
+                    | "LOCK_SCHEMA_UNSUPPORTED" => 2,
+                    _ => 1,
+                })
+                .max()
+                .unwrap_or(0);
+
             if cli.format == "json" {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    own_core::jcs::canonicalize(&serde_json::json!({
                         "schema_version": 1, "command": "verify",
-                        "status": if code == 0 { "ok" } else { "findings" },
+                        "status": match code { 0 => "ok", 1 => "findings", _ => "error" },
                         "exit_code": code, "findings": outcome.findings, "data": {},
                     }))
-                    .unwrap()
+                    .expect("verify output contains only JCS-safe values")
                 );
             } else {
                 for f in &outcome.findings {
-                    eprintln!(
+                    println!(
                         "{}: [{}] {} {}",
                         f.severity.to_uppercase(),
                         f.code,
@@ -87,9 +143,33 @@ fn main() -> ExitCode {
             }
             ExitCode::from(code)
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(2)
-        }
+        Err(e) => report_error(cli.format == "json", &e),
     }
+}
+
+fn report_error(json: bool, error: &str) -> ExitCode {
+    if json {
+        let code = error.split(':').next().unwrap_or("IO_ERROR");
+        println!(
+            "{}",
+            own_core::jcs::canonicalize(&serde_json::json!({
+                "schema_version": 1,
+                "command": "verify",
+                "status": "error",
+                "exit_code": 2,
+                "findings": [{
+                    "code": code,
+                    "severity": "error",
+                    "package": "",
+                    "path": "",
+                    "message": error,
+                }],
+                "data": {},
+            }))
+            .expect("verify output contains only JCS-safe values")
+        );
+    } else {
+        eprintln!("error: {error}");
+    }
+    ExitCode::from(2)
 }

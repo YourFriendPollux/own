@@ -128,6 +128,41 @@ pub fn verify(
             }
         };
         let pdir = format!("{}@{}", pkg.name, pkg.version);
+        // The header is not an integrity anchor by itself: bind the actual
+        // [[file]] records to the digest stored in own.lock before trusting them.
+        let manifest_files: Vec<_> = manifest
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    f.path.clone(),
+                    f.sha256
+                        .strip_prefix("sha256:")
+                        .unwrap_or(&f.sha256)
+                        .to_string(),
+                    f.size,
+                    f.exec,
+                )
+            })
+            .collect();
+        let manifest_size = manifest
+            .files
+            .iter()
+            .try_fold(0u64, |total, f| total.checked_add(f.size));
+        if package_files_sha256(&manifest_files) != pkg.package_files_sha256
+            || manifest.files.len() as u64 != pkg.file_count
+            || manifest_size != Some(pkg.total_size)
+        {
+            findings.push(Finding::err(
+                "DRIFT_MODIFIED",
+                &pdir,
+                &format!(
+                    "vendor/own/.manifests/{}.toml",
+                    crate::lock::dir_name(&pkg.name, &pkg.version)
+                ),
+                "manifest file digest/count/size differ from lock entry",
+            ));
+        }
         if manifest.manifest.package != pdir
             || manifest.manifest.package_files_sha256 != pkg.package_files_sha256
             || manifest.manifest.file_count != pkg.file_count

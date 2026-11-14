@@ -163,6 +163,7 @@ mod add;
 mod ci;
 mod diff;
 mod eject;
+mod git_ignore;
 mod licenses;
 mod osv;
 mod sbom;
@@ -238,22 +239,32 @@ fn cmd_init(root: &std::path::Path, force: bool) -> Result<u8, String> {
             fs::create_dir_all(root.join(".own").join(d)).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
         fs::create_dir_all(root.join("vendor/own")).map_err(|e| format!("IO_ERROR: {e}"))?;
-        // .gitignore: append idempotently
-        let gi = root.join(".gitignore");
-        let mut gi_text = fs::read_to_string(&gi).unwrap_or_default();
-        for line in [".own/", "!vendor/own/**"] {
-            if !gi_text.lines().any(|l| l.trim() == line) {
-                if !gi_text.is_empty() && !gi_text.ends_with('\n') {
-                    gi_text.push('\n');
-                }
-                gi_text.push_str(line);
-                gi_text.push('\n');
+        // Preserve existing rules; only a missing file defaults to empty.
+        let read_optional = |path: &std::path::Path| -> Result<String, String> {
+            match fs::read_to_string(path) {
+                Ok(text) => Ok(text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+                Err(e) => Err(format!("IO_ERROR: {}: {e}", path.display())),
             }
+        };
+        let gi = root.join(".gitignore");
+        let mut gi_text: String = read_optional(&gi)?
+            .split_inclusive('\n')
+            .filter(|line| line.trim() != "!vendor/own/**")
+            .collect();
+        if !gi_text.is_empty() && !gi_text.ends_with('\n') {
+            gi_text.push('\n');
         }
+        if !gi_text.lines().any(|line| line.trim() == ".own/") {
+            gi_text.push_str(".own/\n");
+        }
+        // A pre-existing negation may precede later rules such as dist/.
+        // It must be the final rule, not merely present somewhere in the file.
+        gi_text.push_str("!vendor/own/**\n");
         txn.write_file(".gitignore", gi_text.as_bytes())?;
         // .gitattributes: append idempotently
         let ga = root.join(".gitattributes");
-        let mut ga_text = fs::read_to_string(&ga).unwrap_or_default();
+        let mut ga_text = read_optional(&ga)?;
         for line in [
             "vendor/own/** -text",
             "own.lock text eol=lf",
@@ -268,17 +279,34 @@ fn cmd_init(root: &std::path::Path, force: bool) -> Result<u8, String> {
             }
         }
         txn.write_file(".gitattributes", ga_text.as_bytes())?;
-        // git check-ignore probe (only if inside a git work tree); a failure
-        // rolls the whole initialisation back
-        if root.join(".git").exists() {
+        // Detect git repositories in parent directories too (workspaces), and
+        // never interpret a failed git command as a successful ignore check.
+        let in_repo = std::process::Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(root)
+            .output();
+        let has_git_metadata = root.ancestors().any(|dir| dir.join(".git").exists());
+        let check_git = match in_repo {
+            Ok(out) if out.status.success() => out.stdout.starts_with(b"true"),
+            Ok(out) if has_git_metadata => {
+                return Err(format!(
+                    "GIT_ERROR: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            Err(e) if has_git_metadata => return Err(format!("GIT_ERROR: {e}")),
+            _ => false, // init also supports projects not yet in a git repository
+        };
+        if check_git {
             let out = std::process::Command::new("git")
                 .args(["check-ignore", "--no-index", "vendor/own/_probe/x"])
                 .current_dir(root)
-                .output();
-            if let Ok(o) = out {
-                if o.status.success() {
-                    return Err("VENDOR_PATH_IGNORED: un-ignore the parent directory of vendor/ (a negation cannot re-include under an excluded parent)".to_string());
-                }
+                .output()
+                .map_err(|e| format!("GIT_ERROR: {e}"))?;
+            match out.status.code() {
+                Some(0) => return Err("VENDOR_PATH_IGNORED: un-ignore the parent directory of vendor/ (a negation cannot re-include under an excluded parent)".to_string()),
+                Some(1) => {}, // no ignored path: the only successful negative result
+                _ => return Err(format!("GIT_ERROR: {}", String::from_utf8_lossy(&out.stderr))),
             }
         }
         Ok(())
@@ -879,9 +907,6 @@ fn main() -> ExitCode {
             };
             match ci::ci(&root, &args) {
                 Ok((findings, notes)) => {
-                    for n in &notes {
-                        println!("{n}");
-                    }
                     let code = if findings.iter().any(|f| f.severity == "error") {
                         1
                     } else {
@@ -893,13 +918,22 @@ fn main() -> ExitCode {
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "schema_version": 1, "command": "ci",
                                 "status": if code == 0 { "ok" } else { "findings" },
-                                "exit_code": code, "findings": findings, "data": {},
+                                "exit_code": code, "findings": findings, "data": { "notes": notes },
                             }))
                             .unwrap()
                         );
                     } else {
+                        for note in &notes {
+                            println!("{note}");
+                        }
                         for f in &findings {
-                            eprintln!("ERROR: [{}] {} {}", f.code, f.package, f.path);
+                            println!(
+                                "{}: [{}] {} {}",
+                                f.severity.to_uppercase(),
+                                f.code,
+                                f.package,
+                                f.path
+                            );
                         }
                         if code == 0 {
                             println!("ok: no findings");
@@ -917,11 +951,8 @@ fn main() -> ExitCode {
             // error codes map to exit 2 (usage/precondition) or 1 (policy) per §8.0;
             // here: usage/precondition errors -> 2, known drift/policy -> 1
             let code = match e.split(':').next().unwrap_or("") {
-                "ALREADY_INITIALIZED"
-                | "NOT_INITIALIZED"
-                | "USAGE_ERROR"
-                | "VENDOR_PATH_IGNORED"
-                | "LOCK_BUSY" => 2,
+                "ALREADY_INITIALIZED" | "NOT_INITIALIZED" | "USAGE_ERROR" | "LOCK_BUSY" => 2,
+                "VENDOR_PATH_IGNORED" => 1,
                 "PARSE_ERROR" | "IO_ERROR" | "LOCK_SCHEMA_UNSUPPORTED" => 2,
                 "ALREADY_VENDORED"
                 | "PACKAGE_NOT_VENDORED"
