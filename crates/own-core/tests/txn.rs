@@ -13,6 +13,473 @@ fn fresh_root() -> tempfile::TempDir {
 }
 
 #[test]
+fn lock_order_same_process_second_writer_cannot_recover_live_transaction() {
+    let root = fresh_root();
+    let first = Txn::begin(root.path()).unwrap();
+    first.write_file("file.txt", b"in-progress\n").unwrap();
+    let journal = fs::read(first.txn_dir.join("journal.json")).unwrap();
+    let second = Txn::begin(root.path());
+    assert!(
+        matches!(second, Err(ref error) if error == "LOCK_BUSY"),
+        "{second:?}"
+    );
+    assert_eq!(
+        fs::read(root.path().join("file.txt")).unwrap(),
+        b"in-progress\n"
+    );
+    assert_eq!(
+        fs::read(first.txn_dir.join("journal.json")).unwrap(),
+        journal
+    );
+    first.rollback().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_order_closing_an_unrelated_descriptor_does_not_unlock_the_transaction() {
+    let root = fresh_root();
+    let txn = Txn::begin(root.path()).unwrap();
+    drop(fs::File::open(root.path().join(".own/lock")).unwrap());
+    let output = Command::new("python3").args(["-c", "import fcntl,sys; f=open(sys.argv[1],'r+'); lock=fcntl.lockf if sys.platform.startswith('linux') else fcntl.flock;\ntry:\n lock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); print('ACQUIRED')\nexcept BlockingIOError:\n print('LOCK_BUSY')", root.path().join(".own/lock").to_str().unwrap()]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "LOCK_BUSY");
+    txn.commit().unwrap();
+}
+
+#[test]
+fn lock_order_contender_child() {
+    let Some(root) = std::env::var_os("OWN_LOCK_ORDER_ROOT") else {
+        return;
+    };
+    let result = Txn::begin(Path::new(&root));
+    assert!(
+        matches!(result, Err(ref error) if error == "LOCK_BUSY"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn lock_order_busy_writer_does_not_create_staging_directories() {
+    let root = fresh_root();
+    let txn = Txn::begin(root.path()).unwrap();
+    fs::remove_dir(root.path().join(".own/tmp")).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["lock_order_contender_child", "--exact", "--nocapture"])
+        .env("OWN_LOCK_ORDER_ROOT", root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !root.path().join(".own/tmp").exists(),
+        "LOCK_BUSY caller changed protected staging state"
+    );
+    fs::create_dir(root.path().join(".own/tmp")).unwrap();
+    txn.commit().unwrap();
+}
+
+#[test]
+fn lock_order_mutation_apis_cannot_replace_the_live_lock() {
+    let mut accepted = Vec::new();
+    for api in ["backup", "write_file", "note_created_dir"] {
+        let root = fresh_root();
+        let txn = Txn::begin(root.path()).unwrap();
+        let result = match api {
+            "backup" => txn.backup(".own/lock"),
+            "write_file" => txn.write_file(".own/lock", b"replacement"),
+            _ => txn.note_created_dir(".own/lock"),
+        };
+        if result.is_ok() {
+            accepted.push(api);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "lock-control mutation accepted: {accepted:?}"
+    );
+}
+
+#[test]
+fn lock_order_recovery_cannot_remove_the_held_lock_file() {
+    let root = fresh_root();
+    let stale = root.path().join(".own/txn/lock-poison");
+    fs::create_dir_all(stale.join("backup")).unwrap();
+    fs::write(root.path().join(".own/lock"), b"").unwrap();
+    let journal = serde_json::to_vec(&serde_json::json!({
+        "root": fs::canonicalize(root.path()).unwrap(), "state": "started",
+        "backup_files": [], "created_dirs": [".own/lock"]
+    }))
+    .unwrap();
+    fs::write(stale.join("journal.json"), &journal).unwrap();
+    let result = Txn::begin(root.path());
+    assert!(
+        result.is_err(),
+        "recovery accepted mutation of the lock control file"
+    );
+    assert_eq!(fs::read(stale.join("journal.json")).unwrap(), journal);
+    assert_eq!(
+        fs::read(root.path().join("file.txt")).unwrap(),
+        b"original\n"
+    );
+}
+
+#[test]
+fn confinement_cwd_child() {
+    let Ok(mode) = std::env::var("OWN_CONFINEMENT_CHILD") else {
+        return;
+    };
+    if mode == "crash" {
+        let txn = Txn::begin(Path::new(".")).unwrap();
+        let rel = std::env::var("OWN_CRASH_REL").unwrap_or_else(|_| "file.txt".into());
+        let content = std::env::var("OWN_CRASH_CONTENT").unwrap_or_else(|_| "crashed\n".into());
+        txn.write_file(&rel, content.as_bytes()).unwrap();
+        std::process::exit(0);
+    }
+    let root = std::env::var("OWN_CONFINEMENT_ROOT").unwrap();
+    Txn::begin(Path::new(&root)).unwrap().commit().unwrap();
+}
+
+fn crashed_transaction(root: &Path, rel: &str, content: &str) -> std::path::PathBuf {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["confinement_cwd_child", "--exact", "--nocapture"])
+        .env("OWN_CONFINEMENT_CHILD", "crash")
+        .env("OWN_CRASH_REL", rel)
+        .env("OWN_CRASH_CONTENT", content)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let journals: Vec<_> = fs::read_dir(root.join(".own/txn"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(journals.len(), 1);
+    journals.into_iter().next().unwrap()
+}
+
+#[test]
+fn confinement_relative_root_recovers_from_another_cwd() {
+    let root = fresh_root();
+    let unrelated = fresh_root();
+    fs::write(unrelated.path().join("file.txt"), b"unrelated\n").unwrap();
+    for (mode, cwd) in [("crash", root.path()), ("recover", unrelated.path())] {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["confinement_cwd_child", "--exact", "--nocapture"])
+            .env("OWN_CONFINEMENT_CHILD", mode)
+            .env("OWN_CONFINEMENT_ROOT", root.path())
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    assert_eq!(
+        fs::read(unrelated.path().join("file.txt")).unwrap(),
+        b"unrelated\n"
+    );
+    assert_eq!(
+        fs::read(root.path().join("file.txt")).unwrap(),
+        b"original\n"
+    );
+}
+
+#[test]
+fn confinement_journal_root_is_canonical() {
+    let root = fresh_root();
+    let txn = Txn::begin(&root.path().join(".")).unwrap();
+    let raw = fs::read(txn.txn_dir.join("journal.json")).unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(txn.root, fs::canonicalize(root.path()).unwrap());
+    assert_eq!(
+        j["root"].as_str().unwrap(),
+        fs::canonicalize(root.path()).unwrap().to_str().unwrap()
+    );
+    txn.commit().unwrap();
+}
+
+#[test]
+fn confinement_recovery_rejects_foreign_root_before_any_mutation() {
+    let root = fresh_root();
+    let foreign = fresh_root();
+    let stale = root.path().join(".own/txn/foreign");
+    fs::create_dir_all(stale.join("backup")).unwrap();
+    fs::write(stale.join("backup/file.txt"), b"poison\n").unwrap();
+    let raw = serde_json::to_vec(&serde_json::json!({
+        "state": "started", "root": foreign.path(),
+        "backup_files": [{"rel":"file.txt", "flat":"file.txt", "existed":true}],
+        "created_dirs": []
+    }))
+    .unwrap();
+    fs::write(stale.join("journal.json"), &raw).unwrap();
+    assert!(
+        Txn::begin(root.path()).is_err(),
+        "foreign journal root must fail closed"
+    );
+    assert_eq!(
+        fs::read(foreign.path().join("file.txt")).unwrap(),
+        b"original\n"
+    );
+    assert_eq!(fs::read(stale.join("journal.json")).unwrap(), raw);
+}
+
+#[test]
+fn path_guard_all_apis_reject_traversal_and_absolute_destinations() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let absolute = sandbox.path().join("outside").to_str().unwrap().to_string();
+    let mut accepted = Vec::new();
+    for (i, rel) in [
+        "",
+        ".",
+        "./file.txt",
+        "sub/../file.txt",
+        "../outside",
+        &absolute,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let root = sandbox.path().join(format!("project-{i}"));
+        fs::create_dir_all(&root).unwrap();
+        let txn = Txn::begin(&root).unwrap();
+        let src = root.join(".own/tmp/prepared");
+        fs::create_dir_all(&src).unwrap();
+        for (api, result) in [
+            ("backup", txn.backup(rel)),
+            ("write_file", txn.write_file(rel, b"poison")),
+            ("move_dir_into", txn.move_dir_into(&src, rel)),
+            ("note_created_dir", txn.note_created_dir(rel)),
+        ] {
+            if result.is_ok() {
+                accepted.push(format!("{api}({rel:?})"));
+            }
+        }
+        std::mem::forget(txn);
+    }
+    assert!(accepted.is_empty(), "unsafe paths accepted: {accepted:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn path_guard_all_apis_reject_symlink_parents_and_leaf() {
+    use std::os::unix::fs::symlink;
+    let mut accepted = Vec::new();
+    for api in ["backup", "write_file", "move_dir_into", "note_created_dir"] {
+        for leaf in [false, true] {
+            let root = fresh_root();
+            let outside = fresh_root();
+            if leaf {
+                symlink(outside.path().join("file.txt"), root.path().join("link")).unwrap();
+            } else {
+                symlink(outside.path(), root.path().join("link")).unwrap();
+            }
+            let txn = Txn::begin(root.path()).unwrap();
+            let src = root.path().join(".own/tmp/prepared");
+            fs::create_dir_all(&src).unwrap();
+            let rel = if leaf { "link" } else { "link/file.txt" };
+            let result = match api {
+                "backup" => txn.backup(rel),
+                "write_file" => txn.write_file(rel, b"poison"),
+                "move_dir_into" => txn.move_dir_into(&src, rel),
+                _ => txn.note_created_dir(rel),
+            };
+            if result.is_ok() {
+                accepted.push(format!("{api}({rel})"));
+            }
+            std::mem::forget(txn);
+        }
+    }
+    assert!(accepted.is_empty(), "symlink paths accepted: {accepted:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn path_guard_begin_rejects_symlink_transaction_metadata() {
+    use std::os::unix::fs::symlink;
+    let mut accepted = Vec::new();
+    for rel in [".own", ".own/tmp", ".own/txn", ".own/lock"] {
+        let root = fresh_root();
+        let outside = fresh_root();
+        fs::create_dir_all(root.path().join(".own")).unwrap();
+        let target = if rel.ends_with("lock") {
+            outside.path().join("file.txt")
+        } else {
+            outside.path().to_path_buf()
+        };
+        if rel == ".own" {
+            fs::remove_dir(root.path().join(".own")).unwrap();
+        }
+        symlink(target, root.path().join(rel)).unwrap();
+        if let Ok(txn) = Txn::begin(root.path()) {
+            accepted.push(rel);
+            std::mem::forget(txn);
+        }
+        assert_eq!(
+            fs::read(outside.path().join("file.txt")).unwrap(),
+            b"original\n"
+        );
+    }
+    assert!(
+        accepted.is_empty(),
+        "metadata symlinks accepted: {accepted:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn path_guard_recovery_rejects_replaced_parent_before_mutation() {
+    use std::os::unix::fs::symlink;
+    let root = fresh_root();
+    let outside = fresh_root();
+    fs::create_dir(root.path().join("sub")).unwrap();
+    fs::write(root.path().join("sub/file.txt"), b"saved\n").unwrap();
+    let stale = crashed_transaction(root.path(), "sub/file.txt", "changed\n");
+    let raw = fs::read(stale.join("journal.json")).unwrap();
+    fs::remove_dir_all(root.path().join("sub")).unwrap();
+    symlink(outside.path(), root.path().join("sub")).unwrap();
+    assert!(
+        Txn::begin(root.path()).is_err(),
+        "recovery followed replaced parent"
+    );
+    assert_eq!(
+        fs::read(outside.path().join("file.txt")).unwrap(),
+        b"original\n"
+    );
+    assert_eq!(fs::read(stale.join("journal.json")).unwrap(), raw);
+}
+
+#[cfg(unix)]
+#[test]
+fn path_guard_recovery_rejects_symlink_journal_and_backup() {
+    use std::os::unix::fs::symlink;
+    let mut accepted = Vec::new();
+    for component in ["txn-dir", "journal.json", "backup", "backup/file.txt"] {
+        let root = fresh_root();
+        let outside = fresh_root();
+        let stale = root.path().join(".own/txn/stale");
+        fs::create_dir_all(stale.join("backup")).unwrap();
+        fs::write(stale.join("backup/file.txt"), b"saved\n").unwrap();
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "state":"started", "root":root.path(),
+            "backup_files":[{"rel":"file.txt", "flat":"file.txt", "existed":true}], "created_dirs":[]
+        })).unwrap();
+        fs::write(stale.join("journal.json"), &raw).unwrap();
+        let (path, target) = match component {
+            "txn-dir" => {
+                fs::rename(&stale, outside.path().join("stale")).unwrap();
+                (stale.clone(), outside.path().join("stale"))
+            }
+            "journal.json" => {
+                fs::write(outside.path().join("journal.json"), &raw).unwrap();
+                fs::remove_file(stale.join(component)).unwrap();
+                (stale.join(component), outside.path().join(component))
+            }
+            "backup" => {
+                fs::rename(stale.join("backup"), outside.path().join("backup")).unwrap();
+                (stale.join(component), outside.path().join(component))
+            }
+            _ => {
+                fs::remove_file(stale.join(component)).unwrap();
+                (stale.join(component), outside.path().join("file.txt"))
+            }
+        };
+        symlink(target, path).unwrap();
+        if let Ok(txn) = Txn::begin(root.path()) {
+            accepted.push(component);
+            std::mem::forget(txn);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "recovery symlinks accepted: {accepted:?}"
+    );
+}
+
+#[test]
+fn path_guard_move_rejects_source_outside_project() {
+    let root = fresh_root();
+    let outside = fresh_root();
+    let txn = Txn::begin(root.path()).unwrap();
+    assert!(
+        txn.move_dir_into(outside.path(), "vendor/own/pkg").is_err(),
+        "external source accepted"
+    );
+    assert_eq!(
+        fs::read(outside.path().join("file.txt")).unwrap(),
+        b"original\n"
+    );
+    txn.rollback().unwrap();
+}
+
+#[test]
+fn durable_journal_replacement_preserves_previous_inode() {
+    use std::io::Read;
+    let root = fresh_root();
+    let txn = Txn::begin(root.path()).unwrap();
+    txn.write_file("file.txt", b"first\n").unwrap();
+    let journal = txn.txn_dir.join("journal.json");
+    let before = fs::read(&journal).unwrap();
+    let mut prior_inode = fs::File::open(&journal).unwrap();
+    txn.write_file("second.txt", b"second\n").unwrap();
+    let mut observed = Vec::new();
+    prior_inode.read_to_end(&mut observed).unwrap();
+    assert_eq!(observed, before, "journal was rewritten in place");
+    assert_ne!(fs::read(&journal).unwrap(), before);
+    txn.rollback().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_journal_failure_child() {
+    let Ok(root) = std::env::var("OWN_JOURNAL_FAILURE_CHILD") else {
+        return;
+    };
+    let txn = Txn::begin(Path::new(&root)).unwrap();
+    txn.write_file("file.txt", b"first\n").unwrap();
+    let len = fs::metadata(txn.txn_dir.join("journal.json"))
+        .unwrap()
+        .len();
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let limit = libc::rlimit {
+            rlim_cur: len - 1,
+            rlim_max: len - 1,
+        };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+    assert!(txn.write_file("second.txt", b"second\n").is_err());
+    // Abrupt exit: do not let Drop hide the journal-publication failure.
+    std::process::exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_journal_failed_publication_keeps_recovery_record() {
+    let root = fresh_root();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["durable_journal_failure_child", "--exact", "--nocapture"])
+        .env("OWN_JOURNAL_FAILURE_CHILD", root.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(fs::read(root.path().join("file.txt")).unwrap(), b"first\n");
+    let stale = fs::read_dir(root.path().join(".own/txn"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let raw = fs::read(stale.join("journal.json")).unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&raw)
+        .expect("failed journal publication destroyed previous recovery record");
+    assert_eq!(j["state"], "started");
+    assert_eq!(j["backup_files"].as_array().unwrap().len(), 1);
+    Txn::begin(root.path()).unwrap().commit().unwrap();
+    assert_eq!(
+        fs::read(root.path().join("file.txt")).unwrap(),
+        b"original\n"
+    );
+    assert!(!root.path().join("second.txt").exists());
+}
+
+#[test]
 fn commit_keeps_changes_and_cleans_journal() {
     let t = fresh_root();
     let txn = Txn::begin(t.path()).unwrap();
@@ -44,6 +511,175 @@ fn rollback_restores_backup() {
 }
 
 #[test]
+fn repeated_writes_restore_first_backup_of_existing_file() {
+    let t = fresh_root();
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.write_file("file.txt", b"intermediate\n").unwrap();
+    txn.write_file("file.txt", b"final\n").unwrap();
+    txn.rollback().unwrap();
+    assert_eq!(fs::read(t.path().join("file.txt")).unwrap(), b"original\n");
+}
+
+#[test]
+fn repeated_writes_remove_originally_absent_file() {
+    let t = fresh_root();
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.write_file("new.txt", b"intermediate\n").unwrap();
+    txn.write_file("new.txt", b"final\n").unwrap();
+    txn.rollback().unwrap();
+    assert!(!t.path().join("new.txt").exists());
+}
+
+#[test]
+fn directory_backup_restores_exact_tree_after_replacement() {
+    let t = fresh_root();
+    let rel = "vendor/own/pkg__literal";
+    let original = t.path().join(rel);
+    fs::create_dir_all(original.join("nested__dir/empty")).unwrap();
+    let long_name = "x".repeat(220);
+    fs::write(original.join(&long_name), b"long name\n").unwrap();
+    fs::write(original.join("nested__dir/run"), b"original\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(
+            original.join("nested__dir"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(
+            original.join("nested__dir/run"),
+            fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        symlink("nested__dir/run", original.join("link")).unwrap();
+    }
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.backup(rel).unwrap();
+    fs::remove_dir_all(&original).unwrap();
+    let prep = t.path().join(".own/tmp/prep");
+    fs::create_dir_all(prep.join("extra")).unwrap();
+    fs::write(prep.join("extra/new.txt"), b"extra\n").unwrap();
+    txn.move_dir_into(&prep, rel).unwrap();
+    txn.backup(rel).unwrap();
+    txn.rollback().unwrap();
+    assert_eq!(
+        fs::read(original.join("nested__dir/run")).unwrap(),
+        b"original\n"
+    );
+    assert_eq!(fs::read(original.join(&long_name)).unwrap(), b"long name\n");
+    assert!(original.join("nested__dir/empty").is_dir());
+    assert!(!original.join("extra").exists());
+    assert_eq!(
+        fs::read_dir(&original).unwrap().count(),
+        if cfg!(unix) { 3 } else { 2 }
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(original.join("nested__dir"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(original.join("nested__dir/run"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert_eq!(
+            fs::read_link(original.join("link")).unwrap(),
+            Path::new("nested__dir/run")
+        );
+    }
+}
+
+#[test]
+fn directory_backup_removes_new_tree_when_parents_are_already_removed() {
+    let t = fresh_root();
+    let txn = Txn::begin(t.path()).unwrap();
+    let prep = t.path().join(".own/tmp/prep");
+    fs::create_dir_all(&prep).unwrap();
+    fs::write(prep.join("new.txt"), b"new\n").unwrap();
+    txn.move_dir_into(&prep, "new/parent/pkg").unwrap();
+    txn.backup("new/parent/pkg").unwrap();
+    txn.note_created_dir("new").unwrap();
+    txn.note_created_dir("new/parent").unwrap();
+    txn.rollback().unwrap();
+    assert!(!t.path().join("new").exists());
+}
+
+#[test]
+fn drop_uncommitted_transaction_restores_original() {
+    let t = fresh_root();
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.write_file("file.txt", b"abandoned\n").unwrap();
+    let journal_dir = txn.txn_dir.clone();
+    drop(txn);
+    assert_eq!(fs::read(t.path().join("file.txt")).unwrap(), b"original\n");
+    assert!(!journal_dir.exists());
+}
+
+#[test]
+fn drop_on_question_mark_restores_files_and_directories() {
+    fn failed_command(root: &Path) -> Result<(), String> {
+        let txn = Txn::begin(root)?;
+        txn.write_file("file.txt", b"intermediate\n")?;
+        txn.write_file("file.txt", b"final\n")?;
+        let prep = root.join(".own/tmp/prep");
+        fs::create_dir_all(&prep).map_err(|e| e.to_string())?;
+        fs::write(prep.join("new.txt"), b"new\n").map_err(|e| e.to_string())?;
+        txn.move_dir_into(&prep, "vendor/own/pkg__new")?;
+        fs::read(root.join("missing-input")).map_err(|e| e.to_string())?;
+        txn.commit()
+    }
+    let t = fresh_root();
+    assert!(failed_command(t.path()).is_err());
+    assert_eq!(fs::read(t.path().join("file.txt")).unwrap(), b"original\n");
+    assert!(!t.path().join("vendor/own/pkg__new").exists());
+    assert_eq!(fs::read_dir(t.path().join(".own/txn")).unwrap().count(), 0);
+}
+
+#[test]
+fn drop_failed_rollback_preserves_journal_for_retry() {
+    let t = fresh_root();
+    fs::create_dir_all(t.path().join("blocked")).unwrap();
+    fs::write(t.path().join("blocked/file.txt"), b"original\n").unwrap();
+    let txn = Txn::begin(t.path()).unwrap();
+    txn.write_file("blocked/file.txt", b"changed\n").unwrap();
+    let stale = txn.txn_dir.clone();
+    let raw = fs::read(stale.join("journal.json")).unwrap();
+    fs::remove_dir_all(t.path().join("blocked")).unwrap();
+    fs::write(t.path().join("blocked"), b"barrier\n").unwrap();
+    drop(txn);
+    assert_eq!(fs::read(stale.join("journal.json")).unwrap(), raw);
+    assert_eq!(
+        fs::read(stale.join("backup/blocked__file.txt")).unwrap(),
+        b"original\n"
+    );
+    assert!(Txn::begin(t.path()).is_err());
+    fs::remove_file(t.path().join("blocked")).unwrap();
+    let recovered = Txn::begin(t.path()).unwrap();
+    recovered.commit().unwrap();
+    assert_eq!(
+        fs::read(t.path().join("blocked/file.txt")).unwrap(),
+        b"original\n"
+    );
+    assert!(!stale.exists());
+}
+
+#[test]
 fn rollback_removes_created_dirs() {
     let t = fresh_root();
     let txn = Txn::begin(t.path()).unwrap();
@@ -58,13 +694,13 @@ fn rollback_removes_created_dirs() {
 
 #[test]
 fn lock_busy_when_held() {
-    // flock is per-process on Linux: hold the lock from a child process
+    // Test legacy POSIX-lock compatibility on Linux; other Unix uses flock.
     let t = fresh_root();
     fs::create_dir_all(t.path().join(".own")).unwrap();
     let lockp = t.path().join(".own/lock");
     fs::write(&lockp, b"").unwrap();
     // hold an exclusive fcntl lock from a python child
-    let py = "import fcntl,time,sys; f=open(sys.argv[1],'w'); l=fcntl.lockf(f, fcntl.LOCK_EX); print('LOCKED',flush=True); time.sleep(10)";
+    let py = "import fcntl,time,sys; f=open(sys.argv[1],'w'); lock=fcntl.lockf if sys.platform.startswith('linux') else fcntl.flock; lock(f, fcntl.LOCK_EX); print('LOCKED',flush=True); time.sleep(10)";
     let mut holder = Command::new("python3")
         .arg("-c")
         .arg(py)
@@ -86,9 +722,8 @@ fn lock_busy_when_held() {
 
 #[test]
 fn lock_taken_before_recovery_so_second_writer_cannot_rollback_active_txn() {
-    // The fcntl lock is per-process on Linux, so a second Txn::begin in THIS
-    // process would succeed. Use a child process to hold the lock instead, and
-    // verify the child's LOCK_BUSY path leaves the parent's live journal intact.
+    // A real second process must also see LOCK_BUSY and leave the parent's
+    // live journal intact. Same-process exclusion is covered separately.
     let t = fresh_root();
     // parent holds a live transaction
     let txn1 = Txn::begin(t.path()).unwrap();
@@ -110,8 +745,9 @@ lockp = sys.argv[1]
 root = sys.argv[2]
 # hold nothing; just try to take the lock the parent holds
 f = open(lockp, 'r+')
+lock = fcntl.lockf if sys.platform.startswith('linux') else fcntl.flock
 try:
-    fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    lock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     print("ACQUIRED")   # should NOT happen: parent holds it
 except BlockingIOError:
     print("LOCK_BUSY")
@@ -157,6 +793,93 @@ fn rollback_preserves_literal_double_underscore_in_names() {
         fs::read_to_string(t.path().join(weird)).unwrap(),
         "original\n",
         "rollback must restore the literal '__' path, not vendor/own/@types+babel/core@1.0.0/..."
+    );
+}
+
+#[test]
+fn recovery_refuses_corrupt_journal_and_preserves_evidence() {
+    let t = fresh_root();
+    let stale = t.path().join(".own/txn/corrupt");
+    fs::create_dir_all(stale.join("backup")).unwrap();
+    let raw = b"{\"state\":\"started\", truncated";
+    fs::write(stale.join("journal.json"), raw).unwrap();
+    assert!(
+        Txn::begin(t.path()).is_err(),
+        "corrupt recovery must fail closed"
+    );
+    assert_eq!(fs::read(stale.join("journal.json")).unwrap(), raw);
+    assert_eq!(fs::read_dir(t.path().join(".own/txn")).unwrap().count(), 1);
+}
+
+#[test]
+fn recovery_refuses_unrestorable_backup_and_preserves_evidence() {
+    let t = fresh_root();
+    let stale = t.path().join(".own/txn/unrestorable");
+    fs::create_dir_all(stale.join("backup")).unwrap();
+    fs::write(stale.join("backup/blocked__file.txt"), b"original\n").unwrap();
+    fs::write(t.path().join("blocked"), b"not a directory\n").unwrap();
+    let raw = serde_json::to_vec(&serde_json::json!({
+        "state": "started", "root": t.path(),
+        "backup_files": [{"rel": "blocked/file.txt", "flat": "blocked__file.txt"}],
+        "created_dirs": []
+    }))
+    .unwrap();
+    fs::write(stale.join("journal.json"), &raw).unwrap();
+    assert!(
+        Txn::begin(t.path()).is_err(),
+        "failed restoration must fail closed"
+    );
+    assert_eq!(fs::read(stale.join("journal.json")).unwrap(), raw);
+    assert_eq!(
+        fs::read(stale.join("backup/blocked__file.txt")).unwrap(),
+        b"original\n"
+    );
+    assert_eq!(
+        fs::read(t.path().join("blocked")).unwrap(),
+        b"not a directory\n"
+    );
+    assert_eq!(fs::read_dir(t.path().join(".own/txn")).unwrap().count(), 1);
+}
+
+#[test]
+fn recovery_refuses_invalid_entries_before_removing_created_dirs() {
+    let t = fresh_root();
+    let stale = t.path().join(".own/txn/invalid-entry");
+    fs::create_dir_all(stale.join("backup")).unwrap();
+    fs::create_dir_all(t.path().join("created")).unwrap();
+    fs::write(t.path().join("created/evidence"), b"keep\n").unwrap();
+    let raw = serde_json::to_vec(&serde_json::json!({
+        "state": "started", "root": t.path(),
+        "backup_files": [{"rel": "file.txt"}], "created_dirs": ["created"]
+    }))
+    .unwrap();
+    fs::write(stale.join("journal.json"), &raw).unwrap();
+    assert!(
+        Txn::begin(t.path()).is_err(),
+        "invalid entries must not be skipped"
+    );
+    assert_eq!(fs::read(stale.join("journal.json")).unwrap(), raw);
+    assert_eq!(
+        fs::read(t.path().join("created/evidence")).unwrap(),
+        b"keep\n"
+    );
+}
+
+#[test]
+fn recovery_refuses_missing_backup_of_existing_path() {
+    let t = fresh_root();
+    // A real exited child releases its descriptor lock without running Drop.
+    let stale = crashed_transaction(t.path(), "file.txt", "intermediate\n");
+    fs::remove_file(stale.join("backup/file.txt")).unwrap();
+    let raw = fs::read(stale.join("journal.json")).unwrap();
+    assert!(
+        Txn::begin(t.path()).is_err(),
+        "missing original must not mean absent path"
+    );
+    assert_eq!(fs::read(stale.join("journal.json")).unwrap(), raw);
+    assert_eq!(
+        fs::read(t.path().join("file.txt")).unwrap(),
+        b"intermediate\n"
     );
 }
 
@@ -343,60 +1066,17 @@ fn write_file_publishes_only_synced_content() {
 fn kill9_recovery_in_child_process() {
     // child starts a txn, writes, then gets SIGKILL; parent then begins a new txn
     let t = fresh_root();
-    let script = format!(
-        r#"use own_core::txn::Txn; use std::path::Path; fn main() {{ let txn = Txn::begin(Path::new("{root}")).unwrap(); txn.write_file("file.txt", b"killed\n").unwrap(); println!("READY"); std::thread::sleep(std::time::Duration::from_secs(30)); }}"#,
-        root = t.path().to_string_lossy()
-    );
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("main.rs"), script).unwrap();
-    let manifest = r#"[package]
-name = "kill9child"
-version = "0.0.0"
-edition = "2021"
-[dependencies]
-own-core = { path = "__OWN__" }
-serde_json = "1"
-"#
-    .replace(
-        "__OWN__",
-        &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("crates")
-            .join("own-core")
-            .to_string_lossy(),
-    );
-    fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
-    fs::create_dir_all(dir.path().join("src")).unwrap();
-    fs::rename(dir.path().join("main.rs"), dir.path().join("src/main.rs")).unwrap();
-    let bin = dir.path().join("target/debug/kill9child");
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--manifest-path",
-            dir.path().join("Cargo.toml").to_str().unwrap(),
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let mut child = Command::new(&bin)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    // wait for READY
-    use std::io::Read;
-    let mut out = child.stdout.take().expect("child stdout");
-    let mut buf = [0u8; 5];
-    out.read_exact(&mut buf).unwrap();
-    assert_eq!(&buf, b"READY");
-    child.kill().unwrap();
-    child.wait().unwrap();
+    // Reuse the built test binary: no auxiliary Cargo project, network fetch
+    // or assumption about the caller's CARGO_TARGET_DIR.
+    let mut child = spawn_signal_child(t.path());
+    assert_eq!(journal_state(t.path()), "started");
+    child.child.kill().unwrap();
+    let status = child.child.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
     assert_eq!(
         fs::read_to_string(t.path().join("file.txt")).unwrap(),
-        "killed\n"
+        "interrupted\n"
     );
     // parent (this process) recovers on next begin
     let txn = Txn::begin(t.path()).unwrap();

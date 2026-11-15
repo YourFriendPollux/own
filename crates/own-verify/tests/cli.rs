@@ -267,10 +267,14 @@ fn human_findings_are_results_on_stdout() {
     let output = project.run(&[]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "ERROR: [DRIFT_ORPHAN]  vendor/own/orphan.txt\n"
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // The human line carries the finding message: the code alone cannot tell
+    // "file not in manifest" from "symlink present".
+    assert!(
+        stdout.starts_with("ERROR: [DRIFT_ORPHAN]  vendor/own/orphan.txt — "),
+        "{stdout:?}"
     );
+    assert!(stdout.ends_with('\n'), "{stdout:?}");
 }
 
 #[test]
@@ -394,6 +398,32 @@ fn inv8_installed_accepts_a_clean_publication_subset() {
 }
 
 #[test]
+fn installed_checks_file_alias_and_peer_layouts_via_shared_core() {
+    for store in [
+        "fakepkg@file+vendor+own+fakepkg@1.0.0",
+        "fakepkg@file+vendor+own+fakepkg@1.0.0_peer@2.0.0",
+    ] {
+        let project = Project::with_package();
+        let path = format!("node_modules/.pnpm/{store}/node_modules/fakepkg/dist/index.js");
+        project.write(&path, "module.exports=1\n");
+        assert!(project.run(&["--installed"]).status.success());
+        project.write(&path, "tampered installed bytes\n");
+        assert!(
+            project.run(&[]).status.success(),
+            "vendor bytes must stay unchanged"
+        );
+        let output = project.run(&["--installed", "--format", "json"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "DRIFT_INSTALLED" && f["path"] == "dist/index.js"));
+    }
+}
+
+#[test]
 fn inv10_clean_json_matches_the_sorted_envelope_snapshot() {
     let project = Project::new();
     let output = Command::new(env!("CARGO_BIN_EXE_own-verify"))
@@ -407,4 +437,184 @@ fn inv10_clean_json_matches_the_sorted_envelope_snapshot() {
         String::from_utf8(output.stdout).unwrap(),
         "{\"command\":\"verify\",\"data\":{},\"exit_code\":0,\"findings\":[],\"schema_version\":1,\"status\":\"ok\"}\n"
     );
+}
+
+#[test]
+fn malformed_override_maps_never_become_a_clean_empty_map() {
+    let wrong_maps = [
+        serde_json::json!(null),
+        serde_json::json!([]),
+        serde_json::json!(42),
+        serde_json::json!(false),
+        serde_json::json!("not a map"),
+    ];
+    let mut malformed = Vec::new();
+    for wrong in wrong_maps {
+        malformed.push(wrong.clone());
+        malformed.push(serde_json::json!({"pnpm":wrong}));
+        malformed.push(serde_json::json!({"pnpm":{"overrides":wrong}}));
+    }
+    for value in [
+        serde_json::json!(null),
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!(42),
+        serde_json::json!(false),
+        serde_json::json!(""),
+        serde_json::json!(" \t"),
+    ] {
+        malformed.push(serde_json::json!({"pnpm":{"overrides":{"unused":value}}}));
+    }
+    for key in ["", " \t"] {
+        malformed.push(serde_json::json!({"pnpm":{"overrides":{key:"^1.0.0"}}}));
+    }
+    for text in malformed {
+        let project = Project::new();
+        project.write("package.json", &text.to_string());
+        assert_error(&project.run(&[]), "PARSE_ERROR", "package.json");
+        assert_json_error(&project.run(&["--format=json"]), "PARSE_ERROR");
+    }
+}
+
+#[test]
+fn absent_or_valid_nonvendor_override_maps_still_verify_cleanly() {
+    for text in [
+        "{}",
+        r#"{"pnpm":{}}"#,
+        r#"{"pnpm":{"overrides":{}}}"#,
+        r#"{"pnpm":{"overrides":{"other":"^1.0.0"}}}"#,
+    ] {
+        let project = Project::new();
+        project.write("package.json", text);
+        let output = project.run(&["--format=json"]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["status"], "ok");
+        assert_eq!(envelope["exit_code"], 0);
+        assert_eq!(envelope["findings"], serde_json::json!([]));
+        assert_sorted_keys(&envelope);
+    }
+}
+
+#[test]
+fn policy_parse_errors_name_own_toml_in_both_formats() {
+    for text in [
+        "license = false\n",
+        "license = []\n",
+        "[license]\nallow = false\n",
+        "[license]\nallow = [42]\n",
+        "[license]\nallow = [\"\"]\n",
+        "[license]\nunknown = \"allow\"\n",
+        "[license]\nunknown_field = true\n",
+    ] {
+        let project = Project::new();
+        project.write("own.toml", text);
+        assert_error(&project.run(&[]), "PARSE_ERROR", "own.toml");
+        let output = project.run(&["--format=json"]);
+        assert_json_error(&output, "PARSE_ERROR");
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(envelope["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("own.toml"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn deleted_current_directory_is_an_io_error_not_a_panic() {
+    for format in ["json", "human"] {
+        let project = Project::new();
+        let cwd = project.0.join("deleted-current-directory");
+        fs::create_dir(&cwd).unwrap();
+        let output = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "cd \"$1\" && rmdir \"$1\" && exec \"$2\" --format=\"$3\"",
+                "own-verify-deleted-cwd",
+            ])
+            .arg(&cwd)
+            .arg(env!("CARGO_BIN_EXE_own-verify"))
+            .arg(format)
+            .output()
+            .unwrap();
+        if format == "json" {
+            assert_json_error(&output, "IO_ERROR");
+        } else {
+            assert_error(&output, "IO_ERROR", "current directory");
+        }
+    }
+}
+
+#[test]
+fn schema_errors_keep_their_categories_and_json_exit_two() {
+    for text in [
+        "schema_version = 0\n",
+        "schema_version = 2\n",
+        "schema_version = \"1\"\n",
+    ] {
+        let project = Project::new();
+        project.write("own.toml", text);
+        assert_error(&project.run(&[]), "CONFIG_SCHEMA_UNSUPPORTED", "own.toml");
+        assert_json_error(
+            &project.run(&["--format=json"]),
+            "CONFIG_SCHEMA_UNSUPPORTED",
+        );
+    }
+    for version in [0, 2] {
+        let project = Project::new();
+        let lock = fs::read_to_string(project.0.join("own.lock")).unwrap();
+        project.write(
+            "own.lock",
+            &lock.replacen(
+                "schema_version = 1",
+                &format!("schema_version = {version}"),
+                1,
+            ),
+        );
+        assert_error(&project.run(&[]), "PARSE_ERROR", "own.lock");
+        assert_json_error(&project.run(&["--format=json"]), "PARSE_ERROR");
+    }
+}
+
+#[test]
+fn absent_and_explicit_empty_license_policies_remain_valid_defaults() {
+    for text in [
+        "",
+        "schema_version = 1\n",
+        "schema_version = 1\n[license]\n",
+    ] {
+        let project = Project::new();
+        project.write("own.toml", text);
+        let output = project.run(&["--format=json"]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["findings"], serde_json::json!([]));
+        assert_eq!(envelope["status"], "ok");
+    }
+}
+
+#[test]
+fn strict_override_map_preserves_valid_npm_alias_selectors() {
+    let project = Project::with_package();
+    let overrides = serde_json::json!({
+        "fakepkg":"file:vendor/own/fakepkg@1.0.0",
+        "alias@npm:fakepkg@1.0.0":"file:vendor/own/fakepkg@1.0.0"
+    });
+    project.write(
+        "package.json",
+        &serde_json::json!({"pnpm":{"overrides":overrides}}).to_string(),
+    );
+    let text = fs::read_to_string(project.0.join("own.lock")).unwrap();
+    let mut lock = own_core::lock::parse_lock(&text).unwrap();
+    lock.metadata.lock_digest =
+        own_core::canonical::compute_lock_digest(&lock, overrides.as_object().unwrap());
+    project.write("own.lock", &write_lock_canonical(&lock));
+    let output = project.run(&["--format=json"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["findings"], serde_json::json!([]));
 }

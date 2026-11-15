@@ -9,7 +9,7 @@ use own_core::canonical::{
 use own_core::config::license_policy_json;
 use own_core::lock::{parse_lock, LicenseFile, Lock, Package};
 use own_core::txn::Txn;
-use own_net::{build_client, fetch_packument, fetch_tarball, verify_sri_integrity, NetConfig};
+use own_net::{build_client, fetch_packument, fetch_tarball, verify_sri_integrity};
 use own_policy::{eligibility, license as lic, pnpm_lock::parse_pnpm_lock};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -31,6 +31,8 @@ pub struct AddArgs {
 /// version must not leave the earlier ones vendored (SPEC §9.2 vendor-all).
 pub struct Prepared {
     pub dir: String,
+    pub registry_url: String,
+    pub security: own_extract::SecurityLimits,
     pub tarball: Vec<u8>,
     pub sha512_hex: String,
     pub tarball_sha256: String,
@@ -50,6 +52,20 @@ fn check_local(root: &Path, args: &AddArgs, lock: &Lock) -> Result<(), String> {
     // preconditions
     if !root.join("own.toml").exists() || !root.join("own.lock").exists() {
         return Err("NOT_INITIALIZED".to_string());
+    }
+    if !matches!(
+        args.allow_diamond.as_deref(),
+        None | Some("keep-external" | "unify" | "vendor-all")
+    ) {
+        return Err(
+            "USAGE_ERROR: --allow-diamond must be keep-external|unify|vendor-all".to_string(),
+        );
+    }
+    if matches!(
+        args.allow_diamond.as_deref(),
+        Some("keep-external" | "unify")
+    ) {
+        return Err("USAGE_ERROR: diamond strategy is not implemented; use vendor-all".into());
     }
     // vendor-all (Phase 2, §9.2) vendors several versions of the same package:
     // the duplicate check is then on (name, version), not name alone.
@@ -74,19 +90,15 @@ fn check_local(root: &Path, args: &AddArgs, lock: &Lock) -> Result<(), String> {
     let pnpm_lock_text = std::fs::read_to_string(root.join("pnpm-lock.yaml"))
         .map_err(|e| format!("IO_ERROR: pnpm-lock.yaml: {e}"))?;
     let pnpm_lock = parse_pnpm_lock(&pnpm_lock_text)?;
-    // vendor-all: every version present in pnpm-lock packages is by
-    // definition resolved (Phase 2 §9.2); only check membership there.
+    let dependents = pnpm_lock.registry_dependents(&args.pkg, &args.version);
+    let versions_resolved = pnpm_lock.resolved_versions(&args.pkg);
+    // Ordinary add needs an actual importer or snapshot edge; vendor-all also
+    // accepts catalogue versions (Phase 2 §9.2). Neither uses the specifier as
+    // evidence of which version was really resolved.
     let resolved = if args.allow_diamond.as_deref() == Some("vendor-all") {
-        pnpm_lock
-            .packages
-            .iter()
-            .any(|e| e.name == args.pkg && e.version == args.version)
+        versions_resolved.contains(&args.version)
     } else {
-        pnpm_lock
-            .importers
-            .iter()
-            .flat_map(|im| im.deps.iter())
-            .any(|(n, spec, v)| n == &args.pkg && (v == &args.version || spec == &args.version))
+        !dependents.is_empty()
     };
     if !resolved {
         return Err("USAGE_ERROR: version not resolved in pnpm-lock.yaml".to_string());
@@ -111,71 +123,20 @@ fn check_local(root: &Path, args: &AddArgs, lock: &Lock) -> Result<(), String> {
     }
 
     // diamonds §9.2: dependents from pnpm-lock
-    let dependents: Vec<String> = {
-        let mut d: Vec<String> = pnpm_lock
-            .importers
-            .iter()
-            .filter(|im| {
-                im.deps
-                    .iter()
-                    .any(|(n, _, v)| n == &args.pkg && v == &args.version)
-            })
-            .map(|im| format!("importer:{}", im.path))
-            .collect();
-        for p in &pnpm_lock.packages {
-            if p.deps
-                .iter()
-                .any(|(n, v)| n == &args.pkg && v == &args.version)
-            {
-                d.push(format!("{}@{}", p.name, p.version));
-            }
-        }
-        d.sort();
-        d.dedup();
-        d
-    };
-    let mut versions_resolved: Vec<String> = pnpm_lock
-        .importers
-        .iter()
-        .flat_map(|im| im.deps.iter().map(|(n, _, v)| (n.clone(), v.clone())))
-        .chain(
-            pnpm_lock
-                .packages
-                .iter()
-                .flat_map(|p| p.deps.iter().map(|(n, v)| (n.clone(), v.clone()))),
-        )
-        .filter(|(n, _)| *n == args.pkg)
-        .map(|(_, v)| v)
-        .collect();
-    versions_resolved.sort();
-    versions_resolved.dedup();
     let multi_version = versions_resolved.len() > 1;
-    if dependents.len() >= 2 || multi_version {
-        match args.allow_diamond.as_deref() {
-            None => {
-                return Err(format!(
-                    "DIAMOND_DETECTED: {}@{} also resolved via {}. Use --allow-diamond=<strategy>",
-                    args.pkg,
-                    args.version,
-                    dependents.join(", ")
-                ))
-            }
-            Some("keep-external") | Some("unify") | Some("vendor-all") => {
-                // recorded in lock by caller (Phase 2: vendor-all = vendor
-                // EVERY resolved version of the package, not just <ver>)
-            }
-            Some(_) => {
-                return Err(
-                    "USAGE_ERROR: --allow-diamond must be keep-external|unify|vendor-all"
-                        .to_string(),
-                );
-            }
-        }
+    if (dependents.len() >= 2 || multi_version) && args.allow_diamond.is_none() {
+        return Err(format!(
+            "DIAMOND_DETECTED: {}@{} also resolved via {}. Use --allow-diamond=<strategy>",
+            args.pkg,
+            args.version,
+            dependents.join(", ")
+        ));
     }
     Ok(())
 }
 
 fn prepare(root: &Path, args: &AddArgs, lock: &Lock) -> Result<Prepared, String> {
+    let settings = crate::project_config::load(root)?;
     check_local(root, args, lock)?;
     let dir = format!(
         "vendor/own/{}",
@@ -185,7 +146,7 @@ fn prepare(root: &Path, args: &AddArgs, lock: &Lock) -> Result<Prepared, String>
         .map_err(|e| format!("IO_ERROR: pnpm-lock.yaml: {e}"))?;
     let pnpm_lock = parse_pnpm_lock(&pnpm_lock_text)?;
     // network: packument + tarball
-    let cfg = NetConfig::default();
+    let cfg = settings.net;
     let client = build_client(&cfg)?;
     let packument = fetch_packument(&client, &cfg, &args.pkg)?;
     let pv: serde_json::Value =
@@ -201,7 +162,7 @@ fn prepare(root: &Path, args: &AddArgs, lock: &Lock) -> Result<Prepared, String>
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
-    let max_unpacked = 500 * 1_048_576;
+    let max_unpacked = settings.security.max_unpacked_size;
     let elig = eligibility::evaluate(vobj, &vendored, max_unpacked);
     for w in &elig.warnings {
         eprintln!("warning: {w}");
@@ -275,6 +236,8 @@ fn prepare(root: &Path, args: &AddArgs, lock: &Lock) -> Result<Prepared, String>
     }
     Ok(Prepared {
         dir,
+        registry_url: cfg.registry_url.clone(),
+        security: settings.security,
         tarball: dl.bytes,
         sha512_hex,
         tarball_sha256: dl.sha256.clone(),
@@ -310,6 +273,8 @@ fn apply(
         prepared.license_selected.clone(),
         &prepared.license_expression,
         &prepared.prov,
+        &prepared.security,
+        &prepared.registry_url,
     )?;
     // package.json override FIRST, so the lock digest sees it (§7.3 overrides field)
     update_package_json(
@@ -334,8 +299,10 @@ fn install_and_verify(txn: &Txn, root: &Path, pkg: &str, no_install: bool) -> Re
         eprintln!("warning: --no-install: post-install verification not performed");
         return Ok(());
     }
+    txn.backup("pnpm-lock.yaml")?;
     let st = std::process::Command::new("pnpm")
         .arg("install")
+        .arg("--ignore-scripts")
         .current_dir(root)
         .status()
         .map_err(|e| format!("PNPM_FAILED: {e}"))?;
@@ -343,11 +310,19 @@ fn install_and_verify(txn: &Txn, root: &Path, pkg: &str, no_install: bool) -> Re
         return Err("PNPM_FAILED".to_string());
     }
     let out = std::process::Command::new("pnpm")
-        .args(["install", "--reporter=ndjson", "--force"])
+        .args([
+            "install",
+            "--ignore-scripts",
+            "--reporter=ndjson",
+            "--force",
+        ])
         .current_dir(root)
         .output()
         .map_err(|e| format!("PNPM_FAILED: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        return Err(format!("PNPM_FAILED: forced install exited {}", out.status));
+    }
     let lifecycle = stdout
         .lines()
         .filter(|l| l.contains("pnpm:lifecycle"))
@@ -357,6 +332,23 @@ fn install_and_verify(txn: &Txn, root: &Path, pkg: &str, no_install: bool) -> Re
         return Err("INSTALL_VERIFY_FAILED: lifecycle script ran".to_string());
     }
     let _ = txn;
+    let policy = license_policy_json(
+        &std::fs::read_to_string(root.join("own.toml")).map_err(|e| format!("IO_ERROR: {e}"))?,
+    )?;
+    let overrides = read_overrides_json(root)?;
+    let outcome = own_core::verify::verify(root, &policy, &overrides)?;
+    let installed = own_core::verify::verify_installed(root)?;
+    if let Some(finding) = outcome
+        .findings
+        .iter()
+        .chain(&installed)
+        .find(|f| f.severity == "error")
+    {
+        return Err(format!(
+            "INSTALL_VERIFY_FAILED: {} {}",
+            finding.code, finding.path
+        ));
+    }
     Ok(())
 }
 
@@ -372,11 +364,12 @@ pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
             args.ecosystem
         ));
     }
+    // Keep recovery and the snapshot used for preparation under one lock.
+    let txn = Txn::begin(root)?;
     let lock_text =
         std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
     let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
     let prepared = prepare(root, args, &lock)?;
-    let txn = Txn::begin(root)?;
     let res = apply(
         &txn,
         root,
@@ -406,6 +399,10 @@ pub fn add(root: &Path, args: &AddArgs) -> Result<(), String> {
 /// single transaction, so a failure anywhere rolls the whole run back instead of
 /// leaving a partial set of versions.
 pub fn add_vendor_all(root: &Path, base: &AddArgs, versions: &[String]) -> Result<usize, String> {
+    if base.ecosystem != "npm" {
+        return Err("ECOSYSTEM_UNSUPPORTED: only npm vendoring is implemented".to_string());
+    }
+    let txn = Txn::begin(root)?;
     let lock_text =
         std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
     let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
@@ -447,7 +444,6 @@ pub fn add_vendor_all(root: &Path, base: &AddArgs, versions: &[String]) -> Resul
         let prepared = prepare(root, &args, &lock)?;
         planned.push((args, prepared));
     }
-    let txn = Txn::begin(root)?;
     let res = (|| -> Result<(), String> {
         let mut accumulated = lock.clone();
         for (args, prepared) in &planned {
@@ -485,22 +481,34 @@ fn add_inner(
     license_selected: Option<String>,
     license_expression: &str,
     prov: &Provenance,
+    limits: &own_extract::SecurityLimits,
+    registry_url: &str,
 ) -> Result<Lock, String> {
+    let pnpm_text = std::fs::read_to_string(root.join("pnpm-lock.yaml"))
+        .map_err(|e| format!("IO_ERROR: pnpm-lock.yaml: {e}"))?;
+    let dependents = parse_pnpm_lock(&pnpm_text)?.registry_dependents(&args.pkg, &args.version);
     // cache the tarball (0444, named by sha512)
-    let cache_dir = root.join(".own/cache");
-    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let cache_path = cache_path_for(&cache_dir, sha512_hex);
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&cache_path, tarball).map_err(|e| format!("IO_ERROR: {e}"))?;
-        std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o444))
-            .map_err(|e| format!("IO_ERROR: {e}"))?;
-    }
+    let cache_path = cache_tarball(txn, sha512_hex, tarball)?;
     // extract to .own/tmp/<id>
-    let tmp_extract = root.join(".own/tmp").join(format!("extract-{}", txn.id));
+    let tmp_extract =
+        own_core::path_safety::project_path(root, &format!(".own/tmp/extract-{}", txn.id))
+            .map_err(|e| format!("IO_ERROR: {e}"))?;
     std::fs::create_dir_all(&tmp_extract).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let limits = own_extract::SecurityLimits::default();
-    let stats = own_extract::extract(&cache_path, &tmp_extract, &limits)?;
+    let stats = own_extract::extract(&cache_path, &tmp_extract, limits)?;
+    let vendored: Vec<_> = lock
+        .packages
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone()))
+        .collect();
+    validate_extracted_package_with_limit(
+        &tmp_extract,
+        &args.pkg,
+        &args.version,
+        integrity,
+        &vendored,
+        license_expression,
+        limits.max_unpacked_size,
+    )?;
     // post-extraction: git check-ignore on all files
     let mut paths: Vec<String> = Vec::new();
     collect_files(&tmp_extract, &tmp_extract, &mut paths);
@@ -568,7 +576,7 @@ fn add_inner(
         ecosystem: args.ecosystem.clone(),
         version: args.version.clone(),
         dir: dir.clone(),
-        registry: "https://registry.npmjs.org".to_string(),
+        registry: registry_url.to_string(),
         integrity: integrity.to_string(),
         tarball_sha256: tarball_sha256.to_string(),
         version_manifest_sha256: vm_hash.to_string(),
@@ -576,7 +584,7 @@ fn add_inner(
         provenance_source: prov.source.clone(),
         mode: "verbatim".to_string(),
         roots: vec![".".to_string()],
-        dependents: vec!["importer:.".to_string()],
+        dependents,
         license_expression: license_expression.to_string(),
         license_selected,
         license_policy: license_policy.to_string(),
@@ -606,6 +614,41 @@ fn add_inner(
     let overrides = read_overrides_json(root)?;
     new_lock.metadata.lock_digest = compute_lock_digest(&new_lock, &overrides);
     Ok(new_lock)
+}
+
+/// The registry metadata cannot hide install scripts or a different identity
+/// in the byte-identical archive. Validate it before publishing or installing.
+pub(crate) fn validate_extracted_package_with_limit(
+    root: &Path,
+    name: &str,
+    version: &str,
+    integrity: &str,
+    vendored: &[(String, String)],
+    license: &str,
+    max_unpacked: u64,
+) -> Result<(), String> {
+    let bytes = std::fs::read(root.join("package.json"))
+        .map_err(|e| format!("IO_ERROR: package.json: {e}"))?;
+    let mut package: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("PARSE_ERROR: archive package.json: {e}"))?;
+    if package.get("name").and_then(|v| v.as_str()) != Some(name)
+        || package.get("version").and_then(|v| v.as_str()) != Some(version)
+    {
+        return Err("NOT_ELIGIBLE:archive_identity".into());
+    }
+    if package.get("license").and_then(|v| v.as_str()) != Some(license) {
+        return Err("NOT_ELIGIBLE:archive_license".into());
+    }
+    // dist.integrity belongs to the verified registry response, not package.json.
+    package["dist"] = serde_json::json!({"integrity": integrity});
+    let eligibility = own_policy::eligibility::evaluate(&package, vendored, max_unpacked);
+    if !eligibility.eligible {
+        return Err(format!(
+            "NOT_ELIGIBLE:{}",
+            eligibility.blocking.unwrap_or("archive_metadata")
+        ));
+    }
+    Ok(())
 }
 
 pub fn manifest_pfs_pub(root: &Path, dir: &str) -> Result<String, String> {
@@ -661,6 +704,43 @@ fn cache_path_for(dir: &Path, sha512_hex: &str) -> PathBuf {
     dir.join(format!("{sha512_hex}.tgz"))
 }
 
+pub(crate) fn cache_tarball(txn: &Txn, sha512_hex: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let cache_dir = txn.root.join(".own/cache");
+    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let path = cache_path_for(&cache_dir, sha512_hex);
+    // Replace by durable rename: truncating an existing 0444 entry fails.
+    txn.write_file(&format!(".own/cache/{sha512_hex}.tgz"), bytes)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+        .map_err(|e| format!("IO_ERROR: {e}"))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod cache_publication_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cache_republication_replaces_readonly_entry() {
+        let root = std::env::temp_dir().join(format!("own-cache-republish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let txn = Txn::begin(&root).unwrap();
+        let bytes = b"freshly downloaded and verified bytes";
+        let first = cache_tarball(&txn, &"a".repeat(128), bytes).unwrap();
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        let second = cache_tarball(&txn, &"a".repeat(128), bytes)
+            .expect("same-version update must be able to reuse a read-only cache path");
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&second).unwrap(), bytes);
+        txn.commit().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn collect_files(base: &Path, dir: &Path, out: &mut Vec<String>) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -676,7 +756,7 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-fn is_native_binary(b: &[u8]) -> bool {
+pub(crate) fn is_native_binary(b: &[u8]) -> bool {
     if b.len() >= 4 && &b[..4] == b"\x7fELF" {
         return true;
     }
@@ -693,9 +773,6 @@ fn is_native_binary(b: &[u8]) -> bool {
         if b.len() >= off + 4 && &b[off..off + 4] == b"PE\0\0" {
             return true;
         }
-    }
-    for ext in [".node", ".so", ".dylib", ".dll", ".exe", ".a", ".o"] {
-        let _ = ext;
     }
     false
 }
@@ -875,6 +952,7 @@ fn update_package_json(
     let text = std::fs::read_to_string(root.join(rel)).map_err(|e| format!("IO_ERROR: {e}"))?;
     let mut v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("PARSE_ERROR: {e}"))?;
+    let aliases = alias_selectors(root, pkg, version)?;
     let pnpm = v.as_object_mut().ok_or("PARSE_ERROR: package.json")?;
     let pnpm_map = pnpm
         .entry("pnpm".to_string())
@@ -892,6 +970,30 @@ fn update_package_json(
     // pnpm applies per resolved version. The bare key is removed: leaving it
     // would keep overriding the versions the scoped keys are meant to separate.
     let key = if vendor_all {
+        // Preserve an already-vendored bare version when extending its set.
+        if let Some(value) = ov
+            .get(pkg)
+            .and_then(|value| value.as_str())
+            .filter(|value| value.starts_with("file:vendor/own/"))
+            .map(str::to_string)
+        {
+            let text = std::fs::read_to_string(root.join("own.lock"))
+                .map_err(|e| format!("IO_ERROR: {e}"))?;
+            let locked = parse_lock(&text).map_err(|e| format!("PARSE_ERROR: {e}"))?;
+            let previous = locked
+                .packages
+                .iter()
+                .find(|p| p.name == pkg && value == format!("file:{}", p.dir))
+                .ok_or("OVERRIDE_CONFLICT")?;
+            let old_key = own_core::lock::versioned_override_key(pkg, &previous.version);
+            if ov
+                .get(&old_key)
+                .is_some_and(|old| old != &serde_json::json!(value))
+            {
+                return Err("OVERRIDE_CONFLICT".to_string());
+            }
+            ov.insert(old_key, serde_json::json!(value));
+        }
         ov.remove(pkg);
         own_core::lock::versioned_override_key(pkg, version)
     } else {
@@ -912,8 +1014,85 @@ fn update_package_json(
             .collect();
         *ov = sorted;
     }
+    for selector in aliases {
+        if ov
+            .get(&selector)
+            .is_some_and(|existing| existing != &serde_json::json!(format!("file:{dir}")))
+        {
+            return Err("OVERRIDE_CONFLICT".to_string());
+        }
+        ov.insert(selector, serde_json::json!(format!("file:{dir}")));
+    }
     let out = serde_json::to_string_pretty(&v).map_err(|e| format!("IO_ERROR: {e}"))?;
     txn.write_file(rel, format!("{out}\n").as_bytes())
+}
+
+/// pnpm matches npm aliases by declared name and exact original specifier,
+/// not by the target package's real name or its resolved version.
+fn alias_selectors(root: &Path, pkg: &str, version: &str) -> Result<Vec<String>, String> {
+    use own_policy::pnpm_lock::registry_dependency;
+    let text = match std::fs::read_to_string(root.join("pnpm-lock.yaml")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("IO_ERROR: {e}")),
+    };
+    let lock = parse_pnpm_lock(&text)?;
+    let mut selectors = std::collections::BTreeSet::new();
+    for im in &lock.importers {
+        for (name, spec, resolved) in im.all_deps() {
+            if spec.starts_with("npm:")
+                && registry_dependency(name, Some(spec), resolved)
+                    .is_some_and(|(n, v)| n == pkg && v == version)
+            {
+                selectors.insert(format!("{name}@{spec}"));
+            }
+        }
+    }
+    for parent in &lock.packages {
+        for (name, resolved) in &parent.deps {
+            let main_resolution = resolved.split('(').next().unwrap_or(resolved);
+            if (name == pkg && !main_resolution.contains('@'))
+                || !registry_dependency(name, None, resolved)
+                    .is_some_and(|(n, v)| n == pkg && v == version)
+            {
+                continue;
+            }
+            let mut found = false;
+            let store = std::fs::read_dir(root.join("node_modules/.pnpm"))
+                .map_err(|e| format!("ALIAS_SPECIFIER_UNAVAILABLE: {}: {e}", parent.key))?;
+            for entry in store {
+                let entry = entry.map_err(|e| format!("IO_ERROR: {e}"))?;
+                let manifest = entry
+                    .path()
+                    .join("node_modules")
+                    .join(&parent.name)
+                    .join("package.json");
+                let bytes = match std::fs::read(&manifest) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(format!("IO_ERROR: {e}")),
+                };
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("PARSE_ERROR: {}: {e}", manifest.display()))?;
+                if value["name"] != parent.name || value["version"] != parent.version {
+                    continue;
+                }
+                for section in ["dependencies", "optionalDependencies"] {
+                    if let Some(spec) = value[section][name]
+                        .as_str()
+                        .filter(|s| s.starts_with("npm:"))
+                    {
+                        selectors.insert(format!("{name}@{spec}"));
+                        found = true;
+                    }
+                }
+            }
+            if !found {
+                return Err(format!("ALIAS_SPECIFIER_UNAVAILABLE: {} > {name}; install dependencies before vendoring", parent.key));
+            }
+        }
+    }
+    Ok(selectors.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -922,10 +1101,12 @@ mod override_tests {
     use own_core::txn::Txn;
 
     fn fixture(overrides: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "own-override-{}-{}",
+            "own-override-{}-{}-{}",
             std::process::id(),
-            overrides.len()
+            overrides.len(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -977,6 +1158,13 @@ mod override_tests {
     fn vendor_all_writes_one_versioned_override_per_version_p2_06() {
         // Starts from a bare key, as a single-version `add` would have written it.
         let root = fixture("{\"a\":\"file:vendor/own/a@1.0.0\"}");
+        let mut lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+        lock.packages.push(package("a", "1.0.0"));
+        std::fs::write(
+            root.join("own.lock"),
+            own_core::canonical::write_lock_canonical(&lock),
+        )
+        .unwrap();
         let txn = Txn::begin(&root).unwrap();
         for version in ["1.0.0", "2.0.0"] {
             update_package_json(
@@ -996,6 +1184,52 @@ mod override_tests {
                 "a@1.0.0": "file:vendor/own/a@1.0.0",
                 "a@2.0.0": "file:vendor/own/a@2.0.0",
             })
+        );
+    }
+
+    #[test]
+    fn vendor_all_targets_the_exact_declared_npm_alias() {
+        let root = fixture("{}");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"dependencies":{"zod-old":"npm:zod@3.22.4","zod-new":"npm:zod@^3.23.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      zod-old:\n        specifier: npm:zod@3.22.4\n        version: zod@3.22.4\n      zod-new:\n        specifier: npm:zod@^3.23.0\n        version: zod@3.23.8\n").unwrap();
+        let txn = Txn::begin(&root).unwrap();
+        for version in ["3.22.4", "3.23.8"] {
+            update_package_json(
+                &txn,
+                &root,
+                "zod",
+                version,
+                &format!("vendor/own/zod@{version}"),
+                true,
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(
+            read_overrides(&root),
+            serde_json::json!({
+                "zod@3.22.4": "file:vendor/own/zod@3.22.4",
+                "zod@3.23.8": "file:vendor/own/zod@3.23.8",
+                "zod-old@npm:zod@3.22.4": "file:vendor/own/zod@3.22.4",
+                "zod-new@npm:zod@^3.23.0": "file:vendor/own/zod@3.23.8"
+            })
+        );
+    }
+
+    #[test]
+    fn vendor_all_targets_npm_aliases_even_when_the_declared_name_is_real() {
+        let root = fixture("{}");
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      zod:\n        specifier: npm:zod@3.22.4\n        version: zod@3.22.4\n").unwrap();
+        let txn = Txn::begin(&root).unwrap();
+        update_package_json(&txn, &root, "zod", "3.22.4", "vendor/own/zod@3.22.4", true).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            read_overrides(&root)["zod@npm:zod@3.22.4"],
+            "file:vendor/own/zod@3.22.4"
         );
     }
 
@@ -1103,6 +1337,86 @@ mod override_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod diamond_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(pnpm: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "own-add-diamond-{}-{}",
+                std::process::id(),
+                NONCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("own.toml"), own_core::config::DEFAULT_OWN_TOML).unwrap();
+            let lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+            std::fs::write(root.join("own.lock"), write_lock_canonical(&lock)).unwrap();
+            std::fs::write(root.join("pnpm-lock.yaml"), pnpm).unwrap();
+            Self(root)
+        }
+
+        fn check(&self, strategy: Option<&str>) -> Result<(), String> {
+            let lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+            check_local(
+                &self.0,
+                &AddArgs {
+                    pkg: "zod".into(),
+                    version: "3.22.4".into(),
+                    ecosystem: "npm".into(),
+                    allow_diamond: strategy.map(str::to_string),
+                    license_override: false,
+                    no_install: true,
+                    allow_untested_pnpm: false,
+                },
+                &lock,
+            )
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn add_alias_multiversion_refuses_before_network_inv6() {
+        let fixture = Fixture::new(
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      zod:\n        specifier: 3.22.4\n        version: 3.22.4\n      zod-new:\n        specifier: npm:zod@3.23.8\n        version: zod@3.23.8\npackages:\n  zod@3.22.4:\n    resolution: {integrity: sha512-x}\n  zod@3.23.8:\n    resolution: {integrity: sha512-y}\nsnapshots:\n  zod@3.22.4: {}\n  zod@3.23.8: {}\n",
+        );
+        let before = std::fs::read(fixture.0.join("own.lock")).unwrap();
+        let result = fixture.check(None);
+        assert!(
+            matches!(&result, Err(error) if error.starts_with("DIAMOND_DETECTED:")),
+            "INV-6: alias resolves a second real version, got {result:?}"
+        );
+        assert_eq!(std::fs::read(fixture.0.join("own.lock")).unwrap(), before);
+        assert!(!fixture.0.join("vendor").exists());
+    }
+
+    #[test]
+    fn add_invalid_strategy_without_diamond_is_usage_error_inv6() {
+        let fixture = Fixture::new(
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      zod:\n        specifier: 3.22.4\n        version: 3.22.4\npackages:\n  zod@3.22.4:\n    resolution: {integrity: sha512-x}\n",
+        );
+        assert_eq!(
+            fixture.check(Some("invalid")),
+            Err("USAGE_ERROR: --allow-diamond must be keep-external|unify|vendor-all".into())
+        );
+        assert!(!fixture.0.join("vendor").exists());
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/add_security.rs"]
+mod security_tests;
 
 #[cfg(test)]
 mod provenance_tests {

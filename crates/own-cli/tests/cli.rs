@@ -605,6 +605,37 @@ fn verify_installed_reports_drift_installed() {
 // 3. Read commands on an uninitialised directory
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+#[test]
+fn update_rejects_git_status_exit_128_with_empty_stdout() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = drift_project("update-git-failure");
+    let bin = dir.join("fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\nprintf 'fatal: fixture status failure\\n' >&2\nexit 128\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    let before = read_bytes(dir.path(), "own.lock");
+    let result = run_own(
+        dir.path(),
+        &[("PATH", bin.to_str().unwrap())],
+        &["update", "fakepkg@1.0.1", "--no-pr", "--no-install"],
+    );
+    assert!(
+        result.2.contains("GIT_ERROR"),
+        "git failure must not look clean: {result:?}"
+    );
+    assert!(
+        result.2.contains("128"),
+        "missing process status: {result:?}"
+    );
+    assert_eq!(read_bytes(dir.path(), "own.lock"), before);
+}
+
 #[test]
 fn verify_on_uninitialized_directory_exits_2() {
     let dir = TempDir::new("verify-uninitialized");
@@ -644,6 +675,11 @@ fn read_commands_on_uninitialized_directory_exit_2() {
         &["diff", "a@1.0.0", "a@1.0.1"],
         &["eject", "--adopt", "--yes"],
         &["check"],
+        // The writing commands the scenario battery caught answering a bare
+        // IO_ERROR instead of the §8.2 precondition.
+        &["add", "zod@3.22.4"],
+        &["add", "zod@3.22.4", "--allow-diamond", "vendor-all"],
+        &["update", "zod@3.23.8", "--no-pr"],
     ];
     for args in cases {
         let result = own(dir.path(), args);
@@ -775,14 +811,14 @@ fn licenses_empty_lock_read_then_write_is_idempotent() {
         "LICENSES.md must be byte-identical after a second --write"
     );
 
-    // Once the lock tracks licenses_md_sha256, the read-only form is silent.
+    // Tracking LICENSES.md validates the inventory without suppressing the table.
     let read_after = own(dir.path(), &["licenses"]);
     assert_exit(&read_after, 0, "licenses after --write");
-    assert!(
-        read_after.1.is_empty(),
-        "tracked LICENSES.md is checked silently; stdout={:?}",
-        read_after.1
+    assert_eq!(
+        read_after.1, read_only.1,
+        "validated inventory must still print the table"
     );
+    assert!(read_after.2.is_empty(), "stderr: {:?}", read_after.2);
 
     let verify = own(dir.path(), &["verify"]);
     assert_exit(&verify, 0, "verify after licenses --write");
@@ -887,6 +923,58 @@ fn migrate_on_schema_version_1_is_a_no_op() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn add_alias_only_multiversion_reports_diamond_detected_inv6() {
+    let dir = pnpm_project("add-alias-diamond");
+    // Both declared names are aliases: the old membership check refuses before
+    // networking, while the corrected local guard must identify the diamond.
+    write(
+        dir.path(),
+        "pnpm-lock.yaml",
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      zod-old:\n        specifier: npm:zod@3.22.4\n        version: zod@3.22.4\n      zod-new:\n        specifier: npm:zod@3.23.8\n        version: zod@3.23.8\npackages:\n  zod@3.22.4:\n    resolution: {integrity: sha512-x}\n  zod@3.23.8:\n    resolution: {integrity: sha512-y}\nsnapshots:\n  zod@3.22.4: {}\n  zod@3.23.8: {}\n",
+    );
+    let before: Vec<_> = ["own.lock", "package.json", "pnpm-lock.yaml"]
+        .map(|path| (path, read_bytes(dir.path(), path)))
+        .into();
+    let result = own(dir.path(), &["add", "zod@3.22.4", "--no-install"]);
+    assert_exit(&result, 1, "INV-6: alias-only multi-version add");
+    assert!(result.2.contains("DIAMOND_DETECTED:"), "{result:?}");
+    for (path, bytes) in before {
+        assert_eq!(read_bytes(dir.path(), path), bytes, "{path} changed");
+    }
+    assert!(!dir.join("vendor/own/zod@3.22.4").exists());
+}
+
+#[test]
+fn add_invalid_strategy_reports_usage_error_before_network_inv6() {
+    let dir = pnpm_project("add-invalid-strategy");
+    write(
+        dir.path(),
+        "pnpm-lock.yaml",
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      zod:\n        specifier: 3.22.4\n        version: 3.22.4\npackages:\n  zod@3.22.4: {}\n",
+    );
+    let before = read_bytes(dir.path(), "own.lock");
+    let result = own(
+        dir.path(),
+        &[
+            "add",
+            "zod@3.22.4",
+            "--no-install",
+            "--allow-diamond",
+            "invalid",
+        ],
+    );
+    assert_exit(&result, 2, "invalid strategy must be a usage error");
+    assert!(
+        result
+            .2
+            .contains("USAGE_ERROR: --allow-diamond must be keep-external|unify|vendor-all"),
+        "{result:?}"
+    );
+    assert_eq!(read_bytes(dir.path(), "own.lock"), before);
+    assert!(!dir.join("vendor/own/zod@3.22.4").exists());
+}
+
+#[test]
 fn add_refuses_pypi_with_a_clear_code_inv4() {
     let dir = init_project("add-pypi");
     // No pnpm-lock.yaml here on purpose: a Python package has none, so the npm
@@ -909,6 +997,135 @@ fn add_refuses_pypi_with_a_clear_code_inv4() {
         result.2
     );
     assert!(!dir.path().join("vendor/own/six@1.16.0").exists());
+}
+
+#[test]
+fn eject_rolls_back_when_pnpm_cannot_start_inv9() {
+    let dir = pnpm_project("eject-no-pnpm");
+    // Clean worktree, otherwise eject refuses before touching anything.
+    assert!(
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "git add failed"
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "init"
+            ])
+            .current_dir(dir.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "git commit failed"
+    );
+    let before_toml = std::fs::read_to_string(dir.path().join("own.toml")).unwrap();
+    let before_lock = std::fs::read_to_string(dir.path().join("own.lock")).unwrap();
+
+    // A PATH that has git (an eject prerequisite, §5) but no pnpm: the removal
+    // already happened, so the failure must roll the project state back instead
+    // of leaving a half-ejected repository.
+    let git = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("resolve git")
+            .stdout,
+    )
+    .expect("git path is UTF-8")
+    .trim()
+    .to_string();
+    // Outside the project: a directory inside it would make the worktree dirty.
+    let only_git = std::env::temp_dir().join(format!("own-only-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&only_git);
+    std::fs::create_dir_all(&only_git).unwrap();
+    std::os::unix::fs::symlink(&git, only_git.join("git")).unwrap();
+    let path = only_git.to_string_lossy().to_string();
+    let out = run_own(
+        dir.path(),
+        &[("PATH", &path)],
+        &["eject", "--adopt", "--yes"],
+    );
+    assert_exit(&out, 2, "eject without pnpm");
+    assert!(out.2.contains("PNPM_FAILED"), "stderr: {:?}", out.2);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("own.toml")).unwrap(),
+        before_toml,
+        "own.toml must be restored by the rollback"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("own.lock")).unwrap(),
+        before_lock,
+        "own.lock must be restored by the rollback"
+    );
+}
+
+#[test]
+fn writing_license_commands_read_the_restored_lock_after_recovery() {
+    for args in [&["policy-sync"][..], &["licenses", "--write"][..]] {
+        let dir = pnpm_project(args[0]);
+        let original = read_bytes(dir.path(), "own.lock");
+        let mut interrupted =
+            own_core::lock::parse_lock(std::str::from_utf8(&original).unwrap()).unwrap();
+        interrupted.metadata.own_version = Some("interrupted-state".into());
+        write(
+            dir.path(),
+            "own.lock",
+            own_core::canonical::write_lock_canonical(&interrupted),
+        );
+        write(dir.path(), ".own/txn/crashed/backup/own.lock", &original);
+        write(
+            dir.path(),
+            ".own/txn/crashed/journal.json",
+            serde_json::json!({
+                "state": "started", "id": "crashed", "root": dir.path(),
+                "backup_files": [{"rel": "own.lock", "flat": "own.lock"}],
+                "created_dirs": []
+            })
+            .to_string(),
+        );
+        let result = own(dir.path(), args);
+        assert_exit(&result, 0, "writer must recover before it reads");
+        assert!(result.2.contains("W_TXN_RECOVERED"), "{:?}", result.2);
+        let restored = own_core::lock::parse_lock(&read(dir.path(), "own.lock")).unwrap();
+        assert_ne!(
+            restored.metadata.own_version.as_deref(),
+            Some("interrupted-state"),
+            "{args:?} re-published the snapshot read before crash recovery"
+        );
+        assert!(dir.join(".own/txn").read_dir().unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn add_license_override_must_target_the_package_being_added() {
+    let dir = init_project("license-override-target");
+    // §8.1: the value names <pkg>; it used to be reduced to a boolean, so any
+    // other package name was accepted and waived the licence of whatever was
+    // being vendored.
+    for value in ["human-review:other", "other", "human-review:"] {
+        let result = own(
+            dir.path(),
+            &["add", "zod@3.22.4", "--license-override", value],
+        );
+        assert_exit(&result, 2, &format!("--license-override {value}"));
+        assert!(
+            result.2.contains("USAGE_ERROR"),
+            "value {value:?}: stderr {:?}",
+            result.2
+        );
+    }
+    assert!(!dir.path().join("vendor/own/zod@3.22.4").exists());
 }
 
 #[test]
@@ -995,7 +1212,14 @@ fn check_allow_missing_osv_warns_and_exits_0() {
     assert_eq!(envelope["command"].as_str(), Some("check"));
     assert_eq!(envelope["status"].as_str(), Some("ok"));
     assert_eq!(envelope["exit_code"].as_u64(), Some(0));
-    assert_eq!(envelope["findings"].as_array().map(Vec::len), Some(0));
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .is_some_and(|findings| findings
+                .iter()
+                .all(|finding| finding["severity"] == "warning")),
+        "warnings must stay warning-only: {envelope}"
+    );
     assert_eq!(envelope["data"]["alerts"].as_array().map(Vec::len), Some(0));
 }
 

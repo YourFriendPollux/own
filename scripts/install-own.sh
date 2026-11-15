@@ -7,37 +7,39 @@
 # a published binary is never replaced; a bad release means a new version.
 #
 # Usage: OWN_VERSION=v0.1.0 ./scripts/install-own.sh
-# Env:   OWN_VERSION (required), OWN_BIN_DIR, OWN_REPO (default: this repository),
-#        COSIGN_VERSION (pinned, default below).
+# Requires trusted, preinstalled cosign and slsa-verifier. Never bootstrap a
+# verifier from the same untrusted downloads it is supposed to authenticate.
 set -euo pipefail
 
 OWN_VERSION="${OWN_VERSION:?set OWN_VERSION (e.g. v0.1.0)}"
 OWN_REPO="${OWN_REPO:-YourFriendPollux/own}"
 OWN_BIN_DIR="${OWN_BIN_DIR:-$HOME/.local/bin}"
-COSIGN_VERSION="${COSIGN_VERSION:-v3.0.5}"
+PROV="${OWN_PROVENANCE_ASSET:-multiple.intoto.jsonl}"
+refuse() { echo "install-own: $*" >&2; exit 2; }
+[[ "$OWN_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || refuse "invalid OWN_VERSION"
+[[ "$OWN_REPO" =~ ^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$ ]] || refuse "invalid OWN_REPO"
+[[ "$PROV" =~ ^[0-9A-Za-z_-][0-9A-Za-z_.-]*\.intoto\.jsonl$ ]] || refuse "invalid OWN_PROVENANCE_ASSET"
 ARCH="$(uname -m)"; [ "$ARCH" = "x86_64" ] && ARCH=amd64; [ "$ARCH" = "aarch64" ] && ARCH=arm64
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"   # linux | darwin
+case "$OS-$ARCH" in linux-amd64|linux-arm64|darwin-arm64) ;; *) refuse "unsupported platform: $OS-$ARCH";; esac
+COSIGN="$(command -v cosign)" || refuse "install a trusted cosign on PATH first"
+SLSA="$(command -v slsa-verifier)" || refuse "install a trusted slsa-verifier on PATH first"
+if command -v sha256sum >/dev/null; then
+  CHECKSUM=(sha256sum)
+elif command -v shasum >/dev/null; then
+  CHECKSUM=(shasum -a 256)
+else
+  refuse "missing prerequisite: sha256sum or shasum"
+fi
+for cmd in curl tar install; do
+  command -v "$cmd" >/dev/null || refuse "missing prerequisite: $cmd"
+done
 ASSET="own-${OWN_VERSION}-${OS}-${ARCH}.tar.gz"
 BASE="https://github.com/${OWN_REPO}/releases/download/${OWN_VERSION}"
 
 W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
 cd "$W"
 
-# 1. pinned cosign, fetched per-OS (cosign publishes darwin and linux builds;
-#    checksum-verified against cosign's own signed checksums file)
-if ! command -v cosign >/dev/null 2>&1; then
-  echo "installing pinned cosign ${COSIGN_VERSION}"
-  COSIGN_ASSET="cosign-${OS}-${ARCH}"
-  curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${COSIGN_ASSET}" -o cosign
-  curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-${COSIGN_VERSION}-checksums.txt" -o checksums.txt
-  curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-${COSIGN_VERSION}-checksums.txt.sig" -o checksums.txt.sig
-  curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-${COSIGN_VERSION}-checksums.txt.bundle" -o checksums.txt.bundle
-  grep " ${COSIGN_ASSET}$" checksums.txt | sha256sum -c -
-  chmod +x cosign
-  COSIGN="$W/cosign"
-else
-  COSIGN="$(command -v cosign)"
-fi
 
 # 2. download release assets: tarball + its sha256 manifest + the cosign bundle
 #    produced by the release workflow (sign-blob --bundle). No detached .sig:
@@ -46,12 +48,15 @@ for f in "$ASSET" "$ASSET.sha256" "$ASSET.bundle"; do
   curl -fsSL "${BASE}/${f}" -o "$f"
 done
 
-# 3. verify sha256 of the tarball (integrity of transport)
-sha256sum -c "$ASSET.sha256"
+# 3. Check exactly this tarball, not arbitrary paths in an untrusted manifest.
+read -r EXPECTED NAME EXTRA < "$ASSET.sha256"
+[[ "$EXPECTED" =~ ^[0-9a-f]{64}$ && "$NAME" = "$ASSET" && -z "$EXTRA" ]] || refuse "invalid checksum manifest"
+ACTUAL="$("${CHECKSUM[@]}" "$ASSET")"
+[[ "${ACTUAL%% *}" = "$EXPECTED" ]] || refuse "checksum mismatch"
 
 # 4. verify cosign keyless signature (OIDC identity = this repo's release workflow)
 "$COSIGN" verify-blob \
-  --certificate-identity-regexp "^https://github.com/${OWN_REPO}/\\.github/workflows/release\\.yml@refs/tags/${OWN_VERSION}$" \
+  --certificate-identity "https://github.com/${OWN_REPO}/.github/workflows/release.yml@refs/tags/${OWN_VERSION}" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   --bundle "$ASSET.bundle" \
   "$ASSET"
@@ -61,7 +66,6 @@ sha256sum -c "$ASSET.sha256"
 #    asset name is `multiple.intoto.jsonl` — not `<asset>.intoto.jsonl`, which the
 #    previous version of this script asked for and could never find. Override with
 #    OWN_PROVENANCE_ASSET when a release renames it.
-PROV="${OWN_PROVENANCE_ASSET:-multiple.intoto.jsonl}"
 fetch() { # $1 = asset name; never leaves a half-written file behind
   curl -fsSL "${BASE}/$1" -o "$1" || {
     echo "install-own: release ${OWN_VERSION} does not publish '$1'" >&2
@@ -70,16 +74,19 @@ fetch() { # $1 = asset name; never leaves a half-written file behind
   }
 }
 fetch "$PROV"
-fetch "$PROV.bundle"
-"$COSIGN" verify-blob-attestation \
-  --certificate-identity-regexp "^https://github.com/slsa-framework/slsa-github-generator/\\.github/workflows/.*@refs/tags/v.*$" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --type "https://slsa.dev/provenance/v1" \
-  --bundle "$PROV.bundle" \
-  "$PROV"
+# The generic generator publishes a signed DSSE .intoto.jsonl, not a separate
+# cosign bundle. Verify its signature AND its subject/source/ref binding.
+"$SLSA" verify-artifact "$ASSET" \
+  --provenance-path "$PROV" \
+  --source-uri "github.com/${OWN_REPO}" \
+  --source-tag "$OWN_VERSION" \
+  --builder-id "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0"
 
 # 6. only now: extract and install
-tar -xzf "$ASSET"
+tar -xzf "$ASSET" own own-verify
+for binary in own own-verify; do
+  [ -f "$binary" ] && [ ! -L "$binary" ] || refuse "invalid or missing binary: $binary"
+done
 mkdir -p "$OWN_BIN_DIR"
 install -m 0755 own "$OWN_BIN_DIR/own"
 install -m 0755 own-verify "$OWN_BIN_DIR/own-verify"

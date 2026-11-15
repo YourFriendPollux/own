@@ -3,11 +3,10 @@
 //! `.own/txn/<id>/journal.json`, backs up anything it will modify, writes via
 //! `.own/tmp/` + rename, and rolls back on failure.
 //!
-//! Durability: every journal write, every backup file and every `rename` is
-//! `fsync`ed (file, then parent directory) *before* the work it protects is
-//! considered done. The journal therefore survives a power loss, not only
-//! `kill -9`: the recovery path never depends on data that is still in the page
-//! cache.
+//! Durability ordering: backups and replacement journals are synced before
+//! publishing changes; directory entries are synced before returning success.
+//! Crash recovery is tested. Actual power-loss behavior also depends on the
+//! filesystem and storage hardware and is not established by these tests.
 //!
 //! Signals: the SIGINT/SIGTERM handler is async-signal-safe — it only calls
 //! `write(2)` and `_exit(2)`. It never takes a mutex, reads the journal or
@@ -17,6 +16,7 @@
 //! `started` state, and the next writing command restores the backup and emits
 //! `W_TXN_RECOVERED` — the same path as a crash or `kill -9`.
 
+use crate::path_safety::{checked_absolute, checked_path, validate_relative};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,6 +31,8 @@ pub struct Txn {
     pub root: PathBuf,    // project root
     pub txn_dir: PathBuf, // .own/txn/<id>
     _lock: Option<fs::File>,
+    operation: std::sync::Mutex<()>,
+    finished: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Txn {
@@ -72,76 +74,190 @@ fn install_signal_handler() {
     });
 }
 
-static ACTIVE_TXN: OnceLock<std::sync::Mutex<Option<PathBuf>>> = OnceLock::new();
-fn active_txn() -> &'static std::sync::Mutex<Option<PathBuf>> {
-    ACTIVE_TXN.get_or_init(|| std::sync::Mutex::new(None))
+fn validate_mutation_path(rel: &str) -> std::io::Result<()> {
+    validate_relative(rel)?;
+    if rel == ".git"
+        || rel.starts_with(".git/")
+        || rel == ".own"
+        || rel == ".own/lock"
+        || rel.starts_with(".own/lock/")
+        || rel == ".own/txn"
+        || rel.starts_with(".own/txn/")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "transaction control path cannot be a mutation target",
+        ));
+    }
+    Ok(())
 }
 
-fn rollback_dir(txn_dir: &Path) -> std::io::Result<()> {
-    let journal = txn_dir.join("journal.json");
-    let content = fs::read_to_string(&journal)?;
+fn take_exclusive_lock(file: &File) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = file.as_raw_fd();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let result = {
+            // OFD locks conflict with legacy POSIX locks but belong to this
+            // descriptor, not the process. Closing an unrelated fd is safe.
+            let mut lock = libc::flock {
+                l_type: libc::F_WRLCK as i16,
+                l_whence: libc::SEEK_SET as i16,
+                l_start: 0,
+                l_len: 0,
+                l_pid: 0,
+            };
+            unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &mut lock) }
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EACCES) | Some(libc::EAGAIN)
+        ) {
+            return Err("LOCK_BUSY".into());
+        }
+        Err(format!("IO_ERROR: exclusive transaction lock: {error}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Err("IO_ERROR: transaction locking is unsupported on this platform".into())
+    }
+}
+
+fn rollback_dir(txn_dir: &Path, root: &Path) -> std::io::Result<()> {
+    checked_absolute(root, txn_dir)?;
+    checked_absolute(root, &txn_dir.join("journal.json"))?;
+    checked_absolute(root, &txn_dir.join("backup"))?;
+    let content = fs::read_to_string(txn_dir.join("journal.json"))?;
     let v: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if v["state"] != "started" {
-        return Ok(());
+    validate_journal_root(&v, root)?;
+    match v["state"].as_str() {
+        Some("committed") => return Ok(()),
+        Some("started") => {}
+        _ => return Err(invalid_journal("invalid state")),
     }
-    let root = PathBuf::from(
-        v["root"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no root"))?,
-    );
     let backup = txn_dir.join("backup");
-    if let Some(files) = v["backup_files"].as_array() {
-        for f in files {
-            // new format: {"rel": "...", "flat": "..."}; legacy format: "flat"
-            let (rel, flat) = match f {
-                serde_json::Value::Object(o) => (
-                    o.get("rel")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    o.get("flat")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ),
-                serde_json::Value::String(s) => (s.replace("__", "/"), s.clone()),
-                _ => continue,
-            };
-            if rel.is_empty() || flat.is_empty() {
-                continue;
+    // Validate the complete journal and available originals before any removal.
+    // Legacy entries have no existence flag: missing backup means absent path.
+    let mut files = Vec::new();
+    for f in v["backup_files"]
+        .as_array()
+        .ok_or_else(|| invalid_journal("no backup_files"))?
+    {
+        let (rel, flat, existed) = match f {
+            serde_json::Value::Object(o) => (
+                o.get("rel")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| invalid_journal("no rel"))?
+                    .to_string(),
+                o.get("flat")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| invalid_journal("no flat"))?
+                    .to_string(),
+                o.get("existed")
+                    .map(|v| {
+                        v.as_bool()
+                            .ok_or_else(|| invalid_journal("invalid existed"))
+                    })
+                    .transpose()?,
+            ),
+            serde_json::Value::String(s) => (s.replace("__", "/"), s.clone(), None),
+            _ => return Err(invalid_journal("invalid backup entry")),
+        };
+        validate_mutation_path(&rel)?;
+        validate_relative(&flat)?;
+        if Path::new(&flat).components().count() != 1 {
+            return Err(invalid_journal("backup name is not flat"));
+        }
+        let dst = checked_path(root, &rel)?;
+        let src = checked_absolute(root, &backup.join(flat))?;
+        let present = match fs::symlink_metadata(&src) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+        if existed == Some(true) && !present {
+            return Err(invalid_journal("missing original backup"));
+        }
+        files.push((dst, src, existed != Some(false) && present));
+    }
+    let mut dirs = Vec::new();
+    for d in v["created_dirs"]
+        .as_array()
+        .ok_or_else(|| invalid_journal("no created_dirs"))?
+    {
+        let rel = d
+            .as_str()
+            .ok_or_else(|| invalid_journal("invalid created dir"))?;
+        validate_mutation_path(rel)?;
+        dirs.push(checked_path(root, rel)?);
+    }
+    // A replaced tree can also be in created_dirs. Clean it before restoring.
+    for p in dirs {
+        remove_path(&p)?;
+        sync_existing_parent(&p)?;
+    }
+    for (dst, src, restore) in files {
+        remove_path(&dst)?;
+        if restore {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
             }
-            let src = backup.join(&flat);
-            let dst = root.join(&rel);
-            if src.exists() {
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(&src, &dst)?;
-                // the restored bytes are what a later `verify` will read: make
-                // them durable before the journal is dropped
-                sync_path(&dst)?;
-                if let Some(parent) = dst.parent() {
-                    sync_dir(parent)?;
-                }
+            if src.is_dir() {
+                copy_dir(&src, &dst)?;
+                sync_tree(&dst)?;
             } else {
-                let _ = fs::remove_file(&dst);
-                if let Some(parent) = dst.parent() {
-                    sync_dir(parent)?;
-                }
+                fs::copy(&src, &dst)?;
+                sync_path(&dst)?;
             }
         }
+        sync_existing_parent(&dst)?;
     }
-    // remove created dirs (vendor dirs added by this txn)
-    if let Some(dirs) = v["created_dirs"].as_array() {
-        for d in dirs {
-            if let Some(rel) = d.as_str() {
-                let p = root.join(rel);
-                let _ = fs::remove_dir_all(&p);
-                if let Some(parent) = p.parent() {
-                    sync_dir(parent)?;
-                }
-            }
+    Ok(())
+}
+
+fn invalid_journal(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn validate_journal_root(j: &serde_json::Value, root: &Path) -> std::io::Result<()> {
+    // Never use an untrusted journal root as the restoration destination.
+    // Require the exact canonical spelling, not an alias or a relative path.
+    let recorded = j["root"]
+        .as_str()
+        .ok_or_else(|| invalid_journal("no root"))?;
+    if Some(recorded) != root.to_str() {
+        return Err(invalid_journal(
+            "journal root differs from locked canonical root",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn sync_existing_parent(path: &Path) -> std::io::Result<()> {
+    let mut parent = path.parent();
+    while let Some(p) = parent {
+        match fs::metadata(p) {
+            Ok(_) => return sync_dir(p),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => parent = p.parent(),
+            Err(e) => return Err(e),
         }
     }
     Ok(())
@@ -153,13 +269,19 @@ impl Txn {
     /// the lock is taken. Recovery under the lock is what prevents a second
     /// `own` from rolling back a transaction the first one is still working on.
     pub fn begin(root: &Path) -> Result<Txn, String> {
+        // Preserve support for a not-yet-created project, then bind every
+        // operation and recovery record to its canonical absolute root.
+        fs::create_dir_all(root).map_err(|e| format!("IO_ERROR: {e}"))?;
+        let root = fs::canonicalize(root).map_err(|e| format!("IO_ERROR: {e}"))?;
+        if root.to_str().is_none() {
+            return Err("IO_ERROR: project root is not UTF-8".into());
+        }
         let own = root.join(".own");
-        fs::create_dir_all(own.join("tmp")).map_err(|e| format!("IO_ERROR: {e}"))?;
-        fs::create_dir_all(own.join("txn")).map_err(|e| format!("IO_ERROR: {e}"))?;
-        // make the new directory entries themselves durable (best effort: the
-        // strict fsync point is the journal write below)
-        let _ = sync_dir(&own);
-        let _ = sync_dir(&own.join("txn"));
+        checked_path(&root, ".own/lock").map_err(|e| format!("IO_ERROR: {e}"))?;
+        fs::create_dir_all(&own).map_err(|e| format!("IO_ERROR: {e}"))?;
+        // Only the lock's parent may be created before exclusive ownership.
+        sync_dir(&root).map_err(|e| format!("IO_ERROR: {e}"))?;
+        sync_dir(&own).map_err(|e| format!("IO_ERROR: {e}"))?;
         // exclusive lock — taken before any journal inspection
         let lock_path = own.join("lock");
         #[cfg(unix)]
@@ -167,69 +289,125 @@ impl Txn {
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
             .mode(0o644)
             .open(&lock_path)
             .map_err(|e| format!("IO_ERROR: {e}"))?;
         #[cfg(not(unix))]
-        let lock_file = File::create(&lock_path).map_err(|e| format!("IO_ERROR: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = lock_file.as_raw_fd();
-            let mut fl = libc::flock {
-                l_type: libc::F_WRLCK as i16,
-                l_whence: libc::SEEK_SET as i16,
-                l_start: 0,
-                l_len: 0,
-                l_pid: 0,
-            };
-            let r = unsafe { libc::fcntl(fd, libc::F_SETLK, &mut fl) };
-            if r != 0 {
-                return Err("LOCK_BUSY".to_string());
-            }
+        let lock_file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| format!("IO_ERROR: {e}"))?;
+        take_exclusive_lock(&lock_file)?;
+        // Staging and journal directories are inspected/created only under lock.
+        for rel in [".own/tmp", ".own/txn"] {
+            checked_path(&root, rel).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
+        fs::create_dir_all(own.join("tmp")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        fs::create_dir_all(own.join("txn")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        sync_dir(&own).map_err(|e| format!("IO_ERROR: {e}"))?;
+        sync_dir(&own.join("txn")).map_err(|e| format!("IO_ERROR: {e}"))?;
         // recovery of stale journals — only safe now that we hold the lock
         let txn_root = own.join("txn");
-        if let Ok(rd) = fs::read_dir(&txn_root) {
-            for e in rd.flatten() {
-                let j = e.path().join("journal.json");
-                if j.exists() {
-                    if let Ok(content) = fs::read_to_string(&j) {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if v["state"] == "started" {
-                                let _ = rollback_dir(&e.path());
-                                let _ = fs::remove_dir_all(e.path());
-                                eprintln!("warning: W_TXN_RECOVERED: rolled back unfinished transaction {}", e.file_name().to_string_lossy());
-                            }
-                        }
-                    }
-                }
+        let entries = fs::read_dir(&txn_root).map_err(|e| format!("IO_ERROR: {e}"))?;
+        let mut directories = entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| format!("IO_ERROR: {e}"))?;
+        directories.sort();
+        let mut journals = Vec::new();
+        // First validate the entire collection. A corrupt later record must
+        // not permit an earlier restoration to change the project.
+        for dir in directories {
+            checked_absolute(&root, &dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+            let j = dir.join("journal.json");
+            checked_absolute(&root, &j).map_err(|e| format!("IO_ERROR: {e}"))?;
+            if !j.try_exists().map_err(|e| format!("IO_ERROR: {e}"))? {
+                continue;
+            }
+            let v = read_journal(&dir)?;
+            validate_journal_root(&v, &root).map_err(|e| format!("IO_ERROR: {e}"))?;
+            let state = v["state"]
+                .as_str()
+                .filter(|state| matches!(*state, "started" | "committed"))
+                .ok_or_else(|| format!("IO_ERROR: invalid journal state: {}", j.display()))?;
+            journals.push((dir, state == "started"));
+        }
+        if journals.iter().filter(|(_, started)| *started).count() > 1 {
+            return Err("IO_ERROR: multiple unfinished transactions; recovery order is ambiguous; journals retained".into());
+        }
+        for (dir, started) in journals {
+            if started {
+                rollback_dir(&dir, &root)
+                    .map_err(|e| format!("IO_ERROR: recovery {}: {e}", dir.display()))?;
+                fs::remove_dir_all(&dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+                sync_dir(&txn_root).map_err(|e| format!("IO_ERROR: {e}"))?;
+                eprintln!(
+                    "warning: W_TXN_RECOVERED: rolled back unfinished transaction {}",
+                    dir.file_name().unwrap_or_default().to_string_lossy()
+                );
+            } else {
+                // A durable commit is final: discard leftover bookkeeping,
+                // never restore its backup after a cleanup interruption.
+                fs::remove_dir_all(&dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+                sync_dir(&txn_root).map_err(|e| format!("IO_ERROR: {e}"))?;
             }
         }
         let id = format!("{:x}", randish());
         let txn_dir = txn_root.join(&id);
+        fs::create_dir(&txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
         fs::create_dir_all(txn_dir.join("backup")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        // Sync the directory that contains <id>, not just <id> itself. Without
+        // this, the durable journal could become unreachable after a crash.
+        sync_dir(&txn_root).map_err(|e| format!("IO_ERROR: {e}"))?;
         let journal = serde_json::json!({
             "state": "started",
             "id": id,
-            "root": root.to_string_lossy(),
+            "root": root.to_str().unwrap(),
             "backup_files": [],
             "created_dirs": [],
         });
         write_journal(&txn_dir, &journal)?;
         install_signal_handler();
-        *active_txn().lock().unwrap() = Some(txn_dir.clone());
         Ok(Txn {
             id,
             root: root.to_path_buf(),
             txn_dir,
             _lock: Some(lock_file),
+            operation: std::sync::Mutex::new(()),
+            finished: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Back up `rel` (relative to root) before modifying it.
     pub fn backup(&self, rel: &str) -> Result<(), String> {
-        let src = self.root.join(rel);
+        let _operation = self.operation_guard()?;
+        self.backup_inner(rel)
+    }
+
+    fn backup_inner(&self, rel: &str) -> Result<(), String> {
+        validate_mutation_path(rel).map_err(|e| format!("IO_ERROR: {e}"))?;
+        let src = checked_path(&self.root, rel).map_err(|e| format!("IO_ERROR: {e}"))?;
+        self.check_metadata()?;
+        let mut j = read_journal(&self.txn_dir)?;
+        validate_journal_root(&j, &self.root).map_err(|e| format!("IO_ERROR: {e}"))?;
+        let files = j["backup_files"].as_array().ok_or("IO_ERROR: journal")?;
+        // The first durable entry wins, including when the path was absent.
+        // Never replace its backup with an intermediate transaction state.
+        if files.iter().any(|entry| match entry {
+            serde_json::Value::Object(o) => o.get("rel").and_then(|v| v.as_str()) == Some(rel),
+            serde_json::Value::String(flat) => flat.replace("__", "/") == rel,
+            _ => false,
+        }) {
+            return Ok(());
+        }
+        let existed = match fs::symlink_metadata(&src) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(format!("IO_ERROR: {e}")),
+        };
         // backup under a flat name: '/' -> "__" UNLESS the path already
         // contains a literal "__", in which case the name is suffixed with
         // "~<sha256-16>" so it round-trips unambiguously (e.g.
@@ -239,7 +417,8 @@ impl Txn {
         } else {
             rel.replace('/', "__")
         };
-        let dst = self.txn_dir.join("backup").join(&flat);
+        let dst = checked_absolute(&self.root, &self.txn_dir.join("backup").join(&flat))
+            .map_err(|e| format!("IO_ERROR: {e}"))?;
         if src.is_dir() {
             copy_dir(&src, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
             sync_tree(&dst).map_err(|e| format!("IO_ERROR: {e}"))?;
@@ -253,16 +432,25 @@ impl Txn {
         // journal stores the ORIGINAL relative path alongside the flat name.
         // It is written (and fsynced) only after the backup itself is durable:
         // recovery must never point at a backup that is not on disk yet.
-        let mut j = read_journal(&self.txn_dir)?;
+        sync_dir(&self.txn_dir.join("backup")).map_err(|e| format!("IO_ERROR: {e}"))?;
         j["backup_files"]
             .as_array_mut()
             .ok_or("IO_ERROR: journal")?
-            .push(serde_json::json!({"rel": rel, "flat": flat}));
+            .push(serde_json::json!({"rel": rel, "flat": flat, "existed": existed}));
         write_journal(&self.txn_dir, &j)
     }
 
     pub fn note_created_dir(&self, rel: &str) -> Result<(), String> {
+        let _operation = self.operation_guard()?;
+        self.note_created_dir_inner(rel)
+    }
+
+    fn note_created_dir_inner(&self, rel: &str) -> Result<(), String> {
+        validate_mutation_path(rel).map_err(|e| format!("IO_ERROR: {e}"))?;
+        checked_path(&self.root, rel).map_err(|e| format!("IO_ERROR: {e}"))?;
+        self.check_metadata()?;
         let mut j = read_journal(&self.txn_dir)?;
+        validate_journal_root(&j, &self.root).map_err(|e| format!("IO_ERROR: {e}"))?;
         j["created_dirs"]
             .as_array_mut()
             .ok_or("IO_ERROR: journal")?
@@ -272,15 +460,17 @@ impl Txn {
 
     /// Write `content` to `rel` atomically: write to `.own/tmp/` then rename.
     pub fn write_file(&self, rel: &str, content: &[u8]) -> Result<(), String> {
-        self.backup(rel)?;
+        let _operation = self.operation_guard()?;
+        self.backup_inner(rel)?;
         let tmp = self.root.join(".own/tmp").join(format!("{}.tmp", self.id));
+        checked_absolute(&self.root, &tmp).map_err(|e| format!("IO_ERROR: {e}"))?;
         {
             let mut f = File::create(&tmp).map_err(|e| format!("IO_ERROR: {e}"))?;
             f.write_all(content).map_err(|e| format!("IO_ERROR: {e}"))?;
             // the temporary must be durable before the rename publishes it
             f.sync_all().map_err(|e| format!("IO_ERROR: {e}"))?;
         }
-        let dst = self.root.join(rel);
+        let dst = checked_path(&self.root, rel).map_err(|e| format!("IO_ERROR: {e}"))?;
         if let Some(p) = dst.parent() {
             fs::create_dir_all(p).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
@@ -294,8 +484,14 @@ impl Txn {
 
     /// Rename a prepared directory (e.g. extracted vendor dir) into place.
     pub fn move_dir_into(&self, src_abs: &Path, rel: &str) -> Result<(), String> {
-        self.backup(rel)?;
-        let dst = self.root.join(rel);
+        let _operation = self.operation_guard()?;
+        let src_abs =
+            checked_absolute(&self.root, src_abs).map_err(|e| format!("IO_ERROR: {e}"))?;
+        if !src_abs.starts_with(self.root.join(".own/tmp")) || !src_abs.is_dir() {
+            return Err("IO_ERROR: prepared source must be a directory under .own/tmp".into());
+        }
+        self.backup_inner(rel)?;
+        let dst = checked_path(&self.root, rel).map_err(|e| format!("IO_ERROR: {e}"))?;
         if dst.exists() {
             return Err("VENDOR_DIR_EXISTS".to_string());
         }
@@ -303,20 +499,26 @@ impl Txn {
             fs::create_dir_all(p).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
         // the prepared tree must be on stable storage before it is published
-        sync_tree(src_abs).map_err(|e| format!("IO_ERROR: {e}"))?;
-        fs::rename(src_abs, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
+        sync_tree(&src_abs).map_err(|e| format!("IO_ERROR: {e}"))?;
+        fs::rename(&src_abs, &dst).map_err(|e| format!("IO_ERROR: {e}"))?;
         if let Some(p) = dst.parent() {
             sync_dir(p).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
-        self.note_created_dir(rel)?;
+        self.note_created_dir_inner(rel)?;
         Ok(())
     }
 
     pub fn commit(self) -> Result<(), String> {
+        let _operation = self.operation_guard()?;
+        self.check_metadata()?;
         let mut j = read_journal(&self.txn_dir)?;
+        validate_journal_root(&j, &self.root).map_err(|e| format!("IO_ERROR: {e}"))?;
         j["state"] = serde_json::Value::String("committed".to_string());
+        // If writing the commit record fails, retain the journal for recovery;
+        // Drop must not treat a partially written commit as a successful one.
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         write_journal(&self.txn_dir, &j)?;
-        *active_txn().lock().unwrap() = None;
         let parent = self.txn_dir.parent().map(|p| p.to_path_buf());
         fs::remove_dir_all(&self.txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
         if let Some(p) = parent {
@@ -325,15 +527,57 @@ impl Txn {
         Ok(())
     }
 
+    fn operation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        // The process/descriptor lock is already held for this object's entire
+        // lifetime. Never take it while holding this per-instance mutex.
+        let guard = self
+            .operation
+            .lock()
+            .map_err(|_| "IO_ERROR: transaction operation lock poisoned".to_string())?;
+        if self.finished.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("IO_ERROR: transaction already finished".into());
+        }
+        Ok(guard)
+    }
+
+    fn check_metadata(&self) -> Result<(), String> {
+        for path in [
+            self.txn_dir.clone(),
+            self.txn_dir.join("journal.json"),
+            self.txn_dir.join("backup"),
+            self.root.join(".own/tmp"),
+        ] {
+            checked_absolute(&self.root, &path).map_err(|e| format!("IO_ERROR: {e}"))?;
+        }
+        Ok(())
+    }
+
     pub fn rollback(&self) -> Result<(), String> {
-        rollback_dir(&self.txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
-        *active_txn().lock().unwrap() = None;
+        let _operation = self.operation_guard()?;
+        rollback_dir(&self.txn_dir, &self.root).map_err(|e| format!("IO_ERROR: {e}"))?;
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let parent = self.txn_dir.parent().map(|p| p.to_path_buf());
-        let _ = fs::remove_dir_all(&self.txn_dir);
+        fs::remove_dir_all(&self.txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
         if let Some(p) = parent {
             sync_dir(&p).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
         Ok(())
+    }
+}
+
+impl Drop for Txn {
+    fn drop(&mut self) {
+        if !self.finished.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Err(e) = self.rollback() {
+                // Drop cannot return an error. Keep the started journal and
+                // backups intact so the next writer fails closed or retries.
+                eprintln!(
+                    "warning: transaction rollback failed; journal retained at {}: {e}",
+                    self.txn_dir.display()
+                );
+            }
+        }
     }
 }
 
@@ -346,7 +590,14 @@ fn read_journal(txn_dir: &Path) -> Result<serde_json::Value, String> {
 fn write_journal(txn_dir: &Path, j: &serde_json::Value) -> Result<(), String> {
     let c = serde_json::to_string(j).map_err(|e| format!("IO_ERROR: {e}"))?;
     let path = txn_dir.join("journal.json");
-    let mut f = File::create(&path).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let tmp = txn_dir.join(format!(".journal-{:x}.tmp", randish()));
+    // Never truncate the current recovery record. An interrupted/failed write
+    // leaves it intact, with at most an unreferenced temporary beside it.
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("IO_ERROR: {e}"))?;
     f.write_all(c.as_bytes())
         .map_err(|e| format!("IO_ERROR: {e}"))?;
     // Durability (INV-9): the journal must be on stable storage before the work
@@ -354,6 +605,7 @@ fn write_journal(txn_dir: &Path, j: &serde_json::Value) -> Result<(), String> {
     // working tree with a journal that never made it to disk.
     f.sync_all().map_err(|e| format!("IO_ERROR: {e}"))?;
     drop(f);
+    fs::rename(&tmp, &path).map_err(|e| format!("IO_ERROR: {e}"))?;
     sync_dir(txn_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
     Ok(())
 }
@@ -396,37 +648,30 @@ fn sync_tree(dir: &Path) -> std::io::Result<()> {
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    copy_dir_inner(src, dst, &mut Vec::new())
-}
-
-/// Copy preserving the tree under `dst`, but each path component is sanitized
-/// and capped so deep trees cannot exceed NAME_MAX (255).
-fn copy_dir_inner(src: &Path, dst: &Path, prefix: &mut Vec<String>) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
     for e in fs::read_dir(src)? {
         let e = e?;
         let ty = e.file_type()?;
-        let mut name = e.file_name().to_string_lossy().replace('/', "__");
-        if name.len() > 200 {
-            let h: String = {
-                use sha2::{Digest, Sha256};
-                Sha256::digest(name.as_bytes())
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect()
-            };
-            name = format!("{}~{}", &name[..120], &h[..32]);
-        }
-        let d = dst.join(&name);
-        prefix.push(name);
+        // Each component already exists on this filesystem; flattening or
+        // truncating it would make the rollback tree differ from the original.
+        let d = dst.join(e.file_name());
         if ty.is_dir() {
-            copy_dir_inner(&e.path(), &d, prefix)?;
+            copy_dir(&e.path(), &d)?;
+        } else if ty.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(fs::read_link(e.path())?, &d)?;
+            #[cfg(not(unix))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "cannot preserve backup symlink on this platform",
+            ));
         } else {
             fs::copy(e.path(), &d)?;
         }
-        prefix.pop();
     }
-    Ok(())
+    // Apply directory permissions after copying its children, so read-only
+    // directories can still be copied without changing the saved permissions.
+    fs::set_permissions(dst, fs::metadata(src)?.permissions())
 }
 
 fn randish() -> u64 {

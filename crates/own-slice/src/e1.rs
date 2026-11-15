@@ -140,6 +140,50 @@ pub fn reachable_files(pkg_root: &Path, model: ConsumerModel) -> Option<HashSet<
     )
 }
 
+/// File hints must cover every supplied affected record. Callers that know the
+/// package/version applicability must filter records before requesting evidence;
+/// hints on another record cannot prove a record with missing or malformed hints.
+pub(crate) fn vulnerable_files(advisory: &serde_json::Value) -> Option<Vec<String>> {
+    let affected = advisory.get("affected")?.as_array()?;
+    if affected.is_empty() {
+        return None;
+    }
+    let mut files = Vec::new();
+    for record in affected {
+        let record = record.as_object()?;
+        let start = files.len();
+        for key in ["database_specific", "ecosystem_specific"] {
+            if let Some(hints) = record.get(key) {
+                let hints = hints.as_object()?;
+                for file_key in ["vulnerable_files", "files", "paths"] {
+                    if let Some(paths) = hints.get(file_key) {
+                        let paths = paths.as_array()?;
+                        if paths.is_empty() {
+                            return None;
+                        }
+                        for path in paths {
+                            let path = path.as_str()?;
+                            let normalized = path
+                                .trim_start_matches("package/")
+                                .trim_start_matches("./")
+                                .trim_start_matches('/')
+                                .replace('\\', "/");
+                            if normalized.trim().is_empty() {
+                                return None;
+                            }
+                            files.push(normalized);
+                        }
+                    }
+                }
+            }
+        }
+        if files.len() == start {
+            return None;
+        }
+    }
+    Some(files)
+}
+
 /// Evidence level for an advisory against a vendored package dir.
 /// Returns ("E1", reachable_files) if the advisory carries file-level info
 /// that provably misses the reachable set; ("E0", None) otherwise.
@@ -163,34 +207,9 @@ pub fn evidence_level(
     let Some(reach) = union else {
         return ("E0", None);
     };
-    // File-level hints: OSV `affected[].database_specific` or
-    // `ecosystem_specific` may carry `vulnerable_files` / `files`.
-    let mut vuln_files: Vec<String> = Vec::new();
-    if let Some(affected) = advisory.get("affected").and_then(|a| a.as_array()) {
-        for aff in affected {
-            for key in ["database_specific", "ecosystem_specific"] {
-                if let Some(ds) = aff.get(key) {
-                    for fkey in ["vulnerable_files", "files", "paths"] {
-                        if let Some(arr) = ds.get(fkey).and_then(|v| v.as_array()) {
-                            for f in arr {
-                                if let Some(s) = f.as_str() {
-                                    let n = s
-                                        .trim_start_matches("package/")
-                                        .trim_start_matches("./")
-                                        .trim_start_matches('/')
-                                        .replace('\\', "/");
-                                    vuln_files.push(n);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if vuln_files.is_empty() {
-        return ("E0", Some(reach)); // no file info ⇒ cannot prove unreachable
-    }
+    let Some(vuln_files) = vulnerable_files(advisory) else {
+        return ("E0", Some(reach)); // incomplete file info ⇒ no proof
+    };
     // F-02 (deepseek): E1 only if every vulnerable path EXISTS verbatim in the
     // package and is NOT reachable. Globs, directory prefixes, and paths absent
     // from the tarball all count as hits => E0 (conservative, INV-4).

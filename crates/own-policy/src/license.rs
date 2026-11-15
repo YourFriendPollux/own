@@ -189,8 +189,7 @@ fn canonical_id(display: &str, or_later: bool) -> String {
 
 /// Normalize deprecated SPDX ids (e.g. GPL-3.0+ -> GPL-3.0-or-later).
 pub fn normalize_deprecated(expr: &str) -> String {
-    let mut out = expr.to_string();
-    for (old, new) in [
+    let aliases = [
         ("GPL-1.0+", "GPL-1.0-or-later"),
         ("GPL-2.0+", "GPL-2.0-or-later"),
         ("GPL-3.0+", "GPL-3.0-or-later"),
@@ -202,21 +201,19 @@ pub fn normalize_deprecated(expr: &str) -> String {
         ("GFDL-1.1+", "GFDL-1.1-or-later"),
         ("GFDL-1.2+", "GFDL-1.2-or-later"),
         ("GFDL-1.3+", "GFDL-1.3-or-later"),
-    ] {
-        // word-boundary replace
-        out = out
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
-            .map(|w| {
-                if w == old.trim_end_matches('+') {
-                    new.to_string()
-                } else {
-                    w.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        // simpler: direct replace when token matches
-        out = out.replace(old, new);
+    ];
+    let separator = |c: char| c.is_whitespace() || c == '(' || c == ')';
+    let mut out = String::with_capacity(expr.len());
+    for part in expr.split_inclusive(separator) {
+        let token = part.trim_end_matches(separator);
+        let normalized = aliases
+            .iter()
+            .find_map(|(old, new)| (*old == token).then_some(*new))
+            .unwrap_or(token);
+        out.push_str(normalized);
+        // Preserve every separator verbatim; normalization must not alter the
+        // expression grammar, grouping, or malformed punctuation.
+        out.push_str(&part[token.len()..]);
     }
     out
 }
@@ -224,6 +221,41 @@ pub fn normalize_deprecated(expr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn license_parentheses_survive_deprecated_normalization() {
+        let pol = LicensePolicy::default();
+        for expr in [
+            "(MIT OR GPL-3.0-only) AND GPL-3.0-only",
+            "(MIT OR GPL-3.0+) AND GPL-3.0+",
+            "((MIT OR Apache-2.0) AND (GPL-2.0-only OR GPL-3.0-only))",
+        ] {
+            assert_eq!(
+                evaluate_expression(expr, &pol).unwrap(),
+                (LicenseClass::Deny, None),
+                "{expr}"
+            );
+        }
+        assert_eq!(
+            normalize_deprecated("(MIT OR GPL-3.0+) AND LGPL-2.1"),
+            "(MIT OR GPL-3.0-or-later) AND LGPL-2.1"
+        );
+        assert_eq!(
+            normalize_deprecated("LicenseRef-GPL-3.0+"),
+            "LicenseRef-GPL-3.0+"
+        );
+        assert_eq!(
+            evaluate_expression("MIT OR (GPL-3.0-only AND GPL-3.0-only)", &pol).unwrap(),
+            (LicenseClass::Allow, Some("MIT".into()))
+        );
+        for expr in [
+            "(MIT OR GPL-3.0-only",
+            "MIT OR GPL-3.0-only)",
+            "MIT | GPL-3.0-only",
+        ] {
+            assert!(evaluate_expression(expr, &pol).is_err(), "{expr}");
+        }
+    }
 
     #[test]
     fn classify_patterns() {

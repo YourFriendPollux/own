@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Binary `own`"
 
+[features]
+# Integration-only explicit OSV URL/cap override; never enabled by default.
+__integration_harness = []
+
 [[bin]]
 name = "own"
 path = "src/main.rs"

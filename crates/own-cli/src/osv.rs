@@ -3,13 +3,18 @@
 //! offline against the vendored packages.
 
 use own_core::lock::parse_lock;
-use own_net::{build_client, fetch_osv_dump, NetConfig};
+use own_net::{build_client, fetch_osv_dump_configured};
 use own_policy::semver;
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::Path;
 
-pub const DEFAULT_OSV_URL: &str = "https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip";
+fn valid_osv_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b":_.-".contains(&b))
+}
 
 /// Reduce one OSV advisory to the fields `check` needs (§8.2).
 fn reduce_advisory(a: &Value) -> Option<Value> {
@@ -48,34 +53,11 @@ fn reduce_advisory(a: &Value) -> Option<Value> {
             if pkg.is_empty() {
                 return None;
             }
-            let mut ranges_out = Vec::new();
-            if let Some(ranges) = aff.get("ranges").and_then(|r| r.as_array()) {
-                for r in ranges {
-                    let ty = r
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if ty == "GIT" {
-                        continue; // ignored per §8.2
-                    }
-                    let events: Vec<Value> = r
-                        .get("events")
-                        .and_then(|e| e.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    ranges_out.push(json!({ "type": ty, "events": events }));
-                }
-            }
-            let versions: Vec<String> = aff
-                .get("versions")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Preserve present fields until typed validation. Converting a
+            // malformed array/value to [] would silently erase constraints.
+            // Unsupported range types must reach the validator too.
+            let ranges_out = aff.get("ranges").cloned().unwrap_or_else(|| json!([]));
+            let versions = aff.get("versions").cloned().unwrap_or_else(|| json!([]));
             let mut reduced = json!({ "package": pkg, "ranges": ranges_out, "versions": versions });
             // Keep hints attached to the original affected record: filtering
             // other ecosystems must never shift an E1 hint onto another package.
@@ -105,26 +87,64 @@ fn reduce_advisory(a: &Value) -> Option<Value> {
 /// A dropped record would leave a snapshot that looks complete while missing an
 /// advisory (`OSV_INCOMPLETE` only detects absent package names) — INV-5.
 fn reduce_advisory_checked(raw: &Value) -> Result<Option<Value>, String> {
-    if raw.get("withdrawn").and_then(Value::as_str).is_some() {
-        return Ok(None); // §8.2: withdrawn advisories are ignored
-    }
-    if raw
+    let id = raw
         .get("id")
         .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-    {
+        .filter(|id| valid_osv_id(id));
+    let Some(id) = id else {
         return Err("PARSE_ERROR: OSV advisory without a usable id".to_string());
+    };
+    if let Some(aliases) = raw.get("aliases").filter(|value| !value.is_null()) {
+        let aliases: Vec<String> = serde_json::from_value(aliases.clone())
+            .map_err(|e| format!("PARSE_ERROR: OSV aliases: {e}"))?;
+        if aliases.iter().any(|alias| !usable_osv_token(alias)) {
+            return Err("PARSE_ERROR: invalid OSV alias".to_string());
+        }
+    }
+    if let Some(withdrawn) = raw.get("withdrawn") {
+        let withdrawn = withdrawn
+            .as_str()
+            .ok_or("PARSE_ERROR: OSV withdrawn must be a timestamp")?;
+        timestamp_utc(withdrawn)?;
+        return Ok(None); // §8.2: a valid withdrawn advisory is ignored
     }
     let affected = raw
         .get("affected")
         .and_then(Value::as_array)
         .ok_or_else(|| "PARSE_ERROR: OSV advisory without affected records".to_string())?;
     for record in affected {
-        let ecosystem = record
-            .get("package")
-            .and_then(|p| p.get("ecosystem"))
+        if !record.is_object() {
+            return Err("PARSE_ERROR: OSV affected record must be an object".to_string());
+        }
+        // The OSV schema allows affected entries without package (for example
+        // GIT-only entries). They cannot identify an npm package. A present
+        // package, however, must not hide a missing or mistyped ecosystem.
+        let Some(package) = record.get("package") else {
+            let ranges: Vec<OsvRange> = serde_json::from_value(record["ranges"].clone())
+                .map_err(|e| format!("PARSE_ERROR: OSV unattributed GIT ranges: {e}"))?;
+            if ranges.is_empty() || ranges.iter().any(|r| r.kind != "GIT") {
+                return Err(
+                    "PARSE_ERROR: OSV record without package must have GIT ranges".to_string(),
+                );
+            }
+            for range in &ranges {
+                validate_range(range, id, "<no package>")?;
+            }
+            if let Some(versions) = record.get("versions") {
+                let versions: Vec<String> = serde_json::from_value(versions.clone())
+                    .map_err(|e| format!("PARSE_ERROR: OSV GIT versions: {e}"))?;
+                if versions.iter().any(|v| !usable_osv_token(v)) {
+                    return Err("PARSE_ERROR: invalid OSV GIT version".to_string());
+                }
+            }
+            continue;
+        };
+        let ecosystem = package
+            .get("ecosystem")
             .and_then(Value::as_str)
-            .unwrap_or("");
+            .ok_or_else(|| {
+                "PARSE_ERROR: OSV record without a string package ecosystem".to_string()
+            })?;
         if ecosystem != "npm" {
             continue;
         }
@@ -148,7 +168,7 @@ fn reduce_advisory_checked(raw: &Value) -> Result<Option<Value>, String> {
 
 /// Read every zip entry in memory (§11.2 guards, never extracted to disk) and
 /// keep the reduced advisories that touch a covered package.
-fn collect_advisories(
+pub(crate) fn collect_advisories(
     bytes: &[u8],
     covered: &std::collections::HashSet<&String>,
 ) -> Result<Vec<Value>, String> {
@@ -156,24 +176,36 @@ fn collect_advisories(
     let mut archive =
         zip::ZipArchive::new(cursor).map_err(|e| format!("PARSE_ERROR: osv zip: {e}"))?;
     let max_entries = 2_000_000usize; // OSV npm dump has ~100k+ entries
+    if archive.len() > max_entries {
+        return Err("NETWORK_ERROR: osv dump exceeds entry cap".to_string());
+    }
+    let max_entry_bytes = 5 * 1_048_576u64;
     let mut advisories = Vec::new();
-    for (entries, i) in (0..archive.len()).enumerate() {
-        if entries > max_entries {
-            return Err("NETWORK_ERROR: osv dump exceeds entry cap".to_string());
-        }
+    for i in 0..archive.len() {
         let mut f = archive
             .by_index(i)
             .map_err(|e| format!("IO_ERROR: osv zip entry: {e}"))?;
-        if f.size() > 5 * 1_048_576 {
-            // individual advisory files are small
-            continue;
+        if f.size() > max_entry_bytes {
+            return Err(format!(
+                "NETWORK_ERROR: osv zip entry {i} exceeds advisory byte cap"
+            ));
         }
         let mut s = String::new();
-        f.read_to_string(&mut s)
+        // Enforce the limit on decompressed bytes too, not only ZIP metadata.
+        f.by_ref()
+            .take(max_entry_bytes + 1)
+            .read_to_string(&mut s)
             .map_err(|e| format!("IO_ERROR: osv entry: {e}"))?;
+        if s.len() as u64 > max_entry_bytes {
+            return Err(format!(
+                "NETWORK_ERROR: osv zip entry {i} exceeds advisory byte cap"
+            ));
+        }
         let raw: Value = serde_json::from_str(&s)
             .map_err(|e| format!("PARSE_ERROR: osv zip entry {i} is not valid JSON: {e}"))?;
-        let Some(reduced) = reduce_advisory_checked(&raw)? else {
+        let Some(reduced) = reduce_advisory_checked(&raw)
+            .map_err(|e| format!("{e} (zip entry {i}: {:?})", f.name()))?
+        else {
             continue;
         };
         let touches = reduced
@@ -208,75 +240,183 @@ fn source_date_to_utc(header: &str) -> Result<String, String> {
     Ok(crate::sbom::epoch_to_rfc3339(seconds))
 }
 
-/// `own osv fetch`: download dump, filter to lock packages, write .own/osv.json.
+/// Test-only explicit URL/cap override; production calls `osv_fetch_project`.
+#[allow(dead_code)]
 pub fn osv_fetch(
     root: &Path,
     osv_url: &str,
     max_download_mb: u64,
     now: Option<&str>,
 ) -> Result<u8, String> {
-    let lock_text =
-        std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
-    let covered: Vec<String> = lock.packages.iter().map(|p| p.name.clone()).collect();
-    let config = read_config(root)?;
-    let output = config.local_path.as_deref().unwrap_or(".own/osv.json");
-    let output_path = root.join(output);
-    let client = build_client(&NetConfig::default())?;
-    let download = fetch_osv_dump(&client, osv_url, max_download_mb)?;
-    let source_last_modified = download
-        .last_modified
-        .as_deref()
-        .map(source_date_to_utc)
-        .transpose()?;
-    let covered_set: std::collections::HashSet<&String> = covered.iter().collect();
-    let mut advisories = collect_advisories(&download.bytes, &covered_set)?;
-    advisories.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    let generated_at = match now {
-        Some(now) => {
-            timestamp_utc(now)?;
-            now.to_string()
-        }
-        None => {
-            let seconds = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| format!("IO_ERROR: clock: {e}"))?
-                .as_secs();
-            crate::sbom::epoch_to_rfc3339(
-                i64::try_from(seconds).map_err(|e| format!("IO_ERROR: clock: {e}"))?,
-            )
+    osv_fetch_inner(root, Some((osv_url, max_download_mb)), now)
+}
+
+/// Project entry: acquire URL/cap/client settings only after the exclusive lock.
+pub fn osv_fetch_project(root: &Path, now: Option<&str>) -> Result<u8, String> {
+    osv_fetch_inner(root, None, now)
+}
+
+fn osv_fetch_inner(
+    root: &Path,
+    source_override: Option<(&str, u64)>,
+    now: Option<&str>,
+) -> Result<u8, String> {
+    // Lock before recovery, reading project state, preparing or publishing.
+    let txn = own_core::txn::Txn::begin(root)?;
+    let prepared = (|| {
+        let root = &txn.root;
+        let lock_text = std::fs::read_to_string(checked_input_path(root, "own.lock")?)
+            .map_err(|e| format!("IO_ERROR: own.lock: {e}"))?;
+        let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
+        let covered: Vec<String> = lock.packages.iter().map(|p| p.name.clone()).collect();
+        let config = read_config(root)?;
+        let output = config.local_path.as_deref().unwrap_or(".own/osv.json");
+        checked_snapshot_path(root, output)?;
+        let settings = crate::project_config::load(root)?;
+        let (osv_url, max_download_mb) =
+            source_override.unwrap_or((&settings.osv_url, settings.osv_max_download_mb));
+        let client = build_client(&settings.net)?;
+        // The explicit test entry overrides only URL/cap, never the locked client.
+        let download = fetch_osv_dump_configured(&client, &settings.net, osv_url, max_download_mb)?;
+        let source_last_modified = download
+            .last_modified
+            .as_deref()
+            .map(source_date_to_utc)
+            .transpose()?;
+        let covered_set: std::collections::HashSet<&String> = covered.iter().collect();
+        let mut advisories = collect_advisories(&download.bytes, &covered_set)?;
+        advisories.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        let generated_at = match now {
+            Some(now) => {
+                timestamp_utc(now)?;
+                now.to_string()
+            }
+            None => {
+                let seconds = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| format!("IO_ERROR: clock: {e}"))?
+                    .as_secs();
+                crate::sbom::epoch_to_rfc3339(
+                    i64::try_from(seconds).map_err(|e| format!("IO_ERROR: clock: {e}"))?,
+                )
+            }
+        };
+        let doc = json!({
+            "schema_version": 1, "generated_at": generated_at, "source": osv_url,
+            "source_last_modified": source_last_modified, "covered_packages": covered,
+            "advisories": advisories,
+        });
+        let canon = own_core::jcs::canonicalize(&doc).map_err(|e| format!("IO_ERROR: jcs: {e}"))?;
+        publish_snapshot(&txn, output, canon.as_bytes())?;
+        Ok::<_, String>((output.to_string(), advisories.len(), covered.len()))
+    })();
+    let (output, advisory_count, package_count) = match prepared {
+        Ok(result) => result,
+        Err(error) => {
+            return match txn.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(format!("{error}; rollback failed: {rollback}")),
+            }
         }
     };
-    let doc = json!({
-        "schema_version": 1,
-        "generated_at": generated_at,
-        "source": osv_url,
-        "source_last_modified": source_last_modified,
-        "covered_packages": covered,
-        "advisories": advisories,
-    });
-    // compact deterministic JSON (keys sorted via JCS)
-    let canon = own_core::jcs::canonicalize(&doc).map_err(|e| format!("IO_ERROR: jcs: {e}"))?;
-    let parent = output_path
-        .parent()
-        .ok_or_else(|| "IO_ERROR: OSV path has no parent".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("IO_ERROR: {e}"))?;
-    // atomic write
-    let mut temp_name = output_path
-        .file_name()
-        .ok_or_else(|| "IO_ERROR: invalid OSV path".to_string())?
-        .to_os_string();
-    temp_name.push(".tmp");
-    let tmp = output_path.with_file_name(temp_name);
-    std::fs::write(&tmp, canon.as_bytes()).map_err(|e| format!("IO_ERROR: {e}"))?;
-    std::fs::rename(&tmp, output_path).map_err(|e| format!("IO_ERROR: {e}"))?;
-    println!(
-        "wrote {} ({} advisories for {} packages)",
-        output,
-        advisories.len(),
-        covered.len()
-    );
+    txn.commit()?;
+    println!("wrote {output} ({advisory_count} advisories for {package_count} packages)");
     Ok(0)
+}
+
+fn checked_input_path(root: &Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    own_core::path_safety::project_path(root, rel)
+        .map_err(|e| format!("IO_ERROR: OSV_INPUT_REFUSED:{rel}: {e}"))
+}
+
+fn checked_snapshot_path(root: &Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    let path = Path::new(rel);
+    if path == Path::new(".own/lock")
+        || path.starts_with(".own/tmp")
+        || path.starts_with(".own/txn")
+        || path.starts_with("vendor")
+        || path.components().any(|c| c.as_os_str() == ".git")
+        || path.starts_with(".own/cache") && path.extension().is_some_and(|ext| ext == "tgz")
+        || [
+            "own.lock",
+            "own.toml",
+            "package.json",
+            "pnpm-lock.yaml",
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            ".gitignore",
+        ]
+        .iter()
+        .any(|name| path.file_name().is_some_and(|leaf| leaf == *name))
+    {
+        return Err("PARSE_ERROR: OSV_OUTPUT_REFUSED:sensitive".to_string());
+    }
+    let target = own_core::path_safety::project_path(root, rel)
+        .map_err(|e| format!("IO_ERROR: OSV_OUTPUT_REFUSED:path: {e}"))?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err("IO_ERROR: OSV_OUTPUT_REFUSED:not_file".to_string())
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("IO_ERROR: OSV_OUTPUT_REFUSED:path: {e}")),
+    }
+    Ok(target)
+}
+
+fn publish_snapshot(txn: &own_core::txn::Txn, output: &str, bytes: &[u8]) -> Result<(), String> {
+    // Recheck real filesystem components after a potentially long download.
+    checked_snapshot_path(&txn.root, output)?;
+    let mut prefix = std::path::PathBuf::new();
+    for component in Path::new(output)
+        .parent()
+        .unwrap_or(Path::new(""))
+        .components()
+    {
+        prefix.push(component.as_os_str());
+        let rel = prefix.to_str().ok_or("IO_ERROR: OSV parent is not UTF-8")?;
+        let parent = own_core::path_safety::project_path(&txn.root, rel)
+            .map_err(|e| format!("IO_ERROR: OSV_OUTPUT_REFUSED:path: {e}"))?;
+        match std::fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Persist rollback intent BEFORE each new directory. Sync both
+                // its containing entry and the new directory before publishing.
+                txn.note_created_dir(rel)?;
+                std::fs::create_dir(&parent).map_err(|e| format!("IO_ERROR: OSV parent: {e}"))?;
+                sync_snapshot_dir(
+                    parent
+                        .parent()
+                        .ok_or("IO_ERROR: OSV parent has no parent")?,
+                )?;
+                sync_snapshot_dir(&parent)?;
+            }
+            Ok(_) => return Err("IO_ERROR: OSV_OUTPUT_REFUSED:parent".to_string()),
+            Err(e) => return Err(format!("IO_ERROR: OSV parent: {e}")),
+        }
+    }
+    checked_snapshot_path(&txn.root, output)?;
+    // Txn backs up and syncs the journal/original, then syncs its private
+    // temporary before rename and syncs the destination directory afterwards.
+    txn.write_file(output, bytes)
+}
+
+fn sync_snapshot_dir(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("IO_ERROR: OSV directory sync: {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path; // same platform limitation as own_core::Txn
+        Ok(())
+    }
 }
 
 pub struct CheckArgs {
@@ -335,7 +475,7 @@ fn read_config(root: &Path) -> Result<OsvConfig, String> {
         #[serde(default)]
         osv: OsvConfig,
     }
-    let text = std::fs::read_to_string(root.join("own.toml"))
+    let text = std::fs::read_to_string(checked_input_path(root, "own.toml")?)
         .map_err(|e| format!("IO_ERROR: own.toml: {e}"))?;
     let mut config: Config =
         toml::from_str(&text).map_err(|e| format!("PARSE_ERROR: own.toml: {e}"))?;
@@ -378,6 +518,105 @@ fn read_config(root: &Path) -> Result<OsvConfig, String> {
     Ok(config.osv)
 }
 
+/// Validate the complete npm version token, not just an evaluator's loose
+/// numeric prefix. Keep OSV's introduced="0" sentinel outside this grammar.
+fn valid_npm_osv_version(text: &str) -> bool {
+    let text = text.strip_prefix('v').unwrap_or(text);
+    let identifier = |part: &str| {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    let (version, build) = match text.split_once('+') {
+        Some((version, build)) => (version, Some(build)),
+        None => (text, None),
+    };
+    if build.is_some_and(|build| !build.split('.').all(identifier)) {
+        return false;
+    }
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    let numeric = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|b| b.is_ascii_digit())
+            && (part == "0" || !part.starts_with('0'))
+    };
+    if core.split('.').count() != 3 || !core.split('.').all(numeric) {
+        return false;
+    }
+    if pre.is_some_and(|pre| {
+        !pre.split('.').all(|part| {
+            identifier(part) && (!part.bytes().all(|b| b.is_ascii_digit()) || numeric(part))
+        })
+    }) {
+        return false;
+    }
+    semver::is_valid_version(text)
+}
+
+#[derive(serde::Deserialize)]
+struct OsvRange {
+    #[serde(rename = "type")]
+    kind: String,
+    events: Vec<std::collections::BTreeMap<String, String>>,
+    repo: Option<String>,
+}
+
+fn usable_osv_token(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+fn validate_range(range: &OsvRange, id: &str, package: &str) -> Result<(), String> {
+    let invalid = || {
+        format!(
+            "PARSE_ERROR: invalid OSV advisory {id:?}: {} range for {package:?}",
+            range.kind
+        )
+    };
+    if !matches!(range.kind.as_str(), "SEMVER" | "ECOSYSTEM" | "GIT") {
+        return Err(format!(
+            "PARSE_ERROR: unsupported OSV range type {}",
+            range.kind
+        ));
+    }
+    if range.kind == "GIT"
+        && range
+            .repo
+            .as_deref()
+            .is_none_or(|repo| !usable_osv_token(repo))
+    {
+        return Err(invalid());
+    }
+    let has = |kind: &str| range.events.iter().any(|event| event.contains_key(kind));
+    if !has("introduced") || (has("fixed") && has("last_affected")) {
+        return Err(invalid());
+    }
+    for event in &range.events {
+        if event.len() != 1
+            || event.iter().any(|(key, value)| {
+                !matches!(
+                    key.as_str(),
+                    "introduced" | "fixed" | "last_affected" | "limit"
+                ) || !usable_osv_token(value)
+                    || !(key == "introduced" && value == "0"
+                        || key == "limit" && value.contains('*')
+                        || match range.kind.as_str() {
+                            "SEMVER" => valid_npm_osv_version(value),
+                            "ECOSYSTEM" => true, // uninterpreted by schema; unknown at evaluation
+                            "GIT" => {
+                                matches!(value.len(), 40 | 64)
+                                    && value.bytes().all(|b| b.is_ascii_hexdigit())
+                            }
+                            _ => false,
+                        })
+            })
+        {
+            return Err(format!("{}: event {event:?}", invalid()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_advisory(raw: &Value) -> Result<(), String> {
     #[derive(serde::Deserialize)]
     struct Advisory {
@@ -392,42 +631,41 @@ fn validate_advisory(raw: &Value) -> Result<(), String> {
         #[serde(default)]
         versions: Vec<String>,
         #[serde(default)]
-        ranges: Vec<Range>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Range {
-        #[serde(rename = "type")]
-        kind: String,
-        events: Vec<std::collections::BTreeMap<String, String>>,
+        ranges: Vec<OsvRange>,
     }
     let advisory: Advisory = serde_json::from_value(raw.clone())
         .map_err(|e| format!("PARSE_ERROR: OSV advisory: {e}"))?;
-    let invalid = || "PARSE_ERROR: invalid OSV advisory".to_string();
-    if advisory.id.is_empty() || advisory.aliases.iter().any(String::is_empty) {
+    let invalid = || format!("PARSE_ERROR: invalid OSV advisory {:?}", advisory.id);
+    if !valid_osv_id(&advisory.id)
+        || advisory
+            .aliases
+            .iter()
+            .any(|alias| !usable_osv_token(alias))
+    {
         return Err(invalid());
     }
     for affected in advisory.affected {
-        if affected.package.is_empty() || affected.versions.iter().any(String::is_empty) {
+        if affected.package.is_empty() {
             return Err(invalid());
         }
+        // Git ranges can enumerate repository tags as well as npm releases.
+        // ECOSYSTEM versions are also opaque by schema; keep them, never infer
+        // unaffected from a version list/range our evaluator cannot interpret.
+        let opaque_versions = affected
+            .ranges
+            .iter()
+            .any(|r| matches!(r.kind.as_str(), "GIT" | "ECOSYSTEM"));
+        if let Some(value) = affected.versions.iter().find(|value| {
+            !usable_osv_token(value)
+                || !opaque_versions && semver::parse_osv_ecosystem_version(value).is_none()
+        }) {
+            return Err(format!(
+                "PARSE_ERROR: invalid OSV advisory {:?}: npm version {:?} for {:?}",
+                advisory.id, value, affected.package
+            ));
+        }
         for range in affected.ranges {
-            if !matches!(range.kind.as_str(), "SEMVER" | "ECOSYSTEM" | "GIT")
-                || range.events.is_empty()
-            {
-                return Err(invalid());
-            }
-            for event in range.events {
-                if event.len() != 1
-                    || event.iter().any(|(key, value)| {
-                        !matches!(
-                            key.as_str(),
-                            "introduced" | "fixed" | "last_affected" | "limit"
-                        ) || value.is_empty()
-                    })
-                {
-                    return Err(invalid());
-                }
-            }
+            validate_range(&range, &advisory.id, &affected.package)?;
         }
     }
     Ok(())
@@ -512,11 +750,11 @@ pub fn check(
     args: &CheckArgs,
     osv_local_path: &str,
 ) -> Result<(Vec<Alert>, Vec<String>), String> {
-    let lock_text =
-        std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let lock_text = std::fs::read_to_string(checked_input_path(root, "own.lock")?)
+        .map_err(|e| format!("IO_ERROR: {e}"))?;
     let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
     let config = read_config(root)?;
-    let path = root.join(config.local_path.as_deref().unwrap_or(osv_local_path));
+    let path = checked_snapshot_path(root, config.local_path.as_deref().unwrap_or(osv_local_path))?;
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -642,6 +880,7 @@ pub fn check(
                 let mut hit = false;
                 let mut range_desc = Vec::new();
                 let mut fixed = Vec::new();
+                let mut unevaluable = Vec::new();
                 for r in aff
                     .get("ranges")
                     .and_then(|r| r.as_array())
@@ -661,14 +900,26 @@ pub fn check(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    for (k, v) in &evs {
-                        if k == "fixed" {
-                            fixed.push(v.clone());
+                    let kind = r["type"].as_str().unwrap(); // validated above
+                    let evaluated = if kind == "GIT" {
+                        None // a commit graph cannot be inferred from a release version
+                    } else {
+                        semver::evaluate_osv_range(&p.version, &evs)
+                    };
+                    if evaluated.is_some() {
+                        for (k, v) in &evs {
+                            if k == "fixed" {
+                                fixed.push(v.clone());
+                            }
                         }
                     }
-                    if semver::in_osv_range(&p.version, &evs) {
-                        hit = true;
-                        range_desc.push(format!("{:?}", evs));
+                    match evaluated {
+                        Some(true) => {
+                            hit = true;
+                            range_desc.push(format!("{evs:?}"));
+                        }
+                        Some(false) => {}
+                        None => unevaluable.push(kind.to_string()),
                     }
                 }
                 let versions: Vec<String> = aff
@@ -680,12 +931,40 @@ pub fn check(
                             .collect()
                     })
                     .unwrap_or_default();
-                if versions.iter().any(|v| v == &p.version) {
+                // An explicit ecosystem version is a point, not a wildcard:
+                // e.g. 12.0 may conservatively identify 12.0.0, never 12.0.1.
+                let current = semver::parse_osv_ecosystem_version(&p.version);
+                if versions.iter().any(|v| {
+                    v == &p.version
+                        || current.as_ref().is_some_and(|current| {
+                            semver::parse_osv_ecosystem_version(v).as_ref() == Some(current)
+                        })
+                }) {
                     hit = true;
+                }
+                if !hit {
+                    if versions
+                        .iter()
+                        .any(|v| semver::parse_osv_ecosystem_version(v).is_none())
+                    {
+                        unevaluable.push("versions".to_string());
+                    }
+                    if !unevaluable.is_empty() {
+                        unevaluable.sort();
+                        unevaluable.dedup();
+                        return Err(format!(
+                            "OSV_UNEVALUABLE: {id}: {}: {}",
+                            p.name,
+                            unevaluable.join(",")
+                        ));
+                    }
                 }
                 if hit {
                     let mut level = "E0".to_string();
                     let mut reach_hash: Option<String> = None;
+                    // Applicability belongs to this exact package/version
+                    // record, not every package or platform of the advisory.
+                    let evidence_advisory = json!({"id": id, "affected": [aff]});
                     if args.e2 {
                         // E2 needs an entry file: use main from package.json
                         let dir = root.join(&p.dir);
@@ -699,7 +978,8 @@ pub fn check(
                             })
                             .map(|m| dir.join(m))
                             .unwrap_or_else(|| dir.join("index.js"));
-                        let (lvl, loaded) = own_slice::e2::evidence_level_e2(&dir, adv, &entry);
+                        let (lvl, loaded) =
+                            own_slice::e2::evidence_level_e2(&dir, &evidence_advisory, &entry);
                         if lvl == "E2" {
                             level = "E2".to_string();
                         } else if args.e1 {
@@ -714,8 +994,11 @@ pub fn check(
                     }
                     if args.e1 && level == "E0" {
                         let dir = root.join(&p.dir);
-                        let (lvl, reach) =
-                            own_slice::e1::evidence_level(&dir, adv, own_slice::ConsumerModel::Esm);
+                        let (lvl, reach) = own_slice::e1::evidence_level(
+                            &dir,
+                            &evidence_advisory,
+                            own_slice::ConsumerModel::Esm,
+                        );
                         level = lvl.to_string();
                         if let Some(r) = reach {
                             let mut v: Vec<&String> = r.iter().collect();
@@ -744,6 +1027,62 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // All unit documents, ZIPs, HTTP dates and filesystem states here are
+    // synthetic fixtures. Only the explicit integration live tests use OSV data.
+
+    struct SyntheticSnapshotFixture(std::path::PathBuf);
+    impl SyntheticSnapshotFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "own-osv-publish-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for SyntheticSnapshotFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn synthetic_snapshot_new_parents_are_journaled_before_publication() {
+        let fixture = SyntheticSnapshotFixture::new();
+        let txn = own_core::txn::Txn::begin(&fixture.0).unwrap();
+        publish_snapshot(&txn, "cache/deep/osv.json", b"synthetic-snapshot-bytes").unwrap();
+        let journal: Value =
+            serde_json::from_slice(&std::fs::read(txn.txn_dir.join("journal.json")).unwrap())
+                .unwrap();
+        assert_eq!(journal["created_dirs"], json!(["cache", "cache/deep"]));
+        assert_eq!(journal["state"], "started");
+        assert_eq!(
+            std::fs::read(fixture.0.join("cache/deep/osv.json")).unwrap(),
+            b"synthetic-snapshot-bytes"
+        );
+        txn.rollback().unwrap();
+    }
+
+    #[test]
+    fn synthetic_snapshot_rollback_removes_all_new_parent_directories() {
+        let fixture = SyntheticSnapshotFixture::new();
+        let txn = own_core::txn::Txn::begin(&fixture.0).unwrap();
+        publish_snapshot(&txn, "cache/deep/osv.json", b"synthetic-snapshot-bytes").unwrap();
+        txn.rollback().unwrap();
+        assert!(
+            !fixture.0.join("cache").exists(),
+            "rollback must undo the entire OSV path creation"
+        );
+        assert_eq!(
+            std::fs::read_dir(fixture.0.join(".own/txn"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
 
     fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -766,8 +1105,24 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_ecosystem_partial_bound_is_kept_and_evaluated() {
+        let raw = json!({"id":"GHSA-3h52-269p-cp9r", "affected":[{"package":{"name":"next", "ecosystem":"npm"}, "ranges":[{"type":"ECOSYSTEM", "events":[{"introduced":"13.0"},{"fixed":"14.2.30"}]}]}]});
+        let reduced = reduce_advisory_checked(&raw).unwrap().unwrap();
+        assert_eq!(
+            reduced["affected"][0]["ranges"][0]["events"][0]["introduced"],
+            "13.0"
+        );
+        let events = vec![
+            ("introduced".into(), "13.0".into()),
+            ("fixed".into(), "14.2.30".into()),
+        ];
+        assert!(semver::in_osv_range("14.2.29", &events));
+        assert!(!semver::in_osv_range("14.2.30", &events));
+    }
+
+    #[test]
     fn http_source_date_is_written_as_canonical_utc_p2_02() {
-        // Real header shape served by the OSV mirror.
+        // Synthetic headers in the format used by the OSV mirror.
         assert_eq!(
             source_date_to_utc("Sat, 14 Nov 2026 08:33:14 GMT").unwrap(),
             "2026-11-14T08:33:14Z"

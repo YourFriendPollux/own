@@ -8,7 +8,7 @@ use own_core::canonical::{
 use own_core::config::license_policy_json;
 use own_core::lock::{parse_lock, LicenseFile, Lock, Package};
 use own_core::txn::Txn;
-use own_net::{build_client, fetch_packument, fetch_tarball, verify_sri_integrity, NetConfig};
+use own_net::{build_client, fetch_packument, fetch_tarball, verify_sri_integrity};
 use own_policy::license as lic;
 use std::path::Path;
 use std::process::Command;
@@ -17,211 +17,298 @@ pub struct UpdateArgs {
     pub pkg: String,
     pub new_version: String,
     pub no_pr: bool,
-    #[allow(dead_code)]
-    // diamond strategies recorded at add-time; re-eval path is update to same version
+    // UPDATE preserves recorded decisions; it cannot silently accept a new strategy.
     pub allow_diamond: Option<String>,
     pub no_install: bool,
 }
 
 pub fn update(root: &Path, args: &UpdateArgs) -> Result<u8, String> {
-    // preconditions
-    let lock_text =
-        std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let mut lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
-    let old_idx = lock
-        .packages
-        .iter()
-        .position(|p| p.name == args.pkg)
-        .ok_or("PACKAGE_NOT_VENDORED")?;
-    let old = lock.packages[old_idx].clone();
-    // working tree must be clean
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("GIT_ERROR: {e}"))?;
-    if !dirty.stdout.is_empty() {
-        return Err("WORKTREE_DIRTY".to_string());
-    }
-    // verify current package passes
-    {
-        let toml =
+    update_with_fetch(root, args, |settings| {
+        let cfg = &settings.net;
+        let client = build_client(cfg)?;
+        let packument = fetch_packument(&client, cfg, &args.pkg)?;
+        let pv: serde_json::Value = serde_json::from_slice(&packument)
+            .map_err(|e| format!("PARSE_ERROR: packument: {e}"))?;
+        let vobj = pv
+            .get("versions")
+            .and_then(|vs| vs.get(&args.new_version))
+            .ok_or("VERSION_NOT_FOUND")?
+            .clone();
+        vobj.pointer("/dist/integrity")
+            .and_then(|i| i.as_str())
+            .ok_or("NOT_ELIGIBLE:integrity_missing")?;
+        let tarball_url = vobj
+            .pointer("/dist/tarball")
+            .and_then(|t| t.as_str())
+            .ok_or("VERSION_NOT_FOUND")?;
+        let download = fetch_tarball(&client, cfg, tarball_url)?;
+        Ok((vobj, download))
+    })
+}
+
+// Only acquisition is replaceable in unit tests: SRI, hardened extraction,
+// diff, writes, install, verification and the real Txn remain on the same path.
+fn update_with_fetch<F>(root: &Path, args: &UpdateArgs, fetch: F) -> Result<u8, String>
+where
+    F: FnOnce(
+        &crate::project_config::ProjectConfig,
+    ) -> Result<(serde_json::Value, own_net::TarballDownload), String>,
+{
+    // Recover before loading the lock entry that will be replaced.
+    let txn = Txn::begin(root)?;
+    // Every fallible pre-commit operation shares the same rollback boundary.
+    let res = (|| -> Result<(Package, crate::diff::DiffReport), String> {
+        if !matches!(
+            args.allow_diamond.as_deref(),
+            None | Some("keep-external" | "unify" | "vendor-all")
+        ) {
+            return Err(
+                "USAGE_ERROR: --allow-diamond must be keep-external|unify|vendor-all".into(),
+            );
+        }
+        if let Some(strategy) = args.allow_diamond.as_deref() {
+            return Err(format!(
+                "USAGE_ERROR: UPDATE_STRATEGY_UNSUPPORTED: --allow-diamond={strategy} is not \
+             implemented for update; omit --allow-diamond to preserve recorded decisions"
+            ));
+        }
+        // preconditions
+        let lock_text =
+            std::fs::read_to_string(root.join("own.lock")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        let mut lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
+        let matches: Vec<usize> = lock
+            .packages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, package)| (package.name == args.pkg).then_some(index))
+            .collect();
+        let old_idx = match matches.as_slice() {
+            [] => return Err("PACKAGE_NOT_VENDORED".into()),
+            [index] => *index,
+            _ => {
+                let mut candidates: Vec<String> = matches
+                    .iter()
+                    .map(|index| format!("{}@{}", args.pkg, lock.packages[*index].version))
+                    .collect();
+                candidates.sort();
+                return Err(format!(
+                "USAGE_ERROR: UPDATE_AMBIGUOUS: {} matches {}; no source-version selector is available. \
+                 Restore a single-version vendoring state (own.lock, vendor tree and overrides) \
+                 before retrying",
+                args.pkg,
+                candidates.join(", ")
+            ));
+            }
+        };
+        let old = lock.packages[old_idx].clone();
+        // working tree must be clean
+        let dirty = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(root)
+            .output()
+            .map_err(|e| format!("GIT_ERROR: {e}"))?;
+        if !dirty.status.success() {
+            return Err(format!(
+                "GIT_ERROR: git status -> {}: {}",
+                dirty.status,
+                String::from_utf8_lossy(&dirty.stderr)
+            ));
+        }
+        if !dirty.stdout.is_empty() {
+            return Err("WORKTREE_DIRTY".to_string());
+        }
+        // Refuse current drift anywhere, including findings without a package label.
+        {
+            let toml = std::fs::read_to_string(root.join("own.toml"))
+                .map_err(|e| format!("IO_ERROR: {e}"))?;
+            let pol = license_policy_json(&toml)?;
+            let ov = read_overrides(root)?;
+            let outcome = own_core::verify::verify(root, &pol, &ov)?;
+            if let Some(finding) = outcome.findings.iter().find(|f| f.severity == "error") {
+                return Err(format!(
+                "{}: current project verification failed at {}; run own verify and repair drift before updating",
+                finding.code, finding.path
+            ));
+            }
+        }
+        // fetch new version (same pipeline as add, minus the pnpm-lock precondition)
+        let settings = crate::project_config::load(root)?;
+        let (vobj, dl) = fetch(&settings)?;
+        let integrity = vobj
+            .pointer("/dist/integrity")
+            .and_then(|i| i.as_str())
+            .ok_or("NOT_ELIGIBLE:integrity_missing")?
+            .to_string();
+        let sha512_hex = verify_sri_integrity(&integrity, &dl.bytes)?;
+        let vm_hash = crate::add::version_manifest_hash_pub(&vobj)?;
+        // provenance §8.1 step 4: detection only, same evaluator as `add`
+        let prov = crate::add::evaluate_provenance(&vobj);
+        for w in &prov.warnings {
+            eprintln!("warning: {w}");
+        }
+
+        // eligibility on new version
+        let vendored: Vec<(String, String)> = lock
+            .packages
+            .iter()
+            .filter(|p| p.name != args.pkg)
+            .map(|p| (p.name.clone(), p.version.clone()))
+            .collect();
+        let elig = own_policy::eligibility::evaluate(
+            &vobj,
+            &vendored,
+            settings.security.max_unpacked_size,
+        );
+        if !elig.eligible {
+            return Err(format!(
+                "NOT_ELIGIBLE:{}",
+                elig.blocking.unwrap_or("unknown")
+            ));
+        }
+        let toml_text =
             std::fs::read_to_string(root.join("own.toml")).map_err(|e| format!("IO_ERROR: {e}"))?;
-        let pol = license_policy_json(&toml)?;
-        let ov = read_overrides(root)?;
-        let outcome = own_core::verify::verify(root, &pol, &ov)?;
-        if outcome
+        let pol_json = license_policy_json(&toml_text)?;
+        let pol = lic::LicensePolicy {
+            allow: str_list(&pol_json, "allow"),
+            review: str_list(&pol_json, "review"),
+            deny: str_list(&pol_json, "deny"),
+            unknown: pol_json
+                .get("unknown")
+                .and_then(|u| u.as_str())
+                .unwrap_or("deny")
+                .to_string(),
+        };
+        let expr = elig.license_expression.clone().unwrap_or_default();
+        let (class, selected) = if expr.is_empty() {
+            (lic::LicenseClass::Deny, None)
+        } else {
+            lic::evaluate_expression(&expr, &pol)?
+        };
+        let license_policy = match class {
+            lic::LicenseClass::Allow => "allow",
+            lic::LicenseClass::Review => {
+                if old.license_policy == "human-review" {
+                    "human-review"
+                } else {
+                    return Err("LICENSE_REVIEW_REQUIRED".to_string());
+                }
+            }
+            lic::LicenseClass::Deny => return Err("LICENSE_DENIED".to_string()),
+        };
+
+        // transaction
+        let (new_lock, report) = update_inner(
+            &txn,
+            root,
+            &mut lock,
+            old_idx,
+            &old,
+            args,
+            &dl.bytes,
+            &sha512_hex,
+            &dl.sha256,
+            &vm_hash,
+            &integrity,
+            license_policy,
+            selected,
+            &expr,
+            &prov,
+            &settings,
+        )?;
+        // package.json: override path changes if dir name changed
+        let new_dir = format!(
+            "vendor/own/{}",
+            own_core::lock::dir_name(&args.pkg, &args.new_version)
+        );
+        update_override(
+            &txn,
+            root,
+            &new_lock,
+            &args.pkg,
+            &old.version,
+            &args.new_version,
+            &new_dir,
+        )?;
+        let overrides = read_overrides(root)?;
+        let mut new_lock = new_lock;
+        new_lock.metadata.lock_digest = compute_lock_digest(&new_lock, &overrides);
+        let canonical = write_lock_canonical(&new_lock);
+        txn.write_file("own.lock", canonical.as_bytes())?;
+        // pnpm install + verify
+        if args.no_install {
+            eprintln!("warning: --no-install: post-install verification not performed");
+        } else {
+            txn.backup("pnpm-lock.yaml")?;
+            // pnpm mutates its materialized tree as well as its lockfile.
+            txn.backup("node_modules")?;
+            let st = Command::new("pnpm")
+                .arg("install")
+                .arg("--ignore-scripts")
+                .current_dir(root)
+                .status()
+                .map_err(|e| format!("PNPM_FAILED: {e}"))?;
+            if !st.success() {
+                return Err("PNPM_FAILED".to_string());
+            }
+        }
+        let toml2 =
+            std::fs::read_to_string(root.join("own.toml")).map_err(|e| format!("IO_ERROR: {e}"))?;
+        let pol2 = license_policy_json(&toml2)?;
+        let ov2 = read_overrides(root)?;
+        let outcome = own_core::verify::verify(root, &pol2, &ov2)?;
+        let installed = if args.no_install {
+            Vec::new()
+        } else {
+            own_core::verify::verify_installed(root)?
+        };
+        if let Some(finding) = outcome
             .findings
             .iter()
-            .any(|f| f.severity == "error" && f.package.starts_with(&format!("{}@", args.pkg)))
+            .chain(&installed)
+            .find(|f| f.severity == "error")
         {
-            return Err("DRIFT_MODIFIED: current package in drift; refusing to update".to_string());
+            return Err(format!(
+                "{}: post-update verify failed at {}",
+                finding.code, finding.path
+            ));
         }
-    }
-    // fetch new version (same pipeline as add, minus the pnpm-lock precondition)
-    let cfg = NetConfig::default();
-    let client = build_client(&cfg)?;
-    let packument = fetch_packument(&client, &cfg, &args.pkg)?;
-    let pv: serde_json::Value =
-        serde_json::from_slice(&packument).map_err(|e| format!("PARSE_ERROR: packument: {e}"))?;
-    let vobj = pv
-        .get("versions")
-        .and_then(|vs| vs.get(&args.new_version))
-        .ok_or("VERSION_NOT_FOUND")?;
-    let integrity = vobj
-        .pointer("/dist/integrity")
-        .and_then(|i| i.as_str())
-        .ok_or("NOT_ELIGIBLE:integrity_missing")?
-        .to_string();
-    let tarball_url = vobj
-        .pointer("/dist/tarball")
-        .and_then(|t| t.as_str())
-        .ok_or("VERSION_NOT_FOUND")?
-        .to_string();
-    let dl = fetch_tarball(&client, &cfg, &tarball_url)?;
-    let sha512_hex = verify_sri_integrity(&integrity, &dl.bytes)?;
-    let vm_hash = crate::add::version_manifest_hash_pub(vobj)?;
-    // provenance §8.1 step 4: detection only, same evaluator as `add`
-    let prov = crate::add::evaluate_provenance(vobj);
-    for w in &prov.warnings {
-        eprintln!("warning: {w}");
-    }
-
-    // eligibility on new version
-    let vendored: Vec<(String, String)> = lock
-        .packages
-        .iter()
-        .filter(|p| p.name != args.pkg)
-        .map(|p| (p.name.clone(), p.version.clone()))
-        .collect();
-    let elig = own_policy::eligibility::evaluate(vobj, &vendored, 500 * 1_048_576);
-    if !elig.eligible {
-        return Err(format!(
-            "NOT_ELIGIBLE:{}",
-            elig.blocking.unwrap_or("unknown")
-        ));
-    }
-    let toml_text =
-        std::fs::read_to_string(root.join("own.toml")).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let pol_json = license_policy_json(&toml_text)?;
-    let pol = lic::LicensePolicy {
-        allow: str_list(&pol_json, "allow"),
-        review: str_list(&pol_json, "review"),
-        deny: str_list(&pol_json, "deny"),
-        unknown: pol_json
-            .get("unknown")
-            .and_then(|u| u.as_str())
-            .unwrap_or("deny")
-            .to_string(),
-    };
-    let expr = elig.license_expression.clone().unwrap_or_default();
-    let (class, selected) = if expr.is_empty() {
-        (lic::LicenseClass::Deny, None)
-    } else {
-        lic::evaluate_expression(&expr, &pol)?
-    };
-    let license_policy = match class {
-        lic::LicenseClass::Allow => "allow",
-        lic::LicenseClass::Review => {
-            if old.license_policy == "human-review" {
-                "human-review"
-            } else {
-                return Err("LICENSE_REVIEW_REQUIRED".to_string());
-            }
+        Ok((old, report))
+    })();
+    let (old, report) = match res {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(match txn.rollback() {
+                Ok(()) => error,
+                Err(rollback) => {
+                    let journal = txn.txn_dir.join("journal.json");
+                    let state = match journal.try_exists() {
+                        Ok(true) => "journal retained",
+                        Ok(false) => "journal unavailable",
+                        Err(_) => "journal presence unknown",
+                    };
+                    let separator = if error.contains(':') { ";" } else { ":" };
+                    format!(
+                        "{error}{separator} ROLLBACK_FAILED: {rollback}; {state} at {}",
+                        journal.display()
+                    )
+                }
+            });
         }
-        lic::LicenseClass::Deny => return Err("LICENSE_DENIED".to_string()),
     };
-
-    // transaction
-    let txn = Txn::begin(root)?;
-    let res = update_inner(
-        &txn,
-        root,
-        &mut lock,
-        old_idx,
-        &old,
-        args,
-        &dl.bytes,
-        &sha512_hex,
-        &dl.sha256,
-        &vm_hash,
-        &integrity,
-        license_policy,
-        selected,
-        &expr,
-        &prov,
+    txn.commit()?;
+    println!(
+        "updated {}@{} -> {}@{} ({} files changed, {} signals)",
+        args.pkg,
+        old.version,
+        args.pkg,
+        args.new_version,
+        report.modified.len() + report.added.len() + report.removed.len(),
+        report.signals.len()
     );
-    match res {
-        Ok((new_lock, report)) => {
-            // package.json: override path changes if dir name changed
-            let new_dir = format!(
-                "vendor/own/{}",
-                own_core::lock::dir_name(&args.pkg, &args.new_version)
-            );
-            update_override(
-                &txn,
-                root,
-                &new_lock,
-                &args.pkg,
-                &old.version,
-                &args.new_version,
-                &new_dir,
-            )?;
-            let overrides = read_overrides(root)?;
-            let mut new_lock = new_lock;
-            new_lock.metadata.lock_digest = compute_lock_digest(&new_lock, &overrides);
-            let canonical = write_lock_canonical(&new_lock);
-            txn.write_file("own.lock", canonical.as_bytes())?;
-            // pnpm install + verify
-            if !args.no_install {
-                let st = Command::new("pnpm")
-                    .arg("install")
-                    .current_dir(root)
-                    .status()
-                    .map_err(|e| format!("PNPM_FAILED: {e}"))?;
-                if !st.success() {
-                    let _ = txn.rollback();
-                    return Err("PNPM_FAILED".to_string());
-                }
-            }
-            let toml2 = std::fs::read_to_string(root.join("own.toml"))
-                .map_err(|e| format!("IO_ERROR: {e}"))?;
-            let pol2 = license_policy_json(&toml2)?;
-            let ov2 = read_overrides(root)?;
-            let outcome = match own_core::verify::verify(root, &pol2, &ov2) {
-                Ok(o) => o,
-                Err(e) => {
-                    let _ = txn.rollback();
-                    return Err(e);
-                }
-            };
-            if outcome.findings.iter().any(|f| f.severity == "error") {
-                let _ = txn.rollback();
-                return Err(format!(
-                    "{}: post-update verify failed",
-                    outcome.findings[0].code
-                ));
-            }
-            txn.commit()?;
-            println!(
-                "updated {}@{} -> {}@{} ({} files changed, {} signals)",
-                args.pkg,
-                old.version,
-                args.pkg,
-                args.new_version,
-                report.modified.len() + report.added.len() + report.removed.len(),
-                report.signals.len()
-            );
-            if !args.no_pr {
-                create_pr(root, args, &report)?;
-            }
-            Ok(0)
-        }
-        Err(e) => {
-            let _ = txn.rollback();
-            Err(e)
-        }
+    if !args.no_pr {
+        create_pr(root, args, &report)?;
     }
+    Ok(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,25 +328,39 @@ fn update_inner(
     license_selected: Option<String>,
     license_expression: &str,
     prov: &crate::add::Provenance,
+    settings: &crate::project_config::ProjectConfig,
 ) -> Result<(Lock, crate::diff::DiffReport), String> {
+    // Txn::write_file reuses this scratch path; a failed rename can leave it.
+    // Record its original absence/presence before the first transactional write.
+    txn.backup(&format!(".own/tmp/{}.tmp", txn.id))?;
     // cache
-    let cache_dir = root.join(".own/cache");
-    std::fs::create_dir_all(&cache_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let cache_path = cache_dir.join(format!("{sha512_hex}.tgz"));
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&cache_path, tarball).map_err(|e| format!("IO_ERROR: {e}"))?;
-        std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o444))
-            .map_err(|e| format!("IO_ERROR: {e}"))?;
-    }
+    let cache_path = crate::add::cache_tarball(txn, sha512_hex, tarball)?;
     // extract
-    let tmp_extract = root.join(".own/tmp").join(format!("upd-{}", txn.id));
+    let tmp_extract_rel = format!(".own/tmp/upd-{}", txn.id);
+    let tmp_extract = own_core::path_safety::project_path(root, &tmp_extract_rel)
+        .map_err(|e| format!("IO_ERROR: {e}"))?;
+    // Journal before extraction so every refusal removes even partial archives.
+    txn.note_created_dir(&tmp_extract_rel)?;
     std::fs::create_dir_all(&tmp_extract).map_err(|e| format!("IO_ERROR: {e}"))?;
-    let limits = own_extract::SecurityLimits::default();
-    let stats = own_extract::extract(&cache_path, &tmp_extract, &limits)?;
-    // diff old vendor dir vs new extraction (use root-relative fake dirs)
-    let report = crate::diff::diff_dirs(root, &old.dir, tmp_extract.to_str().ok_or("IO_ERROR")?)
-        .unwrap_or_default();
+    let limits = &settings.security;
+    let stats = own_extract::extract(&cache_path, &tmp_extract, limits)?;
+    let vendored: Vec<_> = lock
+        .packages
+        .iter()
+        .filter(|p| p.name != args.pkg)
+        .map(|p| (p.name.clone(), p.version.clone()))
+        .collect();
+    crate::add::validate_extracted_package_with_limit(
+        &tmp_extract,
+        &args.pkg,
+        &args.new_version,
+        integrity,
+        &vendored,
+        license_expression,
+        limits.max_unpacked_size,
+    )?;
+    // diff old vendor dir vs the prepared project-relative extraction
+    let report = crate::diff::diff_dirs(root, &old.dir, &tmp_extract_rel)?;
     // license files
     let mut paths = Vec::new();
     collect_files(&tmp_extract, &tmp_extract, &mut paths);
@@ -286,7 +387,7 @@ fn update_inner(
     // native check
     for p in &paths {
         let b = std::fs::read(tmp_extract.join(p)).map_err(|e| format!("IO_ERROR: {e}"))?;
-        if b.starts_with(b"\x7fELF") || (b.len() >= 2 && &b[..2] == b"MZ") {
+        if crate::add::is_native_binary(&b) {
             return Err("NOT_ELIGIBLE:native_binary".to_string());
         }
         if p.ends_with("binding.gyp") {
@@ -326,7 +427,7 @@ fn update_inner(
         ecosystem: "npm".into(),
         version: args.new_version.clone(),
         dir: new_dir_rel,
-        registry: old.registry.clone(),
+        registry: settings.net.registry_url.clone(),
         integrity: integrity.to_string(),
         tarball_sha256: tarball_sha256.to_string(),
         version_manifest_sha256: vm_hash.to_string(),
@@ -382,18 +483,40 @@ fn create_pr(
                 String::from_utf8_lossy(&out.stderr)
             ));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        String::from_utf8(out.stdout).map_err(|_| "GIT_ERROR: invalid UTF-8 output".into())
     };
-    // refuse to run on a dirty tree: the branch+commit below must contain ONLY
-    // the update's changes
-    if run(&["status", "--porcelain"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(true)
-    {
-        return Err("GIT_ERROR: working tree not clean before own/update branch".to_string());
+    // The tree was clean BEFORE update. Its own changed files must now be
+    // allowed, but never stage unrelated files or lossy/quoted path lists.
+    let status = run(&["status", "--porcelain", "-z"])?;
+    let owned = |path: &str| {
+        matches!(path, "own.lock" | "package.json" | "pnpm-lock.yaml")
+            || path.starts_with("vendor/own/")
+    };
+    let mut records = status.split('\0').filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        let path = record.get(3..).ok_or("GIT_ERROR: invalid status record")?;
+        if !owned(path) {
+            return Err("GIT_ERROR: unrelated changes before own/update branch".into());
+        }
+        if record.as_bytes()[..2]
+            .iter()
+            .any(|c| matches!(c, b'R' | b'C'))
+        {
+            let original = records.next().ok_or("GIT_ERROR: missing rename source")?;
+            if !owned(original) {
+                return Err("GIT_ERROR: unrelated rename before own/update branch".into());
+            }
+        }
     }
     let _ = run(&["checkout", "-b", &branch])?;
-    let _ = run(&["add", "-A"])?;
+    let _ = run(&[
+        "add",
+        "--",
+        "own.lock",
+        "package.json",
+        "pnpm-lock.yaml",
+        "vendor/own",
+    ])?;
     let msg = format!(
         "chore(deps): update {} to {} (own)",
         args.pkg, args.new_version
@@ -490,6 +613,17 @@ fn update_override(
                 ov.remove(&stale);
             }
         }
+        let old_dir = format!(
+            "file:vendor/own/{}",
+            own_core::lock::dir_name(pkg, old_version)
+        );
+        for (selector, target) in ov.iter_mut() {
+            if own_core::verify::npm_alias_target(selector) == Some(pkg)
+                && target.as_str() == Some(old_dir.as_str())
+            {
+                *target = serde_json::Value::String(val.clone());
+            }
+        }
         ov.insert(key, serde_json::Value::String(val));
         let mut keys: Vec<String> = ov.keys().cloned().collect();
         keys.sort();
@@ -579,10 +713,14 @@ fn author_email(a: &str) -> &str {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/update_security.rs"]
+mod security_tests;
+
+#[cfg(test)]
 mod override_tests {
     use super::*;
 
-    fn package(name: &str, version: &str) -> Package {
+    pub(super) fn package(name: &str, version: &str) -> Package {
         Package {
             name: name.into(),
             ecosystem: "npm".into(),
@@ -682,6 +820,32 @@ mod override_tests {
             read_overrides(&root),
             serde_json::json!({"a": "file:vendor/own/a@2.1.0"})
         );
+    }
+
+    #[test]
+    fn update_retargets_only_aliases_bound_to_the_replaced_version() {
+        let root = fixture(
+            "alias",
+            r#"{"a@1.0.0":"file:vendor/own/a@1.0.0","a@2.0.0":"file:vendor/own/a@2.0.0","old@npm:a@1.0.0":"file:vendor/own/a@1.0.0","new@npm:a@2.0.0":"file:vendor/own/a@2.0.0"}"#,
+        );
+        let mut lock = own_core::canonical::empty_lock("0.1.0", "1", &serde_json::Map::new());
+        lock.packages.push(package("a", "1.1.0"));
+        lock.packages.push(package("a", "2.0.0"));
+        let txn = Txn::begin(&root).unwrap();
+        update_override(
+            &txn,
+            &root,
+            &lock,
+            "a",
+            "1.0.0",
+            "1.1.0",
+            "vendor/own/a@1.1.0",
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        let overrides = read_overrides(&root);
+        assert_eq!(overrides["old@npm:a@1.0.0"], "file:vendor/own/a@1.1.0");
+        assert_eq!(overrides["new@npm:a@2.0.0"], "file:vendor/own/a@2.0.0");
     }
 
     #[test]

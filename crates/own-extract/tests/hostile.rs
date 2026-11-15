@@ -94,6 +94,47 @@ const SYMLINK: u8 = b'2';
 const HARDLINK: u8 = b'1';
 
 #[test]
+fn rule_short_trailing_data_refused_inv3() {
+    let (_t, cache) = setup();
+    let mut bytes = gzip(&build_tar(&[("package/index.js", REG, b"ok")]));
+    bytes.push(1);
+    let hash = own_core::hex(Sha512::digest(&bytes));
+    let path = cache.join(format!("{hash}.tgz"));
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    assert_eq!(
+        extract(&path, &_t.path().join("dest"), &limits()).unwrap_err(),
+        "EXTRACT_REFUSED:trailing_data"
+    );
+}
+
+#[test]
+fn rule_gzip_trailer_crc_refused_inv3() {
+    let (_t, cache) = setup();
+    let mut bytes = gzip(&build_tar(&[("package/index.js", REG, b"ok")]));
+    let crc = bytes.len() - 8;
+    bytes[crc] ^= 1;
+    let hash = own_core::hex(Sha512::digest(&bytes));
+    let path = cache.join(format!("{hash}.tgz"));
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(extract(&path, &_t.path().join("dest"), &limits()).is_err());
+}
+
+#[test]
+fn rule_decompressed_padding_is_bounded_inv3() {
+    let (_t, cache) = setup();
+    let mut raw = build_tar(&[("package/index.js", REG, b"ok")]);
+    raw.resize(8 * 1024 * 1024, 0);
+    let bytes = gzip(&raw);
+    let hash = own_core::hex(Sha512::digest(&bytes));
+    let path = cache.join(format!("{hash}.tgz"));
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(extract(&path, &_t.path().join("dest"), &limits()).is_err());
+}
+
+#[test]
 fn happy_path_extracts_files_stripping_prefix() {
     let (_t, cache) = setup();
     let dest = _t.path().join("dest");

@@ -124,7 +124,7 @@ pub fn openvex(
         let p = lock
             .packages
             .iter()
-            .find(|p| p.name == a.package)
+            .find(|p| p.name == a.package && p.version == a.current_version)
             .ok_or("PACKAGE_NOT_VENDORED")?;
         // Phase 2 (Annexe G): E1 evidence is auditable — status_notes carry the
         // evidence level AND the sha256 of the reachable file set, so the proof
@@ -165,19 +165,41 @@ pub fn openvex(
 }
 
 pub fn sbom(root: &Path, args: &SbomArgs) -> Result<u8, String> {
+    // Validate the complete request before generating or publishing anything.
+    let paths: Vec<&str> = match args.format.as_str() {
+        "cyclonedx" | "vex" => args.output.as_deref().into_iter().collect(),
+        "both" => vec![
+            args.vex_output
+                .as_deref()
+                .ok_or("USAGE_ERROR: --format both requires --vex-output")?,
+            args.output
+                .as_deref()
+                .ok_or("USAGE_ERROR: --output required with both")?,
+        ],
+        _ => return Err("USAGE_ERROR: --format must be cyclonedx|vex|both".to_string()),
+    };
+    let mut targets = Vec::new();
+    for path in &paths {
+        let target = validate_output_path(root, path)?;
+        if targets.contains(&target) {
+            return Err("USAGE_ERROR: SBOM outputs must be distinct files".to_string());
+        }
+        targets.push(target);
+    }
+
+    // Recover and lock before reading the state used to generate artifacts.
+    let txn = if paths.is_empty() {
+        None
+    } else {
+        Some(own_core::txn::Txn::begin(root)?)
+    };
+    // Serialize every artifact before the first write. One transaction owns
+    // all outputs and reports success only after its durable commit.
+    let mut documents = Vec::new();
     match args.format.as_str() {
         "cyclonedx" => {
             let doc = cyclonedx(root, args)?;
-            let s = serde_json::to_string_pretty(&doc).map_err(|e| format!("IO_ERROR: {e}"))?;
-            match &args.output {
-                Some(p) => {
-                    std::fs::write(root.join(p), format!("{s}\n"))
-                        .map_err(|e| format!("IO_ERROR: {e}"))?;
-                    println!("wrote {p}");
-                }
-                None => println!("{s}"),
-            }
-            Ok(0)
+            documents.push(serialize_document(&doc)?);
         }
         "vex" | "both" => {
             // needs osv.json alerts
@@ -195,40 +217,85 @@ pub fn sbom(root: &Path, args: &SbomArgs) -> Result<u8, String> {
                 eprintln!("warning: {warning}");
             }
             let doc = openvex(root, args, &alerts)?;
-            let s = serde_json::to_string_pretty(&doc).map_err(|e| format!("IO_ERROR: {e}"))?;
-            let out_path = if args.format == "both" {
-                Some(
-                    args.vex_output
-                        .clone()
-                        .ok_or("USAGE_ERROR: --format both requires --vex-output")?,
-                )
-            } else {
-                // §8.3: stdout when --output is absent (same rule as cyclonedx)
-                args.output.clone()
-            };
-            match &out_path {
-                Some(p) => {
-                    std::fs::write(root.join(p), format!("{s}\n"))
-                        .map_err(|e| format!("IO_ERROR: {e}"))?;
-                    println!("wrote {p} ({} statements)", alerts.len());
-                }
-                None => println!("{s}"),
-            }
+            documents.push(serialize_document(&doc)?);
             if args.format == "both" {
                 let cdx = cyclonedx(root, args)?;
-                let s2 =
-                    serde_json::to_string_pretty(&cdx).map_err(|e| format!("IO_ERROR: {e}"))?;
-                let out = args
-                    .output
-                    .clone()
-                    .ok_or("USAGE_ERROR: --output required with both")?;
-                std::fs::write(root.join(out), format!("{s2}\n"))
-                    .map_err(|e| format!("IO_ERROR: {e}"))?;
+                documents.push(serialize_document(&cdx)?);
             }
-            Ok(0)
         }
-        _ => Err("USAGE_ERROR: --format must be cyclonedx|vex|both".to_string()),
+        _ => unreachable!("format validated above"),
     }
+    if paths.is_empty() {
+        // §8.3: single-format commands without --output remain read-only.
+        print!("{}", documents[0]);
+        return Ok(0);
+    }
+    let txn = txn.expect("nonempty output paths hold a transaction");
+    let result = (|| -> Result<(), String> {
+        for path in &paths {
+            txn.backup(path)?;
+        }
+        for (path, document) in paths.iter().zip(&documents) {
+            txn.write_file(path, document.as_bytes())?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return match txn.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(format!("{error}; rollback failed: {rollback}")),
+        };
+    }
+    txn.commit()?;
+    for path in paths {
+        println!("wrote {path}");
+    }
+    Ok(0)
+}
+
+fn serialize_document(doc: &Value) -> Result<String, String> {
+    serde_json::to_string_pretty(doc)
+        .map(|text| format!("{text}\n"))
+        .map_err(|e| format!("IO_ERROR: {e}"))
+}
+
+fn validate_output_path(root: &Path, path: &str) -> Result<std::path::PathBuf, String> {
+    let relative = Path::new(path);
+    if relative == Path::new(".own/lock")
+        || relative.starts_with(".own/tmp")
+        || relative.starts_with(".own/txn")
+        || relative.starts_with(".git")
+        || relative.starts_with("vendor/own")
+        || ["own.lock", "own.toml", "package.json", "pnpm-lock.yaml"]
+            .iter()
+            .any(|p| relative == Path::new(p))
+    {
+        return Err("USAGE_ERROR: SBOM output cannot overwrite transaction metadata".to_string());
+    }
+    let target = own_core::path_safety::project_path(root, path)
+        .map_err(|e| format!("IO_ERROR: SBOM output {path}: {e}"))?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "IO_ERROR: SBOM output {path} is not a regular file"
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("IO_ERROR: SBOM output {path}: {e}")),
+    }
+    let parent = target
+        .parent()
+        .ok_or("IO_ERROR: SBOM output has no parent")?;
+    if !std::fs::metadata(parent)
+        .map_err(|e| format!("IO_ERROR: SBOM output parent {path}: {e}"))?
+        .is_dir()
+    {
+        return Err(format!(
+            "IO_ERROR: SBOM output parent {path} is not a directory"
+        ));
+    }
+    Ok(target)
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ pub struct Lock {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Metadata {
+    #[serde(deserialize_with = "supported_lock_schema")]
     pub schema_version: u32,
     pub own_version: Option<String>,
     pub extractor_version: Option<String>,
@@ -70,6 +71,7 @@ pub struct Decision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub manifest: ManifestHeader,
     #[serde(default, rename = "file")]
@@ -77,7 +79,9 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestHeader {
+    #[serde(deserialize_with = "supported_manifest_schema")]
     pub schema_version: u32,
     pub package: String,
     pub package_files_sha256: String,
@@ -86,6 +90,7 @@ pub struct ManifestHeader {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestFile {
     pub path: String,
     pub sha256: String,
@@ -120,8 +125,43 @@ pub fn parse_lock(text: &str) -> Result<Lock, toml::de::Error> {
     toml::from_str(text)
 }
 
+fn supported_lock_schema<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if version != crate::canonical::SCHEMA_VERSION {
+        return Err(<D::Error as serde::de::Error>::custom(format!(
+            "LOCK_SCHEMA_UNSUPPORTED: {version}"
+        )));
+    }
+    Ok(version)
+}
+
 pub fn parse_manifest(text: &str) -> Result<Manifest, toml::de::Error> {
-    toml::from_str(text)
+    let manifest: Manifest = toml::from_str(text)?;
+    let mut paths = std::collections::BTreeSet::new();
+    for file in &manifest.files {
+        crate::path_safety::validate_relative(&file.path)
+            .map_err(<toml::de::Error as serde::de::Error>::custom)?;
+        if !paths.insert(&file.path) {
+            return Err(<toml::de::Error as serde::de::Error>::custom(
+                "duplicate manifest path",
+            ));
+        }
+    }
+    Ok(manifest)
+}
+
+fn supported_manifest_schema<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if version != crate::canonical::SCHEMA_VERSION {
+        return Err(<D::Error as serde::de::Error>::custom(format!(
+            "MANIFEST_SCHEMA_UNSUPPORTED: {version}"
+        )));
+    }
+    Ok(version)
 }
 
 #[cfg(test)]

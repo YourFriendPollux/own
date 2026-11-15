@@ -75,13 +75,23 @@ enum Commands {
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
     },
-    /// Verify a cosign keyless signature (+ optional SLSA provenance) offline (SPEC §8.3)
+    /// Verify a cosign keyless signature and optional SLSA provenance (may use network)
     VerifySignature {
+        /// Signed release artifact (e.g. the published tarball, not an extracted binary)
         file: String,
+        /// Sigstore bundle produced by cosign sign-blob
         #[arg(long)]
         bundle: String,
-        #[arg(long)]
+        /// Signed DSSE in-toto JSONL from the SLSA generator; may use network
+        #[arg(long, requires_all = ["source_uri", "source_tag"])]
         provenance: Option<String>,
+        /// Expected SLSA source repository, e.g. github.com/owner/repo
+        #[arg(long, requires = "provenance")]
+        source_uri: Option<String>,
+        /// Exact release tag expected in the SLSA provenance (not a regexp)
+        #[arg(long, requires = "provenance")]
+        source_tag: Option<String>,
+        /// Local Sigstore TrustedRoot for cosign only; does not make SLSA offline
         #[arg(long)]
         trusted_root: Option<String>,
         #[arg(long)]
@@ -166,6 +176,7 @@ mod eject;
 mod git_ignore;
 mod licenses;
 mod osv;
+mod project_config;
 mod sbom;
 mod scan;
 mod update;
@@ -187,16 +198,32 @@ fn read_overrides(
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("PARSE_ERROR: package.json: {e}"))?;
     let mut out = serde_json::Map::new();
-    if let Some(ov) = v
-        .get("pnpm")
-        .and_then(|p| p.get("overrides"))
-        .and_then(|o| o.as_object())
-    {
-        for (k, val) in ov {
-            if let Some(s) = val.as_str() {
-                if s.starts_with("file:vendor/own/") {
-                    out.insert(k.clone(), serde_json::Value::String(s.to_string()));
-                }
+    if let Some(pnpm) = v.get("pnpm") {
+        if !pnpm.is_object() {
+            return Err("PARSE_ERROR: package.json.pnpm must be an object".into());
+        }
+        let Some(overrides) = pnpm.get("overrides") else {
+            return Ok(out);
+        };
+        if !overrides.is_object() {
+            return Err("PARSE_ERROR: pnpm.overrides must be an object".into());
+        }
+        let overrides = overrides.as_object().unwrap();
+        for (selector, value) in overrides {
+            if selector.is_empty() {
+                return Err("PARSE_ERROR: blank override selector".into());
+            }
+            let Some(value) = value.as_str() else {
+                return Err("PARSE_ERROR: pnpm.overrides entries must be strings".into());
+            };
+            if value.is_empty() {
+                return Err("PARSE_ERROR: blank override value".into());
+            }
+            if value.starts_with("file:vendor/own/") {
+                out.insert(
+                    selector.clone(),
+                    serde_json::Value::String(value.to_string()),
+                );
             }
         }
     }
@@ -208,6 +235,8 @@ fn cmd_init(root: &std::path::Path, force: bool) -> Result<u8, String> {
     if !root.join("package.json").is_file() {
         return Err("USAGE_ERROR: package.json required at root".to_string());
     }
+    // Recover an interrupted init before deciding whether it is initialized.
+    let txn = own_core::txn::Txn::begin(root)?;
     let already = root.join("own.toml").exists() && root.join("own.lock").exists();
     if already && !force {
         return Err("ALREADY_INITIALIZED".to_string());
@@ -224,7 +253,6 @@ fn cmd_init(root: &std::path::Path, force: bool) -> Result<u8, String> {
     // INV-9 / §8.0: `init` writes project state, so it takes the exclusive lock
     // and journals its work like every other writing command. A failure (or a
     // signal) then leaves the directory as it was instead of half-initialised.
-    let txn = own_core::txn::Txn::begin(root)?;
     let res = (|| -> Result<(), String> {
         // own.toml
         if !root.join("own.toml").exists() || force {
@@ -379,8 +407,17 @@ fn cmd_verify(
             ))
         });
     }
-    let has_error = outcome.findings.iter().any(|f| f.severity == "error");
-    let exit_code = if has_error { 1 } else { 0 };
+    let exit_code = outcome
+        .findings
+        .iter()
+        .filter(|f| f.severity == "error")
+        .map(|f| match f.code.as_str() {
+            "IO_ERROR" | "PARSE_ERROR" | "LOCK_NOT_CANONICAL" | "LOCK_SCHEMA_UNSUPPORTED" => 2,
+            _ => 1,
+        })
+        .max()
+        .unwrap_or(0);
+
     if format == "json" {
         let findings_json: Vec<serde_json::Value> = outcome
             .findings
@@ -392,13 +429,13 @@ fn cmd_verify(
                 })
             })
             .collect();
-        let status = if has_error { "findings" } else { "ok" };
+
         println!(
             "{}",
             serde_json::json!({
                 "schema_version": 1,
                 "command": "verify",
-                "status": status,
+                "status": match exit_code { 0 => "ok", 1 => "findings", _ => "error" },
                 "exit_code": exit_code,
                 "findings": findings_json,
                 "data": {},
@@ -411,16 +448,59 @@ fn cmd_verify(
         println!("ok: no findings");
     } else {
         for f in &outcome.findings {
-            println!(
-                "{}: [{}] {} {}",
-                f.severity.to_uppercase(),
-                f.code,
-                f.package,
-                f.path
-            );
+            // The message is what distinguishes "symlink present" from "file not
+            // in manifest", or "exec bit differs" from "sha256/size differ": a
+            // human report without it names the code and nothing actionable.
+            if f.message.is_empty() {
+                println!(
+                    "{}: [{}] {} {}",
+                    f.severity.to_uppercase(),
+                    f.code,
+                    f.package,
+                    f.path
+                );
+            } else {
+                println!(
+                    "{}: [{}] {} {} — {}",
+                    f.severity.to_uppercase(),
+                    f.code,
+                    f.package,
+                    f.path,
+                    f.message
+                );
+            }
         }
     }
     Ok(exit_code)
+}
+
+fn error_exit_code(error: &str) -> u8 {
+    match error.split(':').next().unwrap_or("") {
+        "ALREADY_INITIALIZED"
+        | "NOT_INITIALIZED"
+        | "USAGE_ERROR"
+        | "LOCK_BUSY"
+        | "PARSE_ERROR"
+        | "IO_ERROR"
+        | "CONFIG_SCHEMA_UNSUPPORTED"
+        | "LOCK_SCHEMA_UNSUPPORTED"
+        | "ALREADY_VENDORED"
+        | "PACKAGE_NOT_VENDORED"
+        | "VERSION_NOT_FOUND"
+        | "VENDOR_DIR_EXISTS"
+        | "OVERRIDE_CONFLICT"
+        | "WORKTREE_DIRTY"
+        | "GIT_ERROR"
+        | "PNPM_UNSUPPORTED"
+        | "ECOSYSTEM_UNSUPPORTED"
+        | "PNPM_FAILED"
+        | "OSV_MISSING"
+        | "OSV_STALE"
+        | "OSV_INCOMPLETE"
+        | "LOCK_NOT_CANONICAL" => 2,
+        "NETWORK_ERROR" | "REGISTRY_UNAVAILABLE" | "TARBALL_REMOVED" | "GH_FAILED" => 3,
+        _ => 1,
+    }
 }
 
 fn main() -> ExitCode {
@@ -431,7 +511,7 @@ fn main() -> ExitCode {
         Commands::Scan {
             include_dev,
             format,
-        } => match scan::scan(&root, *include_dev) {
+        } => match validate_format(format).and_then(|()| scan::scan(&root, *include_dev)) {
             Ok((rows, errors)) => {
                 if format == "json" {
                     let data: Vec<serde_json::Value> = rows
@@ -494,6 +574,23 @@ fn main() -> ExitCode {
             no_install,
             allow_untested_pnpm,
         } => {
+            // §8.0/§8.2 precondition: every writing command starts from an
+            // initialized project, and says so — a bare IO_ERROR about a missing
+            // own.lock does not tell the user to run `own init`.
+            if let Err(e) = require_init(&root) {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+            if ecosystem != "npm" {
+                eprintln!("error: ECOSYSTEM_UNSUPPORTED: Phase 2 ecosystem vendoring is not implemented; only npm is supported");
+                return ExitCode::from(2);
+            }
+            if matches!(allow_diamond.as_deref(), Some("keep-external" | "unify")) {
+                eprintln!(
+                    "error: USAGE_ERROR: diamond strategy is not implemented; use vendor-all"
+                );
+                return ExitCode::from(2);
+            }
             // scoped: @scope/name@1.2.3 -> split at last '@'
             let (pkg, version) = if spec.starts_with('@') {
                 match spec.rfind('@') {
@@ -509,6 +606,29 @@ fn main() -> ExitCode {
             if pkg.is_empty() || version.is_empty() {
                 eprintln!("error: USAGE_ERROR: expected <pkg>@<version>");
                 return ExitCode::from(2);
+            }
+            // §8.1: `--license-override=human-review:<pkg>` waives the review for
+            // the package being added and nothing else. The value used to be
+            // reduced to a boolean, so `human-review:<other>` silently waived the
+            // licence of whatever was being vendored.
+            if let Some(value) = license_override.as_deref() {
+                match value.strip_prefix("human-review:") {
+                    Some(target) if target == pkg => {}
+                    Some(target) => {
+                        eprintln!(
+                            "error: USAGE_ERROR: --license-override targets {target:?}, \
+                             but {pkg:?} is being added"
+                        );
+                        return ExitCode::from(2);
+                    }
+                    None => {
+                        eprintln!(
+                            "error: USAGE_ERROR: --license-override must be \
+                             human-review:<pkg>"
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
             }
             if allow_diamond.as_deref() == Some("vendor-all") {
                 // Phase 2 (SPEC §9.2): vendor-all = vendor EVERY version of
@@ -527,14 +647,7 @@ fn main() -> ExitCode {
                         return ExitCode::from(2);
                     }
                 };
-                let mut versions: Vec<String> = pl
-                    .packages
-                    .iter()
-                    .filter(|e| e.name == pkg)
-                    .map(|e| e.version.clone())
-                    .collect();
-                versions.sort();
-                versions.dedup();
+                let mut versions = pl.resolved_versions(pkg);
                 if versions.is_empty() {
                     versions.push(version.to_string());
                 }
@@ -560,7 +673,7 @@ fn main() -> ExitCode {
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
-                        ExitCode::from(1)
+                        ExitCode::from(error_exit_code(&e))
                     }
                 };
             }
@@ -590,12 +703,19 @@ fn main() -> ExitCode {
         Commands::Migrate => require_init(&root).and_then(|()| licenses::migrate(&root)),
         Commands::OsvFetch => {
             let now = std::env::var("OWN_NOW").ok();
-            match osv::osv_fetch(&root, osv::DEFAULT_OSV_URL, 500, now.as_deref()) {
+            match require_init(&root).and_then(|()| osv::osv_fetch_project(&root, now.as_deref())) {
                 Ok(c) => Ok(c),
                 Err(e) => Err(e),
             }
         }
         Commands::Slice { format, model } => {
+            if model
+                .as_deref()
+                .is_some_and(|model| !matches!(model, "esm" | "cjs"))
+            {
+                eprintln!("error: USAGE_ERROR: --model must be esm or cjs");
+                return ExitCode::from(2);
+            }
             if let Err(e) = validate_format(format).and_then(|()| require_init(&root)) {
                 eprintln!("error: {e}");
                 return ExitCode::from(2);
@@ -688,6 +808,8 @@ fn main() -> ExitCode {
             file,
             bundle,
             provenance,
+            source_uri,
+            source_tag,
             trusted_root,
             identity,
             issuer,
@@ -696,6 +818,8 @@ fn main() -> ExitCode {
                 file: file.clone(),
                 bundle: bundle.clone(),
                 provenance: provenance.clone(),
+                source_uri: source_uri.clone(),
+                source_tag: source_tag.clone(),
                 trusted_root: trusted_root.clone(),
                 identity: identity.clone(),
                 issuer: issuer.clone(),
@@ -732,6 +856,12 @@ fn main() -> ExitCode {
             allow_diamond,
             no_install,
         } => {
+            // Same precondition as `add` (§8.2): an uninitialized project must
+            // answer NOT_INITIALIZED, not a missing-file IO_ERROR.
+            if let Err(e) = require_init(&root) {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
             let (pkg, new_version) = update::split_spec_pub(spec);
             if pkg.is_empty() || new_version.is_empty() {
                 eprintln!("error: USAGE_ERROR: expected <pkg>@<new-version>");
@@ -860,7 +990,7 @@ fn main() -> ExitCode {
                         // decides the exit code must appear there too — an empty
                         // array beside `"status": "findings"` tells a consumer
                         // nothing failed. `data.alerts` keeps the full detail.
-                        let findings: Vec<serde_json::Value> = alerts
+                        let mut findings: Vec<serde_json::Value> = alerts
                             .iter()
                             .map(|a| {
                                 serde_json::json!({
@@ -880,20 +1010,28 @@ fn main() -> ExitCode {
                                 })
                             })
                             .collect();
+                        findings.extend(warnings.iter().map(|warning| {
+                            serde_json::json!({
+                                "code": warning.split([':', ' ']).next().unwrap_or("W_OSV"),
+                                "severity": "warning", "package": "", "path": "",
+                                "message": warning,
+                            })
+                        }));
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "schema_version": 1, "command": "check",
                                 "status": if code == 0 { "ok" } else { "findings" },
                                 "exit_code": code, "findings": findings,
-                                "data": { "alerts": data },
+                                "data": { "alerts": data, "warnings": warnings },
                             }))
                             .unwrap()
                         );
                     } else {
                         for a in &alerts {
                             println!(
-                                "CVE_ALERT E0: {} ({}) affects {}@{} fixed in {:?}",
+                                "CVE_ALERT {}: {} ({}) affects {}@{} fixed in {:?}",
+                                a.evidence_level,
                                 a.advisory_id,
                                 a.aliases.join(","),
                                 a.package,
@@ -945,13 +1083,24 @@ fn main() -> ExitCode {
                             println!("{note}");
                         }
                         for f in &findings {
-                            println!(
-                                "{}: [{}] {} {}",
-                                f.severity.to_uppercase(),
-                                f.code,
-                                f.package,
-                                f.path
-                            );
+                            if f.message.is_empty() {
+                                println!(
+                                    "{}: [{}] {} {}",
+                                    f.severity.to_uppercase(),
+                                    f.code,
+                                    f.package,
+                                    f.path
+                                );
+                            } else {
+                                println!(
+                                    "{}: [{}] {} {} — {}",
+                                    f.severity.to_uppercase(),
+                                    f.code,
+                                    f.package,
+                                    f.path,
+                                    f.message
+                                );
+                            }
                         }
                         if code == 0 {
                             println!("ok: no findings");
@@ -968,27 +1117,7 @@ fn main() -> ExitCode {
         Err(e) => {
             // error codes map to exit 2 (usage/precondition) or 1 (policy) per §8.0;
             // here: usage/precondition errors -> 2, known drift/policy -> 1
-            let code = match e.split(':').next().unwrap_or("") {
-                "ALREADY_INITIALIZED" | "NOT_INITIALIZED" | "USAGE_ERROR" | "LOCK_BUSY" => 2,
-                "VENDOR_PATH_IGNORED" => 1,
-                "PARSE_ERROR" | "IO_ERROR" | "LOCK_SCHEMA_UNSUPPORTED" => 2,
-                "ALREADY_VENDORED"
-                | "PACKAGE_NOT_VENDORED"
-                | "VERSION_NOT_FOUND"
-                | "VENDOR_DIR_EXISTS"
-                | "OVERRIDE_CONFLICT"
-                | "WORKTREE_DIRTY"
-                | "GIT_ERROR"
-                | "PNPM_UNSUPPORTED"
-                | "ECOSYSTEM_UNSUPPORTED"
-                | "PNPM_FAILED"
-                | "OSV_MISSING"
-                | "OSV_STALE"
-                | "OSV_INCOMPLETE"
-                | "LOCK_NOT_CANONICAL" => 2,
-                "NETWORK_ERROR" | "REGISTRY_UNAVAILABLE" | "TARBALL_REMOVED" | "GH_FAILED" => 3,
-                _ => 1,
-            };
+            let code = error_exit_code(&e);
             eprintln!("error: {e}");
             ExitCode::from(code)
         }

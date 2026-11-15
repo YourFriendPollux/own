@@ -23,10 +23,45 @@ pub fn evaluate(
     max_unpacked: u64,
 ) -> Eligibility {
     let mut w = Vec::new();
+    // A present but unreadable constraint is not an absent constraint. Keep
+    // the existing refusal codes so callers do not need a new error contract.
+    let invalid = |code| Eligibility {
+        eligible: false,
+        blocking: Some(code),
+        warnings: vec![],
+        license_expression: None,
+        unpacked_size: None,
+        has_bin: false,
+        install_scripts: vec![],
+    };
+    for (field, code) in [
+        ("dependencies", "dependencies"),
+        ("peerDependencies", "peer_dependencies"),
+        ("optionalDependencies", "optional_dependencies"),
+        ("scripts", "install_scripts"),
+    ] {
+        if let Some(value) = version_obj.get(field) {
+            if !value
+                .as_object()
+                .is_some_and(|map| map.values().all(Value::is_string))
+            {
+                return invalid(code);
+            }
+        }
+    }
+    if version_obj.get("gypfile").is_some_and(|v| !v.is_boolean()) {
+        return invalid("binding_gyp");
+    }
+    if version_obj
+        .get("directories")
+        .is_some_and(|v| !v.is_object())
+    {
+        return invalid("bin");
+    }
     // dependencies: empty or only vendored packages whose version satisfies the range
     if let Some(deps) = version_obj.get("dependencies").and_then(|d| d.as_object()) {
         for (name, range) in deps {
-            let range = range.as_str().unwrap_or("*");
+            let range = range.as_str().unwrap_or("");
             let ok = vendored
                 .iter()
                 .any(|(n, v)| n == name && crate::semver::satisfies(v, range));
@@ -48,7 +83,7 @@ pub fn evaluate(
         .and_then(|d| d.as_object())
     {
         for (name, range) in peers {
-            let range = range.as_str().unwrap_or("*");
+            let range = range.as_str().unwrap_or("");
             let ok = vendored
                 .iter()
                 .any(|(n, v)| n == name && crate::semver::satisfies(v, range));
@@ -81,10 +116,10 @@ pub fn evaluate(
             install_scripts: vec![],
         };
     }
-    let bundled = version_obj
-        .get("bundledDependencies")
-        .or_else(|| version_obj.get("bundleDependencies"));
-    if let Some(b) = bundled {
+    for b in ["bundledDependencies", "bundleDependencies"]
+        .iter()
+        .filter_map(|field| version_obj.get(*field))
+    {
         let empty = b.as_array().map(|a| a.is_empty()).unwrap_or(false);
         if !empty {
             return Eligibility {
@@ -267,5 +302,80 @@ fn normalize_legacy_licenses(v: Option<&Value>) -> Option<String> {
         None
     } else {
         Some(parts.join(" OR "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn package() -> Value {
+        json!({"version": "1.0.0", "license": "MIT", "dist": {"integrity": "sha512-AAAA"}})
+    }
+
+    #[test]
+    fn eligibility_rejects_unreadable_constraint_types() {
+        let vendored = vec![("runtime".into(), "1.2.5".into())];
+        for (field, code, bad) in [
+            ("dependencies", "dependencies", json!(["runtime"])),
+            ("dependencies", "dependencies", json!({"runtime": 123})),
+            ("dependencies", "dependencies", Value::Null),
+            ("peerDependencies", "peer_dependencies", json!(["runtime"])),
+            (
+                "peerDependencies",
+                "peer_dependencies",
+                json!({"runtime": false}),
+            ),
+            ("optionalDependencies", "optional_dependencies", json!([])),
+            ("scripts", "install_scripts", json!(["postinstall"])),
+            ("scripts", "install_scripts", json!({"prepare": []})),
+            ("scripts", "install_scripts", Value::Null),
+            ("gypfile", "binding_gyp", json!("false")),
+            ("directories", "bin", json!(["bin"])),
+        ] {
+            let mut value = package();
+            value[field] = bad;
+            let result = evaluate(&value, &vendored, u64::MAX);
+            assert!(!result.eligible, "{field}: {value}");
+            assert_eq!(result.blocking, Some(code), "{field}: {value}");
+        }
+        let mut value = package();
+        value["bundledDependencies"] = json!([]);
+        value["bundleDependencies"] = json!(["runtime"]);
+        assert_eq!(
+            evaluate(&value, &vendored, u64::MAX).blocking,
+            Some("bundled_dependencies")
+        );
+    }
+
+    #[test]
+    fn eligibility_keeps_valid_absent_and_empty_constraints() {
+        assert!(evaluate(&package(), &[], u64::MAX).eligible);
+        let mut value = package();
+        for field in [
+            "dependencies",
+            "peerDependencies",
+            "optionalDependencies",
+            "scripts",
+            "directories",
+        ] {
+            value[field] = json!({});
+        }
+        value["bundledDependencies"] = json!([]);
+        value["bundleDependencies"] = json!([]);
+        value["gypfile"] = json!(false);
+        assert!(evaluate(&value, &[], u64::MAX).eligible);
+        value["dependencies"] = json!({"runtime": "^1.0.0"});
+        value["peerDependencies"] = json!({"runtime": ">=1.0.0 <2.0.0"});
+        value["scripts"] = json!({"prepare": "build", "test": "test"});
+        let result = evaluate(&value, &[("runtime".into(), "1.2.5".into())], u64::MAX);
+        assert!(result.eligible);
+        assert_eq!(result.install_scripts, ["prepare"]);
+        value["scripts"]["postinstall"] = json!("build");
+        assert_eq!(
+            evaluate(&value, &[("runtime".into(), "1.2.5".into())], u64::MAX).blocking,
+            Some("install_scripts")
+        );
     }
 }

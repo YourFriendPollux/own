@@ -37,11 +37,8 @@ pub fn parse(path: &Path, src: &[u8]) -> ParseOutcome {
         return ParseOutcome::Failed;
     }
     match parser.parse(src, None) {
-        // F4 (amended): has_error() is too strict — the JS grammar reports
-        // ERROR nodes on valid large `export { ... }` lists. We only fail on
-        // MISSING nodes (grammar-level incompleteness), which genuinely
-        // indicate an unparseable prefix.
-        Some(t) if !root_has_missing(&t) => ParseOutcome::Ok(t),
+        // Grammar limitations are uncertainty, not permission to ignore ERROR.
+        Some(t) if !t.root_node().has_error() => ParseOutcome::Ok(t),
         _ => ParseOutcome::Failed, // partial parse ⇒ no proof (INV-4)
     }
 }
@@ -103,9 +100,21 @@ pub fn edges(tree: &Tree, src: &[u8]) -> AstEdges {
                 }
             }
             "identifier" => {
-                if n.utf8_text(src).unwrap_or("") == "eval" {
-                    // bare `eval` reference (direct or indirect)
+                let name = n.utf8_text(src).unwrap_or("");
+                if name == "eval" {
                     out.dynamic = true;
+                }
+                if name == "require" {
+                    // Only a direct call is understood. Every other reference
+                    // can escape (assignment, argument, return, destructuring,
+                    // .bind/.call, or a shadowing declaration).
+                    let direct_call = n.parent().is_some_and(|p| {
+                        p.kind() == "call_expression"
+                            && p.child_by_field_name("function") == Some(n)
+                    });
+                    if !direct_call {
+                        out.dynamic = true;
+                    }
                 }
             }
             // const r = require; r('./x') — aliased require ⇒ dynamic (INV-4)
@@ -135,21 +144,6 @@ pub fn edges(tree: &Tree, src: &[u8]) -> AstEdges {
         let _ = &mut cursor;
     }
     out
-}
-
-fn root_has_missing(tree: &Tree) -> bool {
-    let mut stack = vec![tree.root_node()];
-    while let Some(n) = stack.pop() {
-        if n.is_missing() {
-            return true;
-        }
-        for i in 0..n.child_count() {
-            if let Some(c) = n.child(i) {
-                stack.push(c);
-            }
-        }
-    }
-    false
 }
 
 fn string_literal(node: &Node, src: &[u8]) -> Option<String> {

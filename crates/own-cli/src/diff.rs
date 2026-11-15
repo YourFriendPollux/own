@@ -6,7 +6,7 @@
 //! (SPEC §8.2 signal list), which is what the tests assert.
 
 use own_core::lock::{parse_lock, Lock};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::path::Path;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -123,7 +123,7 @@ fn scan_js_signals(content: &str, path: &str) -> Vec<Signal> {
     out
 }
 
-fn scan_pkg_json(old: &str, new: &str, path: &str, out: &mut Vec<Signal>) {
+fn scan_pkg_json(old: &str, new: &str, path: &str, out: &mut Vec<Signal>) -> Result<(), String> {
     let fields = [
         "scripts",
         "dependencies",
@@ -138,8 +138,13 @@ fn scan_pkg_json(old: &str, new: &str, path: &str, out: &mut Vec<Signal>) {
         "exports",
         "type",
     ];
-    let o: Value = serde_json::from_str(old).unwrap_or(json!({}));
-    let n: Value = serde_json::from_str(new).unwrap_or(json!({}));
+    let o: Value =
+        serde_json::from_str(old).map_err(|e| format!("PARSE_ERROR: old {path}: {e}"))?;
+    let n: Value =
+        serde_json::from_str(new).map_err(|e| format!("PARSE_ERROR: new {path}: {e}"))?;
+    if !o.is_object() || !n.is_object() {
+        return Err(format!("PARSE_ERROR: {path}: expected an object"));
+    }
     for f in fields {
         if o.get(f) != n.get(f) {
             out.push(Signal {
@@ -150,41 +155,70 @@ fn scan_pkg_json(old: &str, new: &str, path: &str, out: &mut Vec<Signal>) {
             });
         }
     }
+    Ok(())
 }
 
-fn list_files(root: &Path) -> Vec<(String, String, u64)> {
+fn list_files(root: &Path) -> Result<Vec<(String, String, u64)>, String> {
     let mut out = Vec::new();
-    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, String, u64)>) {
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, base, out);
-                } else if p.is_file() {
-                    if let Ok(rel) = p.strip_prefix(base) {
-                        let rel = rel.to_string_lossy().replace('\\', "/");
-                        let h = own_core::sha256_hex(&std::fs::read(&p).unwrap_or_default());
-                        let sz = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                        out.push((rel, h, sz));
-                    }
-                }
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, String, u64)>) -> Result<(), String> {
+        let metadata = std::fs::symlink_metadata(dir)
+            .map_err(|e| format!("IO_ERROR: {}: {e}", dir.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!("IO_ERROR: {}: unsafe directory", dir.display()));
+        }
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("IO_ERROR: {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("IO_ERROR: {}: {e}", dir.display()))?;
+            let p = entry.path();
+            let metadata = std::fs::symlink_metadata(&p)
+                .map_err(|e| format!("IO_ERROR: {}: {e}", p.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!("IO_ERROR: {}: symlink refused", p.display()));
+            }
+            if metadata.is_dir() {
+                walk(&p, base, out)?;
+            } else if metadata.is_file() {
+                let rel = p
+                    .strip_prefix(base)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .ok_or_else(|| format!("IO_ERROR: {}: invalid path", p.display()))?;
+                let bytes =
+                    std::fs::read(&p).map_err(|e| format!("IO_ERROR: {}: {e}", p.display()))?;
+                out.push((
+                    rel.replace('\\', "/"),
+                    own_core::sha256_hex(&bytes),
+                    bytes.len() as u64,
+                ));
+            } else {
+                return Err(format!("IO_ERROR: {}: special file refused", p.display()));
             }
         }
+        Ok(())
     }
-    walk(root, root, &mut out);
+    walk(root, root, &mut out)?;
     out.sort();
-    out
+    Ok(out)
 }
 
 pub fn diff_dirs(root: &Path, old_dir: &str, new_dir: &str) -> Result<DiffReport, String> {
-    let old = list_files(&root.join(old_dir));
-    let new = list_files(&root.join(new_dir));
+    let old_root = own_core::path_safety::project_path(root, old_dir)
+        .map_err(|e| format!("IO_ERROR: {old_dir}: {e}"))?;
+    let new_root = own_core::path_safety::project_path(root, new_dir)
+        .map_err(|e| format!("IO_ERROR: {new_dir}: {e}"))?;
+    let old = list_files(&old_root)?;
+    let new = list_files(&new_root)?;
     let old_map: std::collections::HashMap<&str, &String> =
         old.iter().map(|(p, h, _)| (p.as_str(), h)).collect();
     let new_map: std::collections::HashMap<&str, &String> =
         new.iter().map(|(p, h, _)| (p.as_str(), h)).collect();
     let mut added: Vec<String> = Vec::new();
-    let mut removed: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = old
+        .iter()
+        .filter(|(p, _, _)| !new_map.contains_key(p.as_str()))
+        .map(|(p, _, _)| p.clone())
+        .collect();
     let mut modified: Vec<String> = Vec::new();
     let mut renamed: Vec<(String, String)> = Vec::new();
     for (p, h, _) in &new {
@@ -206,11 +240,6 @@ pub fn diff_dirs(root: &Path, old_dir: &str, new_dir: &str) -> Result<DiffReport
             _ => {}
         }
     }
-    for (p, _, _) in &old {
-        if !new_map.contains_key(p.as_str()) {
-            removed.push(p.clone());
-        }
-    }
     // signals on added/modified JS + risky files + package.json
     let mut signals = Vec::new();
     let changed: Vec<&String> = added.iter().chain(modified.iter()).collect();
@@ -226,24 +255,30 @@ pub fn diff_dirs(root: &Path, old_dir: &str, new_dir: &str) -> Result<DiffReport
             continue;
         }
         if is_js(p) {
-            if let Ok(content) = std::fs::read_to_string(&full) {
-                if content.len() <= 2 * 1_048_576 {
-                    signals.extend(scan_js_signals(&content, p));
-                } else {
-                    signals.push(Signal {
-                        kind: "too_large_to_parse".into(),
-                        name: "parse".into(),
-                        path: p.clone(),
-                        line: 0,
-                    });
-                }
+            let content = std::fs::read_to_string(&full)
+                .map_err(|e| format!("IO_ERROR: {}: {e}", full.display()))?;
+            if content.len() <= 2 * 1_048_576 {
+                signals.extend(scan_js_signals(&content, p));
+            } else {
+                signals.push(Signal {
+                    kind: "too_large_to_parse".into(),
+                    name: "parse".into(),
+                    path: p.clone(),
+                    line: 0,
+                });
             }
         }
         if p == "package.json" {
-            let old_content =
-                std::fs::read_to_string(root.join(old_dir).join(p)).unwrap_or_default();
-            let new_content = std::fs::read_to_string(&full).unwrap_or_default();
-            scan_pkg_json(&old_content, &new_content, p, &mut signals);
+            let old_content = if old_map.contains_key(p.as_str()) {
+                let old_path = old_root.join(p);
+                std::fs::read_to_string(&old_path)
+                    .map_err(|e| format!("IO_ERROR: {}: {e}", old_path.display()))?
+            } else {
+                "{}".to_string()
+            };
+            let new_content = std::fs::read_to_string(&full)
+                .map_err(|e| format!("IO_ERROR: {}: {e}", full.display()))?;
+            scan_pkg_json(&old_content, &new_content, p, &mut signals)?;
         }
     }
     signals.sort_by(|a, b| {
@@ -290,6 +325,155 @@ pub fn split_spec(spec: &str) -> (String, String) {
 mod tests {
     use super::*;
 
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "own-diff-{}-{}",
+                std::process::id(),
+                NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(root.join("old")).unwrap();
+            std::fs::create_dir_all(root.join("new")).unwrap();
+            Self(root)
+        }
+
+        fn write(&self, path: &str, bytes: impl AsRef<[u8]>) {
+            std::fs::write(self.0.join(path), bytes).unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn diff_renames_identical_files_one_to_one_deterministically() {
+        let f = Fixture::new();
+        f.write("old/b.js", "same bytes");
+        f.write("old/a.js", "same bytes");
+        f.write("new/z.js", "same bytes");
+        f.write("new/y.js", "same bytes");
+        f.write("new/x.js", "same bytes");
+        let report = diff_dirs(&f.0, "old", "new").unwrap();
+        assert_eq!(
+            report.renamed,
+            vec![
+                ("a.js".into(), "x.js".into()),
+                ("b.js".into(), "y.js".into())
+            ]
+        );
+        assert_eq!(report.added, vec!["z.js"]);
+        assert!(report.removed.is_empty());
+        assert!(report.modified.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_io_error_never_reports_missing_unreadable_or_unsafe_trees_as_clean() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let mut masked = Vec::new();
+        for case in [
+            "missing",
+            "file_root",
+            "unreadable_file",
+            "unreadable_dir",
+            "dangling",
+            "outside",
+            "special",
+            "escape",
+        ] {
+            let f = Fixture::new();
+            let mut socket = None;
+            let mut old = "old";
+            match case {
+                "missing" => std::fs::remove_dir(f.0.join("old")).unwrap(),
+                "file_root" => {
+                    std::fs::remove_dir(f.0.join("old")).unwrap();
+                    f.write("old", "not a directory");
+                }
+                "unreadable_file" | "unreadable_dir" => {
+                    if unsafe { libc::geteuid() } == 0 {
+                        continue;
+                    }
+                    f.write("old/a.txt", "must not hash empty bytes");
+                    let path = if case == "unreadable_file" {
+                        "old/a.txt"
+                    } else {
+                        "old"
+                    };
+                    std::fs::set_permissions(f.0.join(path), std::fs::Permissions::from_mode(0o0))
+                        .unwrap();
+                }
+                "dangling" => symlink("absent", f.0.join("old/link")).unwrap(),
+                "outside" => {
+                    f.write("secret", "outside tree");
+                    symlink("../secret", f.0.join("old/link")).unwrap();
+                }
+                "special" => {
+                    socket = Some(
+                        std::os::unix::net::UnixListener::bind(f.0.join("old/socket")).unwrap(),
+                    );
+                }
+                "escape" => old = "../",
+                _ => unreachable!(),
+            }
+            // Avoid traversing the temp directory in the unfixed implementation.
+            let result = if case == "escape" {
+                diff_dirs(&f.0, "old/../new", "new")
+            } else {
+                diff_dirs(&f.0, old, "new")
+            };
+            if !matches!(&result, Err(e) if e.starts_with("IO_ERROR:")) {
+                masked.push(format!("{case}: {result:?}"));
+            }
+            if case == "unreadable_dir" {
+                std::fs::set_permissions(f.0.join("old"), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            drop(socket);
+        }
+        assert!(masked.is_empty(), "masked errors: {masked:#?}");
+    }
+
+    #[test]
+    fn diff_io_error_invalid_utf8_js_cannot_silently_skip_risk_scan() {
+        let f = Fixture::new();
+        f.write("new/a.js", b"eval(code);\xff");
+        let result = diff_dirs(&f.0, "old", "new");
+        assert!(
+            matches!(&result, Err(e) if e.starts_with("IO_ERROR:") && e.contains("a.js")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn diff_parse_error_malformed_package_json_is_not_an_empty_object() {
+        let mut masked = Vec::new();
+        for (old, new) in [
+            (Some("broken"), "{}"),
+            (Some("{}"), "broken"),
+            (None, "[]"),
+            (None, "broken"),
+        ] {
+            let f = Fixture::new();
+            if let Some(old) = old {
+                f.write("old/package.json", old);
+            }
+            f.write("new/package.json", new);
+            let result = diff_dirs(&f.0, "old", "new");
+            if !matches!(&result, Err(e) if e.starts_with("PARSE_ERROR:") && e.contains("package.json"))
+            {
+                masked.push(format!("{old:?} -> {new}: {result:?}"));
+            }
+        }
+        assert!(masked.is_empty(), "masked errors: {masked:#?}");
+    }
+
     #[test]
     fn detects_require_fs_and_eval() {
         let sigs = scan_js_signals("const fs = require(\"fs\");\neval(code);\n", "a.js");
@@ -313,7 +497,8 @@ mod tests {
             r#"{"scripts":{"postinstall":"x"}}"#,
             "package.json",
             &mut sigs,
-        );
+        )
+        .unwrap();
         assert!(sigs
             .iter()
             .any(|s| s.kind == "package_json" && s.name == "scripts"));

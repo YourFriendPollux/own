@@ -20,15 +20,15 @@ pub enum E2Outcome {
     Inconclusive,
 }
 
-/// The node require-hook source. Records every resolved module filename into
-/// the file named by OWN_E2_TRACE.
-// E2-01 (deepseek review): trace goes to STDOUT with an `E2T ` prefix — the
-// traced code cannot rewrite the trace (no fs-write grant at all). Attacker
-// can only ADD lines, and added lines only create hits (safe direction).
+/// The node require-hook source. Records resolved module filenames on stdout.
+// Capture the writer before package code runs; no filesystem-write grant is
+// needed. Additional trace paths can only add potential vulnerable-file hits.
 const HOOK: &str = r#"
 const Module = require('module');
 const fs = require('fs');
-const emit = (p) => { try { process.stdout.write('E2T ' + p + '\n'); } catch (e) {} };
+const writeTrace = process.stdout.write.bind(process.stdout);
+const resolvePath = require('path').resolve.bind(require('path'));
+const emit = (p) => { writeTrace('\nE2T ' + p + '\n'); };
 const orig = Module._resolveFilename;
 Module._resolveFilename = function (request, parent, ...rest) {
   const r = orig.call(this, request, parent, ...rest);
@@ -39,36 +39,50 @@ Module._resolveFilename = function (request, parent, ...rest) {
 // carry the vulnerable payload without going through require().
 const origRead = fs.readFileSync;
 fs.readFileSync = function (p, ...rest) {
-  try { emit(require('path').resolve(String(p))); } catch (e) {}
+  try { emit(resolvePath(String(p))); } catch (e) {}
   return origRead.call(this, p, ...rest);
 };
 const origReadAsync = fs.readFile;
 fs.readFile = function (p, ...rest) {
-  try { emit(require('path').resolve(String(p))); } catch (e) {}
+  try { emit(resolvePath(String(p))); } catch (e) {}
   return origReadAsync.call(this, p, ...rest);
 };
 if (fs.promises && fs.promises.readFile) {
   const origP = fs.promises.readFile;
   fs.promises.readFile = function (p, ...rest) {
-    try { emit(require('path').resolve(String(p))); } catch (e) {}
+    try { emit(resolvePath(String(p))); } catch (e) {}
     return origP.call(this, p, ...rest);
   };
 }
 const origCRS = fs.createReadStream;
 fs.createReadStream = function (p, ...rest) {
-  try { emit(require('path').resolve(String(p))); } catch (e) {}
+  try { emit(resolvePath(String(p))); } catch (e) {}
   return origCRS.call(this, p, ...rest);
 };
+// Hook removal is not a successful trace. Freeze the instrumentation surfaces.
+for (const [obj, key] of [[Module, '_resolveFilename'], [fs, 'readFileSync'],
+  [fs, 'readFile'], [fs, 'createReadStream'], [fs.promises, 'readFile']]) {
+  Object.defineProperty(obj, key, {value: obj[key], writable: false, configurable: false});
+}
+// A package-controlled early exit is incomplete, even if stdout forges the
+// completion marker. Preserve a nonzero native exit that cannot be replaced.
+const failIncomplete = process.reallyExit.bind(process, 1);
+for (const key of ['exit', 'reallyExit']) {
+  Object.defineProperty(process, key, {value: failIncomplete, writable: false, configurable: false});
+}
+// ESM named imports must see the same frozen process/fs instrumentation.
+Module.syncBuiltinESMExports();
 "#;
 
 /// ESM loader hook (registered with `--import`): records every resolved ESM
 /// module URL so `import` edges are traced too (F2).
 const ESM_HOOK: &str = r#"
 // E2-03 (deepseek): ESM resolve hook via registerHooks (node >= 22.15).
-// Writes a marker line `E2T-ESM-OK` on successful registration — if absent
+// Writes a marker line `E2T ESM-OK` on successful registration — if absent
 // from the output, the whole ESM graph is untraced ⇒ caller must treat as
 // Inconclusive.
-const emit = (p) => { try { process.stdout.write('E2T ' + p + '\n'); } catch (e) {} };
+const writeTrace = process.stdout.write.bind(process.stdout);
+const emit = (p) => { writeTrace('\nE2T ' + p + '\n'); };
 try {
   const { registerHooks } = await import('node:module');
   registerHooks({
@@ -86,12 +100,53 @@ try {
 } catch (e) { /* older node: no ESM trace => caller sees no ESM-OK marker */ }
 "#;
 
+/// Resolve Node against the caller's PATH before clearing the child environment.
+/// Canonicalization also anchors relative PATH entries before changing cwd.
+fn node_from_incoming_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let name = if cfg!(windows) { "node.exe" } else { "node" };
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(name);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        if let Ok(absolute) = std::fs::canonicalize(candidate) {
+            return Some(absolute);
+        }
+    }
+    None
+}
+
 /// Execute the package entry under node with the trace hook.
 /// `entry` = absolute path to the entry file. Timeout 10s.
 pub fn trace_loaded_files(pkg_root: &Path, entry: &Path) -> E2Outcome {
+    let Ok(canonical_root) = std::fs::canonicalize(pkg_root) else {
+        return E2Outcome::Inconclusive;
+    };
+    let Ok(canonical_entry) = std::fs::canonicalize(entry) else {
+        return E2Outcome::Inconclusive;
+    };
+    let pkg_root = canonical_root.as_path();
+    let entry = canonical_entry.as_path();
+    if !entry.starts_with(pkg_root) || pkg_root.to_string_lossy().contains('*') {
+        return E2Outcome::Inconclusive;
+    }
     if !entry.is_file() {
         return E2Outcome::Inconclusive;
     }
+    let Some(node) = node_from_incoming_path() else {
+        return E2Outcome::Inconclusive;
+    };
     let tmp = match tempfile::tempdir() {
         Ok(t) => t,
         Err(_) => return E2Outcome::Inconclusive,
@@ -108,24 +163,23 @@ pub fn trace_loaded_files(pkg_root: &Path, entry: &Path) -> E2Outcome {
     // Module._resolveFilename hook; ESM imports are traced via the
     // --import ESM hook below.
     let runner_src = format!(
-        "(async () => {{ try {{ require({:?}); }} catch (e) {{ if (e && (e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_REQUIRE_ASYNC_MODULE')) {{ await import({:?}); }} else throw e; }} }})();\n",
+        "const writeTrace = process.stdout.write.bind(process.stdout); (async () => {{ try {{ require({:?}); }} catch (e) {{ if (e && (e.code === 'ERR_REQUIRE_ESM' || e.code === 'ERR_REQUIRE_ASYNC_MODULE')) {{ await import({:?}); }} else throw e; }} writeTrace('\\nE2T RUN-COMPLETE\\n'); }})();\n",
         entry_str, entry_str
     );
     if std::fs::write(&runner, runner_src).is_err() {
         return E2Outcome::Inconclusive;
     }
     // F4: bounded execution — 10s timeout, kill on expiry ⇒ Inconclusive
-    // E2-01 (deepseek review): sandboxed execution — node permission model, no
-    // addons, NO fs-write at all (trace goes over stdout with `E2T ` prefix,
-    // so traced code cannot forge/erase it), env cleared. Network blocked by
-    // --permission (no --allow-net). read=/ is required because node's
-    // realpathSync during module resolution denies narrower grants (verified
-    // on node v26).
-    let mut cmd = Command::new("node");
+    // The selected Node runs with a cleared environment and a fixed child PATH.
+    // Reads are limited to the package and temporary driver; never grant read=/.
+    // --permission leaves network, fs-write, workers and child processes denied;
+    // --no-addons denies native addons. Unsupported permissions fail closed.
+    let mut cmd = Command::new(node);
     cmd.arg("--max-old-space-size=256") // E2-F3: cap child memory too
         .arg("--permission")
         .arg("--no-addons")
-        .arg("--allow-fs-read=/")
+        .arg(format!("--allow-fs-read={}", pkg_root.display()))
+        .arg(format!("--allow-fs-read={}", tmp.path().display()))
         .arg("--require")
         .arg(&hook)
         .arg("--import")
@@ -141,38 +195,70 @@ pub fn trace_loaded_files(pkg_root: &Path, entry: &Path) -> E2Outcome {
         Ok(c) => c,
         Err(_) => return E2Outcome::Inconclusive,
     };
+    // Drain concurrently, retaining at most cap+1 bytes. Exceeding the cap
+    // terminates the probe, rather than accepting a truncated trace.
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return E2Outcome::Inconclusive;
+    };
+    let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_overflow = overflow.clone();
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let result = stdout.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes);
+        reader_overflow.store(
+            bytes.len() > 8 * 1024 * 1024,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        result.map(|_| bytes)
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let status;
     loop {
         match child.try_wait() {
             Ok(Some(st)) => {
-                status = st;
+                status = Some(st);
                 break;
             }
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                if std::time::Instant::now() >= deadline
+                    || overflow.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return E2Outcome::Inconclusive; // timeout ⇒ no proof
+                    status = None;
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(_) => return E2Outcome::Inconclusive,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                status = None;
+                break;
+            }
         }
     }
     // E2-02 (deepseek): nonzero exit ⇒ Inconclusive (entry threw before
     // loading everything — proven false E2 otherwise).
-    if !status.success() {
+    let Ok(Ok(bytes)) = reader.join() else {
+        return E2Outcome::Inconclusive;
+    };
+    if status.is_none_or(|s| !s.success()) || overflow.load(std::sync::atomic::Ordering::Relaxed) {
         return E2Outcome::Inconclusive;
     }
-    // E2-F3 (apinex): cap the trace read at 8MB — a flooding entry cannot OOM own
-    let mut buf = String::new();
-    if let Some(so) = child.stdout.take() {
-        use std::io::Read;
-        let _ = so.take(8 * 1024 * 1024).read_to_string(&mut buf);
+    let Ok(buf) = String::from_utf8(bytes) else {
+        return E2Outcome::Inconclusive;
+    };
+    // Both instrumentation and runner must complete, even for a CJS entry:
+    // CJS can import ESM without leaving an `import(` string in stdout.
+    if !buf.lines().any(|line| line == "E2T RUN-COMPLETE")
+        || !buf.lines().any(|line| line == "E2T ESM-OK")
+    {
+        return E2Outcome::Inconclusive;
     }
-    // E2-03 (deepseek): the ESM hook must have registered — look for the marker.
-    let esm_ok = buf.lines().any(|l| l.trim() == "E2T ESM-OK");
     let mut set = HashSet::new();
     for line in buf.lines() {
         if let Some(rest) = line.trim().strip_prefix("E2T ") {
@@ -182,13 +268,7 @@ pub fn trace_loaded_files(pkg_root: &Path, entry: &Path) -> E2Outcome {
             }
         }
     }
-    // If the package entry is ESM (or any import happened) and the ESM hook did
-    // not register, the import graph is untraced ⇒ no proof.
-    let entry_is_esm = entry.extension().and_then(|e| e.to_str()) == Some("mjs")
-        || entry.to_string_lossy().ends_with(".mjs");
-    if (entry_is_esm || buf.contains("import(")) && !esm_ok {
-        return E2Outcome::Inconclusive;
-    }
+
     if set.is_empty() {
         return E2Outcome::Inconclusive;
     }
@@ -209,33 +289,9 @@ pub fn evidence_level_e2(
     if crate::e1::reachable_files(pkg_root, crate::ConsumerModel::Esm).is_none() {
         return ("E0", None);
     }
-    // vulnerable files from the advisory (same extraction as E1)
-    let mut vuln_files: Vec<String> = Vec::new();
-    if let Some(affected) = advisory.get("affected").and_then(|a| a.as_array()) {
-        for aff in affected {
-            for key in ["database_specific", "ecosystem_specific"] {
-                if let Some(ds) = aff.get(key) {
-                    for fkey in ["vulnerable_files", "files", "paths"] {
-                        if let Some(arr) = ds.get(fkey).and_then(|v| v.as_array()) {
-                            for f in arr {
-                                if let Some(s) = f.as_str() {
-                                    vuln_files.push(
-                                        s.trim_start_matches("package/")
-                                            .trim_start_matches("./")
-                                            .trim_start_matches('/')
-                                            .replace('\\', "/"),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if vuln_files.is_empty() {
-        return ("E0", None); // no file info ⇒ no proof at any level
-    }
+    let Some(vuln_files) = crate::e1::vulnerable_files(advisory) else {
+        return ("E0", None); // incomplete file info ⇒ no proof
+    };
     match trace_loaded_files(pkg_root, entry) {
         E2Outcome::Inconclusive => ("E0", None),
         E2Outcome::Loaded(loaded) => {

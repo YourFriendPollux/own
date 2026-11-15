@@ -1,14 +1,14 @@
 //! JCS (RFC 8785) canonicalization, implemented internally per SPEC §12 / ADR 0003.
 //!
-//! Scope for `own`: strings, integers (i64/u64), arrays, objects, bools, null.
-//! Floats are rejected (SPEC §7.3: only integers and strings enter the digest).
+//! Own digests use strings and integers, but this canonicalizer also supports
+//! finite f64 values with ECMAScript notation for the RFC 8785 vectors.
 
 use serde_json::Value;
 
 /// Canonicalize a JSON value per RFC 8785.
 /// Property names are sorted by UTF-16 code units (ascending, unsigned).
-/// Strings are escaped per §3.2.2.2. Numbers: only integers supported here;
-/// floats return an error (not needed by own and keeps INV-10 simple).
+/// Strings are escaped per §3.2.2.2. Finite floats use ECMAScript notation;
+/// non-finite numbers return an error.
 pub fn canonicalize(value: &Value) -> Result<String, String> {
     let mut out = String::new();
     write_value(value, &mut out)?;
@@ -20,17 +20,13 @@ fn write_value(v: &Value, out: &mut String) -> Result<(), String> {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                out.push_str(&i.to_string());
-            } else if let Some(u) = n.as_u64() {
-                out.push_str(&u.to_string());
-            } else if let Some(f) = n.as_f64() {
-                out.push_str(&es6_format_f64(f)?);
-            } else {
-                // arbitrary_precision: number not representable as i64/u64/f64 —
-                // emit the raw literal digits
-                out.push_str(n.to_string().trim_matches('"'));
-            }
+            // RFC 8785 uses ECMAScript binary64 semantics for every number,
+            // including integer JSON representations. Never emit an unchecked
+            // arbitrary-precision literal that bypasses the finite-number rule.
+            let number = n
+                .as_f64()
+                .ok_or("JCS: number is not representable as binary64")?;
+            out.push_str(&es6_format_f64(number)?);
         }
         Value::String(s) => write_string(s, out),
         Value::Array(arr) => {
@@ -64,9 +60,7 @@ fn write_value(v: &Value, out: &mut String) -> Result<(), String> {
 /// Sort comparison per RFC 8785 §3.2.3: property names compared as arrays of
 /// UTF-16 code units, unsigned, lexicographic; shorter precedes longer on prefix.
 fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let au: Vec<u16> = a.encode_utf16().collect();
-    let bu: Vec<u16> = b.encode_utf16().collect();
-    au.cmp(&bu)
+    a.encode_utf16().cmp(b.encode_utf16())
 }
 
 /// ECMAScript Number::toString (ECMA-262 §7.1.12.1) for f64, as required by
@@ -82,7 +76,8 @@ fn es6_format_f64(f: f64) -> Result<String, String> {
     // ryu's Buffer::format gives the shortest round-trip decimal, in plain or
     // scientific style ("56.0", "333333333.3333333", "1e30", "0.002").
     let mut buf = ryu::Buffer::new();
-    let s = buf.format(f);
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    let s = buf.format(f.abs());
     let (digits_raw, n) = match s.split_once(['e', 'E']) {
         Some((m, e)) => {
             let exp: i32 = e.parse().map_err(|_| "bad exponent")?;
@@ -110,25 +105,32 @@ fn es6_format_f64(f: f64) -> Result<String, String> {
         };
         let e = n - 1;
         Ok(format!(
-            "{}e{}{}",
+            "{}{}e{}{}",
+            sign,
             mantissa,
             if e >= 0 { "+" } else { "-" },
             e.abs()
         ))
     } else if n > k {
         // integral value with trailing zeros: digits + (n-k) zeros, no decimal point
-        Ok(format!("{}{}", digits, "0".repeat((n - k) as usize)))
+        Ok(format!(
+            "{}{}{}",
+            sign,
+            digits,
+            "0".repeat((n - k) as usize)
+        ))
     } else if n == k {
         // integral value, exactly k digits
-        Ok(digits.clone())
+        Ok(format!("{sign}{digits}"))
     } else if n > 0 {
         Ok(format!(
-            "{}.{}",
+            "{}{}.{}",
+            sign,
             &digits[..n as usize],
             &digits[n as usize..]
         ))
     } else {
-        Ok(format!("0.{}{}", "0".repeat((-n) as usize), digits))
+        Ok(format!("{}0.{}{}", sign, "0".repeat((-n) as usize), digits))
     }
 }
 
@@ -157,6 +159,44 @@ fn write_string(s: &str, out: &mut String) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn jcs_integers_follow_ecmascript_binary64_inv10() {
+        for (input, expected) in [
+            ("9007199254740993", "9007199254740992"),
+            ("-9007199254740993", "-9007199254740992"),
+            ("18446744073709551615", "18446744073709552000"),
+        ] {
+            let value: Value = serde_json::from_str(input).unwrap();
+            assert_eq!(canonicalize(&value).unwrap(), expected);
+        }
+        if let Ok(value) = serde_json::from_str::<Value>("1e999") {
+            assert!(canonicalize(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn jcs_negative_floats_keep_sign_inv10() {
+        for (input, expected) in [
+            ("-1.5", "-1.5"),
+            ("-0.002", "-0.002"),
+            ("-1e-7", "-1e-7"),
+            ("-1e-6", "-0.000001"),
+            ("-1e21", "-1e+21"),
+            ("-333333333.3333333", "-333333333.3333333"),
+            ("-0.0", "0"),
+            ("0.002", "0.002"),
+        ] {
+            let value: Value = serde_json::from_str(input).unwrap();
+            assert_eq!(canonicalize(&value).unwrap(), expected, "{input}");
+        }
+        let negative = canonicalize(&serde_json::json!({"value": -1.5})).unwrap();
+        let positive = canonicalize(&serde_json::json!({"value": 1.5})).unwrap();
+        assert_ne!(
+            crate::sha256_hex(negative.as_bytes()),
+            crate::sha256_hex(positive.as_bytes())
+        );
+    }
 
     /// Official RFC 8785 reference vectors (cyberphone/json-canonicalization testdata).
     #[test]

@@ -2,6 +2,7 @@ pub mod canonical;
 pub mod config;
 pub mod jcs;
 pub mod lock;
+pub mod path_safety;
 pub mod toml_write;
 pub mod txn;
 pub mod verify;

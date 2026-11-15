@@ -1,256 +1,92 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Notable user-facing changes follow
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Unreleased entries are
+local source changes, not evidence that a signed release has been published.
 
 ## [Unreleased]
 
 ### Added
-- **Corpus rebuilt from measured data, J1 eligibility measured**
-  (`scripts/corpus-build.py`, `scripts/e2e-pnpm.sh`): the committed corpus was
-  250 `name@version` lines with no header, so `day1.sh`'s `npm view
-  "$pkg@latest"` skipped every entry and the acceptance line counted 0 packages.
-  The corpus is now 250 bare names ranked by measured weekly downloads
-  (`api.npmjs.org`), with a dated header naming the ranking source, and
-  `corpus-build.py` regenerates it and measures §9.1 eligibility with the same
-  criteria as `own-policy`. Running `day1.sh` step 1 verbatim on it reports
-  **106 / 250 eligible** (0 skipped, threshold 15) — GO; the packument criteria
-  alone give 122 / 250. A second run reproduced the same set, the same two
-  numbers. `e2e-pnpm.sh` drives the real registry end to end on pnpm 9.15.9 and
-  10.34.9: install, `--frozen-lockfile`, `require`, byte-identical installed
-  copy, `verify --installed`, `DRIFT_MODIFIED`/`DRIFT_EXTRA` on tamper, clean
-  again after restore, and `own-verify` agreement. It also pins the lifecycle
-  question: pnpm 9 runs a `file:` dependency's `postinstall` (2
-  `pnpm:lifecycle` events, detector satisfied) and pnpm 10 ignores build
-  scripts (0 events).
-- **Provenance detection (§8.1 step 4, partial)**: `own add` and `own update`
-  now evaluate what the registry advertises through a single, tested
-  `evaluate_provenance` (npm attestations, registry signatures) and report it as
-  `W_PROVENANCE_UNVERIFIED` instead of silently dropping the information. The
-  lock keeps `provenance_level = "integrity-only"`: `attested` and
-  `registry-signed` are never written without the matching verification
-  (INV-7). 4 unit tests in `own-cli`.
-- **CLI integration tests**: `crates/own-cli/tests/cli.rs`, 28 offline tests
-  driving the real binary — `init` (layout, `.gitignore`/`.gitattributes`,
-  transaction lock, `ALREADY_INITIALIZED`, `--root`), `verify`
-  (clean/deterministic, drift codes, `--installed` incl. `DRIFT_INSTALLED`,
-  `--format json`, unknown `--format`), uninitialized-directory preconditions,
-  `ci`, `licenses` (incl. the `Hash` column), `policy-sync`, `migrate`, `check`
-  (`OSV_MISSING`), `slice`, `sbom` (CycloneDX/OpenVEX, stdout and `--output`,
-  determinism), `eject`, JSON envelope and §8.0 exit codes.
-- `.gitignore` now ignores `/fuzz/target/` (cargo-fuzz has its own workspace;
-  those artifacts had been committed before the history rewrite).
+
+- Shared installed-file verification in `own verify --installed` and
+  `own-verify --installed`, including aliases, file dependencies and peer contexts.
+- Transactional multi-version `vendor-all`, version-scoped overrides and safe
+  extension of previously owned versions.
+- Conservative E1/E2 reachability evidence and CycloneDX/OpenVEX generation.
+- Explicit detection of advertised npm provenance without upgrading
+  `provenance_level` beyond `integrity-only`.
+- Regression coverage for parser refusals, real lock shapes, integrity anchors,
+  transaction recovery, CI output, adoption and release/installer behavior.
 
 ### Fixed
-- **Installer asked for a provenance asset the release never publishes**: step 5
-  fetched `<asset>.intoto.jsonl`, but the SLSA generic generator signs one
-  attestation for all subjects and uploads `multiple.intoto.jsonl`. It also ran
-  its first verification against a `.bundle` that had not been downloaded yet,
-  behind `2>/dev/null`, in an `a || b && c` chain that ran the second
-  verification even when the first succeeded. Now the attestation and its bundle
-  are fetched explicitly (`OWN_PROVENANCE_ASSET` overrides the name), a missing
-  asset stops the installer with a message naming it, and the verification runs
-  once with its errors visible. Still unexercised: no release and no cosign exist
-  here.
-- **`verify-signature` said "file not readable" without saying which**: it now
-  names the missing path, and has its first tests (missing bundle names the path;
-  no cosign on `PATH` is `IO_ERROR: cosign binary not found`, both exit 2).
-- **`add --ecosystem pypi` failed with a pnpm-lock error instead of a refusal**:
-  the flag is documented as a Phase 2 surface, but nothing implemented it, so the
-  npm path ran and died on `IO_ERROR: pnpm-lock.yaml: No such file or directory`
-  — a file a Python package never has. `add` now returns `ECOSYSTEM_UNSUPPORTED`
-  (exit 2, "pypi vendoring is a Phase 2 surface and is not implemented") before
-  reading any lock; test `add_refuses_pypi_with_a_clear_code_inv4`.
-- **`check --format json` hid its own failure**: the envelope said
-  `"status": "findings"` with `"exit_code": 1` while `findings` was a hardcoded
-  empty array — everything lived in `data.alerts`, so any consumer reading the
-  §8.0 public list saw a failing run with nothing in it. Each alert is now also a
-  finding (`CVE_ALERT`, `error`, `<pkg>@<version>`, message naming the advisory
-  and the fixed versions), and `data.alerts` keeps the full detail. Found by
-  running `own check` against the real OSV dump for lodash 4.17.20 and reading
-  the JSON; test `check_json_lists_every_alert_as_a_finding`.
-- **Git-ignore probe says what to do outside a repository (`add` step 5, `ci`)**:
-  a directory that is not a work tree made `git check-ignore` exit 128 and the
-  command failed with git's raw "fatal: not a git repository", which no longer
-  says what to fix now that `git >= 2.30` is a documented prerequisite of
-  `add`/`update`/`eject`/`ci` (§5). The refusal stays a `GIT_ERROR` (measured: an
-  earlier attempt to treat it as "nothing ignored" contradicted §5 and was
-  reverted); the message now reads "not a git repository — git >= 2.30 is
-  required for add/update/eject/ci (SPEC §5); run `git init` first". Unit test
-  `outside_a_repository_is_a_git_error_not_a_clean_check` plus
-  `ci_git_error_is_not_a_clean_ignore_check_inv5` and
-  `ci_git_unavailable_is_not_a_clean_ignore_check_inv5` (the latter with `PATH`
-  emptied so git cannot spawn).
-- **OSV cache and policy checks (partial)**: validate snapshot/advisory
-  structure and UTC dates; compare elapsed seconds using the system clock
-  when `OWN_NOW` is absent. `check` and VEX share configured cache paths, age
-  limits, environment overrides and id/alias exceptions requiring a reason
-  and valid expiry date. Expired exceptions retain alerts with
-  `W_IGNORE_EXPIRED`; stale overrides retain `W_OSV_STALE`. Reject absolute
-  or parent-traversing cache paths. VEX no longer implicitly bypasses
-  missing/stale snapshots.
-- **OSV source date and real-age comparison (§8.2, INV-5/INV-10)**:
-  `fetch_osv_dump` now returns the `Last-Modified` header with the archive
-  bytes, and `own osv fetch` writes it to `source_last_modified` as RFC 3339
-  UTC instead of a constant `null`. Age comparison keeps sub-second
-  precision, so the inclusive deadline is decided exactly. A snapshot dated
-  in the future is refused (`PARSE_ERROR ... in the future`) for both
-  `generated_at` and `source_last_modified`, and `--allow-stale-osv` cannot
-  mask it: the §8.2 risk table names a mirror that lies about its dates. The
-  mirror's own date is judged against the system clock, never an injected
-  `OWN_NOW`, which the mirror cannot know.
-- **Strict dump validation (§8.2, INV-5)**: every zip member is now validated
-  before the package filter. A truncated or non-JSON member, a nameless npm
-  record, or an advisory without an id is a hard `PARSE_ERROR` instead of a
-  silently dropped record — a dropped record would leave a snapshot that looks
-  complete while missing an advisory. Well-formed advisories for packages
-  outside the lock are still skipped, and the non-npm filter now runs before
-  the npm field extraction so a malformed non-npm record cannot discard the npm
-  record of the same advisory. The whole published dump passes this validation
-  in the live fetch test.
-  `--allow-missing-osv` no longer masks a snapshot that exists but is
-  unreadable. Ecosystem filtering keeps `database_specific` and
-  `ecosystem_specific` attached to their own affected record, so a hint can
-  no longer move onto another package. Two opt-in network tests exercise the
-  real HTTPS mirror: a four-byte ranged fetch for the transport header, and
-  a full `osv fetch` writing to a configured path. A VEX regression test drives
-  `sbom --format vex --e1` twice through the real binary and requires
-  byte-identical output, settling the counter-review claim that the OpenVEX
-  `@id` would drift with a `HashSet`-ordered reachable set. 9 new tests. These
-  changes do not certify phase 2.
-- **vendor-all keeps and verifies every version (§9.2, INV-5)**: a name
-  vendored in several versions now carries one `name@version` override per
-  version. The previous code skipped the override whenever a bare key already
-  existed, and a bare `file:` key pins every version to one directory, so the
-  second version was never reachable. `own verify` and `own ci` compare the
-  versioned shape, so a missing, stale or bare key for a multi-version package
-  is `OVERRIDE_MISMATCH` instead of being skipped — that skip is what left
-  vendor-all packages unverified. `own update` rewrites the key for the version
-  it moves, collapses back to the bare key when one version remains, and
-  refuses to overwrite an override own did not write. Every version's local
-  preconditions are checked before the first write and all writes share one
-  transaction, so a refusal leaves no partial set of versions; re-running
-  vendor-all vendors only the versions that are new. 7 new tests. The
-  end-to-end pnpm 9/10 run against a local registry is still open.
-- **Manifest integrity anchor (INV-8)**: recompute the digest, file count and
-  total size of the actual manifest records against `own.lock`. Changing a file
-  and its manifest hash no longer bypasses verification while the lock stays
-  unchanged. Both verifier binaries use this shared check.
-- **Git pipe deadlock (INV-5)**: `add` and `ci` share a NUL-delimited ignore
-  probe that feeds stdin while draining stdout/stderr. Regression test with
-  3,000 ignored files; Git failures remain explicit errors.
-- **Git safety and transactional initialization (INV-1/5/9)**: `init` keeps the
-  vendor negation last, preserves unreadable Git configuration by refusing the
-  operation, checks repositories in parent directories, and rolls back on Git
-  errors. `VENDOR_PATH_IGNORED` uses exit 1. `add` and `ci` no longer confuse
-  failed ignore checks with clean results; `ci` checks project-relative paths.
-- **CI JSON output**: `--base-ref` change notes stay inside `data.notes`, not
-  before the JSON document. Human findings are results on stdout.
-- **Minimal verifier**: `own-verify --installed` performs the installed-file
-  comparison. Missing configuration/lock and unreadable or malformed inputs
-  are explicit errors, not empty policy/override values. JSON error envelopes
-  and sorted findings use the same output contract as successful verification.
-- **Determinism gate**: replace the ineffective network setup and swallowed
-  errors with an offline, non-empty fixture comparing verify and SBOM output.
-- **Dependency advisories**: upgrade `zip` from 2.6.1 to 9.5.1 for
-  RUSTSEC-2026-0367/0368/0369/0429; remove its unused dependency from `own-net`.
-  OSV still reads ZIP entries in memory, never using disk extraction APIs.
-- **CLI conformance (§8.0/§8.1/§8.3)**, from the divergences the integration suite
-  documented:
-  - `NOT_INITIALIZED` (exit 2) is now the answer of every command that needs
-    project state (`verify`, `ci`, `licenses`, `policy-sync`, `migrate`, `slice`,
-    `sbom`, `diff`, `check`, `eject`). `verify` used to report an unmatchable
-    `NOT_INITIALIZED or IO_ERROR: own.toml: …` and exit 1; the others reported a
-    bare `IO_ERROR`.
-  - `--format human|json` is declared by `verify` and validated everywhere
-    (`scan`, `slice`, `diff`, `check`, `ci`): an unknown value is a
-    `USAGE_ERROR` (exit 2) instead of being silently ignored. The result now goes
-    to stdout in human mode too (§8.0: logs on stderr), and the JSON envelope is
-    emitted only with `--format json`.
-  - `verify --installed` is implemented (`own_core::verify::verify_installed`):
-    every file present in `node_modules/.pnpm` must exist in the manifest with
-    the same bytes (`DRIFT_INSTALLED`); files absent from the copy are not
-    reported (§5), and a package that was never installed is skipped.
-  - `init` is transactional (INV-9): it takes `.own/lock`, journals its writes
-    and commits, so a failure (or a signal) leaves the directory untouched
-    instead of half-initialised.
-  - `sbom --format vex` no longer requires `--output`: without it the OpenVEX
-    document goes to stdout, like CycloneDX (§8.3).
-  - `licenses` prints the `Hash` column required by §8.1.
-  - Remaining documented deviation: `ci` requires `pnpm-lock.yaml`, because its
-    overrides/pnpm coherence check needs it; the failure is an `IO_ERROR`
-    (exit 2).
-- **Signal handling (INV-9)**: the SIGINT/SIGTERM handler is now
-  async-signal-safe — it only calls `write(2)` and `_exit(128+signal)`. It no
-  longer takes the active-transaction mutex, reads the journal or copies files
-  from inside the handler (a signal could interrupt the thread holding that
-  mutex, and none of those calls are in POSIX's async-signal-safe list). An
-  interrupted run leaves the journal `started` and the **next writing command**
-  restores the backup and emits `W_TXN_RECOVERED`, the same path as `kill -9`.
-  New tests `sigterm_leaves_started_journal_that_next_writer_restores` and
-  `sigint_leaves_started_journal_that_next_writer_restores` assert the exit code
-  (143/130), the handler message and the recovery.
-- **Durability (INV-9)**: every journal write, every backup file and every
-  `rename` is now `fsync`ed (file, then parent directory) *before* the work it
-  protects is considered done, so the journal survives a power loss and not only
-  `kill -9`. The ordering enforced is backup durable → journal entry durable →
-  rename → directory sync, in `begin`/`backup`/`write_file`/`move_dir_into`/
-  `commit`/`rollback` (recursive `sync_tree` for prepared trees).
-- **rust-toolchain.toml** was malformed (`channel` without the `[toolchain]`
-  table), so *every* `cargo`/`rustup` invocation inside the repository failed
-  with ``missing field `toolchain` ``. It now declares
-  `[toolchain] channel = "1.99.1"` + `rustfmt`/`clippy`.
-- **Transactions (INV-9)**: `Txn::begin` now takes the exclusive lock **before**
-  scanning/recovering journals, so a concurrent `own` gets `LOCK_BUSY` instead of
-  rolling back the active transaction. New regression test
-  `lock_taken_before_recovery_so_second_writer_cannot_rollback_active_txn`.
-- **Rollback path encoding**: backup journal entries now store the original
-  relative path explicitly (`{"rel": ..., "flat": ...}`), so names containing a
-  literal `__` (e.g. `@types+babel__core`) round-trip correctly. Legacy string
-  entries are still decoded. New test
-  `rollback_preserves_literal_double_underscore_in_names`.
-- **Extraction (§11.2)**: the compression-ratio check now compares decompressed
-  bytes against **compressed** bytes (counter moved before the GzDecoder), the
-  temp file is created with `create_new(true)`, non-UTF-8 entry names are
-  refused (`EXTRACT_REFUSED:non_utf8_path`) instead of lossy-converted, the
-  actual bytes written are checked against `max_file_size`, and multi-member /
-  trailing gzip data is refused (`EXTRACT_REFUSED:trailing_data`). New tests:
-  `rule_max_file_size_refused`, `rule_max_unpacked_size_refused`,
-  `rule_compression_ratio_refused`, `rule_trailing_data_refused`,
-  `rule_non_utf8_path_refused` (18 → 23 hostile tests).
-- **Verify (CRLF)**: the CRLF→LF normalization no longer doubles `\n`, so
-  `LINE_ENDINGS_REWRITTEN` actually fires.
-- **Release workflow**: all `uses:` refs pinned to real, verified 40-char commit
-  SHAs (checkout v4.2.2, upload-artifact v4.6.2, download-artifact v4.3.0,
-  cosign-installer v4.1.1, action-gh-release v3.0.3, dtolnay/rust-toolchain v1).
-  aarch64-linux now cross-compiles with `gcc-aarch64-linux-gnu`. SLSA provenance
-  uses a dedicated `provenance` job calling the reusable
-  `generator_generic_slsa3.yml@v2.1.0` with the correct `base64-subjects` input.
-- **Installer**: `OWN_REPO` defaults to `YourFriendPollux/own`; cosign is fetched
-  per-OS (darwin/linux); the non-existent detached `.sig` is gone — verification
-  uses the `.bundle` produced by the release; SLSA attestation is fetched as
-  `<asset>.intoto.jsonl`.
-- **CI**: installs `cargo-deny`, `cargo-vet` and `cargo-fuzz` before use.
+
+- Enforce initialization for state-consuming commands and improve human/JSON
+  result reporting. Report actionable error codes, failing paths and advisory
+  findings instead of clean-looking partial results; JSON error handling and
+  validation of format options are not uniform across every command.
+- Validate actual manifest digests, file counts and sizes against the lock;
+  reject coordinated file/manifest changes while the lock anchor is unchanged.
+- Preserve aliases, catalog resolutions, current-directory links and file-peer
+  contexts in supported pnpm v9 locks. Refuse unsupported schemas and
+  multi-document locks instead of losing the project graph.
+- Accept exact single-version scoped overrides while retaining rejection of
+  ambiguous or incomplete override maps. Preserve an existing bare version when
+  extending a multi-version set, and check conflicts before removing its key.
+- Compare registry-to-file parent identities in CI only through known lock
+  entries, retaining coverage checks for unknown parents and versions.
+- Drain Git subprocess pipes concurrently, use NUL-delimited paths, distinguish
+  Git errors from clean ignore checks and keep vendored files trackable.
+- Lock before journal recovery, preserve original backups, sync publication
+  boundaries and recover interrupted transactions on the next writing command.
+- Reject unsafe extraction paths, non-UTF-8 names, invalid gzip tails and
+  resource-limit violations; read verified archive data for extraction.
+- Validate OSV snapshot/advisory structure, ranges, timestamps, freshness and
+  dated exceptions. Preserve conservative alerts and explicit stale/missing
+  warnings rather than silently discarding unsupported or malformed records.
+- Bind release provenance to the tarball, repository and exact tag; request the
+  SLSA generator's `multiple.intoto.jsonl` asset and require trusted verifiers
+  before installing. Hosted cryptographic verification remains unvalidated.
+- Keep release jobs behind the shared CI gate and normalize archive/checksum
+  metadata in the packaging script.
+- Refuse PyPI vendoring explicitly in the ordinary add path before reading an
+  npm lockfile; no support is claimed for non-npm diamond-mode combinations.
 
 ### Changed
-- `fuzz/corpus/` (3 449 generated libFuzzer artifacts, ~14 MB) is untracked and
-  gitignored; regenerate with `cargo +nightly fuzz run <target>`.
-- README updated: real test count (110), corpus size (250), known limits section,
-  note that SPEC.md/docs are not in the published archive.
+
+- Retain only installer, packaging and their regression helpers under `scripts/`.
+  Remove one-off eligibility/corpus, exploratory audit and repository-campaign
+  scripts along with generated output and caches.
+- Refresh the README, contributor/security guidance and GitHub templates to
+  describe the current command boundaries and publication limitations.
+- Ignore generated Python, Rust, fuzz, release and editor output while keeping
+  `vendor/own/**` trackable.
+
+### Known limitations
+
+- Package provenance is not cryptographically verified.
+- The complete public OSV npm dump is accepted: 232,472 archive entries produce 231,720 live npm advisories, preserving raw ECOSYSTEM tokens and marking non-evaluable ranges `OSV_UNEVALUABLE`.
+- `verify --remote` is unimplemented; `migrate` is a schema-1 no-op.
+- `check --remote` and `diff --from-cache` are refused. Normal `update` is
+  blocked by its absolute-extraction/project-relative-diff path mismatch;
+  its accepted diamond option is not implemented as a strategy.
+- Generated network, mirror and security TOML fields are not general CLI
+  configuration; only the implemented license/local-OSV settings should be
+  relied on. No fresh-download air-gap or private-registry support is claimed.
+- Slicing/reachability features are experimental, and PyPI is unsupported.
+- Dependency audit coverage is incomplete; required CI gates and actual hosted
+  signing must succeed before a release can be treated as verified.
 
 ## [0.1.0] - 2026-11-10
 
-### Added
-- `own init` / `verify` / `ci` / `scan` / `add` / `licenses --write` /
-  `policy-sync` / `migrate` (0.1 Core, SPEC §8.1)
-- `own osv-fetch` / `check` (E0 alerts) / `diff` / `update` (0.2, §8.2)
-- `own sbom` (CycloneDX 1.5 + OpenVEX) / `eject --adopt` / `verify-signature` (0.3, §8.3)
-- `own-verify`: minimal offline verifier binary (no network deps)
-- Hardened extraction (§11.2) with hostile tests; cargo-fuzz targets
-  (extraction, packument, SPDX, OSV)
-- INV-9 transactions with kill -9 recovery test; JCS RFC 8785 + golden §7.3
-  vectors; canonical TOML writer
-- Release workflow (cosign keyless + SLSA) + verified installer script
-- Measured: `own ci` 16 ms (release) on 12 pkgs / 9.4 MB vendored
+Initial development baseline:
+
+- npm vendoring, lock/manifests, license policy, offline verification and CI checks.
+- OSV/check/diff/update command surfaces, SBOM output, adoption and external
+  signature-verification support.
+- `own-verify`, hardened extraction, canonical serialization and transaction
+  recovery with regression and fuzz harnesses.
+- GitHub release workflow and installer sources.
+
+This entry records the development version's history, not a claim that release
+assets or their hosted signatures have been exercised.

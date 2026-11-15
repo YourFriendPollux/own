@@ -7,7 +7,7 @@
 //!
 //! Every refusal is an error `EXTRACT_REFUSED:<rule>`, never a warning.
 
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use sha2::{Digest, Sha512};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
@@ -165,7 +165,18 @@ fn extract_from_file(
         inner: f,
         counter: compressed.clone(),
     };
-    let gz = GzDecoder::new(counted);
+    let gz = GzDecoder::new(std::io::BufReader::new(counted));
+    // Bound the entire decompressed stream, including extension headers and
+    // padding after tar EOF, not only the file payloads counted in stats.
+    let decompressed_cap = limits
+        .max_unpacked_size
+        .saturating_add((limits.max_entries as u64).saturating_mul(1536))
+        .saturating_add(1024);
+    let gz = CountingReader::new(
+        gz,
+        decompressed_cap,
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
     let mut archive = tar::Archive::new(gz);
     fs::create_dir_all(dest_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
 
@@ -321,14 +332,20 @@ fn extract_from_file(
         let mut sink = [0u8; 65536];
         loop {
             match std::io::Read::read(&mut remaining, &mut sink) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(_) => continue,
+                Err(e) => return Err(format!("PARSE_ERROR: gzip: {e}")),
             }
         }
         let raw_size = fs::metadata(tar_gz)
             .map_err(|e| format!("IO_ERROR: {e}"))?
             .len();
-        let read = compressed.load(std::sync::atomic::Ordering::Relaxed);
+        // Bufread GzDecoder leaves bytes after the member in its input buffer.
+        // Counting raw read-ahead as consumed used to miss short trailing data.
+        let buffered = remaining.inner.get_ref().buffer().len() as u64;
+        let read = compressed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(buffered);
         if read < raw_size {
             return Err(refused("trailing_data"));
         }
@@ -397,16 +414,13 @@ fn check_path(p: &str, limits: &SecurityLimits) -> ExtractResult<()> {
 
 /// Reader wrapper that counts bytes read from `inner` and enforces a cap.
 /// Kept for callers that need a hard byte cap on a decompressed stream.
-#[allow(dead_code)]
 struct CountingReader<R> {
     inner: R,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     cap: u64,
 }
 
-#[allow(dead_code)]
 impl<R: Read> CountingReader<R> {
-    #[allow(dead_code)]
     fn new(inner: R, cap: u64, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
         Self {
             inner,
@@ -422,10 +436,10 @@ impl<R: Read> Read for CountingReader<R> {
         let prev = self
             .counter
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        if prev + n as u64 > self.cap {
+        if prev.saturating_add(n as u64) > self.cap {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "max_tarball_size exceeded",
+                "max_decompressed_size exceeded",
             ));
         }
         Ok(n)

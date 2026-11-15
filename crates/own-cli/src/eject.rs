@@ -33,12 +33,21 @@ pub fn eject(root: &Path, args: &EjectArgs) -> Result<u8, String> {
             return Ok(0);
         }
     }
+    // Recovery must precede both the worktree check and the verify snapshot.
+    let txn = Txn::begin(root)?;
     // clean worktree required
     let dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(root)
         .output()
         .map_err(|e| format!("GIT_ERROR: {e}"))?;
+    if !dirty.status.success() {
+        return Err(format!(
+            "GIT_ERROR: git status exited {}: {}",
+            dirty.status,
+            String::from_utf8_lossy(&dirty.stderr)
+        ));
+    }
     if !dirty.stdout.is_empty() {
         return Err("WORKTREE_DIRTY".to_string());
     }
@@ -72,7 +81,6 @@ pub fn eject(root: &Path, args: &EjectArgs) -> Result<u8, String> {
         ));
     }
     // transaction: prepare removals (keep vendor dirs, LICENSES.md, overrides, .gitattributes/.gitignore/CODEOWNERS)
-    let txn = Txn::begin(root)?;
     let res = (|| -> Result<(), String> {
         for f in ["own.lock", "own.toml"] {
             if root.join(f).exists() {
@@ -86,10 +94,27 @@ pub fn eject(root: &Path, args: &EjectArgs) -> Result<u8, String> {
             std::fs::remove_dir_all(&manifests).map_err(|e| format!("IO_ERROR: {e}"))?;
         }
         // .own/ is disposable (cache/tmp/txn) and self-recursive to back up:
-        // skip the backup entirely — it is reconstructible (§8.0).
+        // skip the backup entirely — it is reconstructible (§8.0). But the
+        // transaction's own directory and the held lock live inside it: removing
+        // the whole tree deleted the journal that commit() reads, so eject
+        // destroyed the state and then failed with IO_ERROR, unrecoverable by
+        // rollback. Empty everything else now and drop .own/ after the commit.
         let own_dir = root.join(".own");
         if own_dir.exists() {
-            std::fs::remove_dir_all(&own_dir).map_err(|e| format!("IO_ERROR: {e}"))?;
+            for entry in std::fs::read_dir(&own_dir).map_err(|e| format!("IO_ERROR: {e}"))? {
+                let entry = entry.map_err(|e| format!("IO_ERROR: {e}"))?;
+                let name = entry.file_name();
+                if name == "txn" || name == "lock" {
+                    continue;
+                }
+                let path = entry.path();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
+                    std::fs::remove_dir_all(&path).map_err(|e| format!("IO_ERROR: {e}"))?;
+                } else {
+                    std::fs::remove_file(&path).map_err(|e| format!("IO_ERROR: {e}"))?;
+                }
+            }
         }
         Ok(())
     })();
@@ -98,11 +123,19 @@ pub fn eject(root: &Path, args: &EjectArgs) -> Result<u8, String> {
         return Err(e);
     }
     // pnpm install --frozen-lockfile + build
-    let st = Command::new("pnpm")
+    // Every failure from here on has already removed own.lock/own.toml: an early
+    // `?` would return with the state destroyed and no rollback (INV-9).
+    let st = match Command::new("pnpm")
         .args(["install", "--frozen-lockfile"])
         .current_dir(root)
         .status()
-        .map_err(|e| format!("PNPM_FAILED: {e}"))?;
+    {
+        Ok(st) => st,
+        Err(e) => {
+            let _ = txn.rollback();
+            return Err(format!("PNPM_FAILED: {e}"));
+        }
+    };
     if !st.success() {
         let _ = txn.rollback();
         return Err("INSTALL_VERIFY_FAILED: pnpm install --frozen-lockfile".to_string());
@@ -114,13 +147,19 @@ pub fn eject(root: &Path, args: &EjectArgs) -> Result<u8, String> {
                 .and_then(|b| b.as_str())
                 .is_some()
             {
-                let st = Command::new("pnpm")
+                let st = match Command::new("pnpm")
                     .arg("run")
                     .arg("build")
                     .current_dir(root)
                     .stdin(Stdio::null())
                     .status()
-                    .map_err(|e| format!("PNPM_FAILED: {e}"))?;
+                {
+                    Ok(st) => st,
+                    Err(e) => {
+                        let _ = txn.rollback();
+                        return Err(format!("PNPM_FAILED: {e}"));
+                    }
+                };
                 if !st.success() {
                     let _ = txn.rollback();
                     return Err("INSTALL_VERIFY_FAILED: build script".to_string());
@@ -129,6 +168,9 @@ pub fn eject(root: &Path, args: &EjectArgs) -> Result<u8, String> {
         }
     }
     txn.commit()?;
+    // Only now can .own/ (lock file and the emptied transaction parent) go: the
+    // commit above needed its journal, which lives inside that directory.
+    let _ = std::fs::remove_dir_all(root.join(".own"));
     println!("ejected: vendor/own/* adopted as first-party; own.lock/own.toml/.own removed (recover via git)");
     Ok(0)
 }

@@ -9,8 +9,10 @@ use sha2::{Digest, Sha256, Sha512};
 use std::io::Read;
 use std::time::Duration;
 
+#[derive(Debug, Clone)]
 pub struct NetConfig {
     pub registry_url: String, // canonical, no trailing slash, no credentials
+    pub mirror_url: Option<String>, // explicitly trusted registry mirror
     pub connect_timeout_s: u64,
     pub read_timeout_s: u64,
     pub max_retries: u32,
@@ -24,6 +26,7 @@ impl Default for NetConfig {
     fn default() -> Self {
         Self {
             registry_url: "https://registry.npmjs.org".to_string(),
+            mirror_url: None,
             connect_timeout_s: 10,
             read_timeout_s: 30,
             max_retries: 3,
@@ -36,13 +39,21 @@ impl Default for NetConfig {
 }
 
 pub fn build_client(cfg: &NetConfig) -> Result<Client, String> {
+    validate_config(cfg)?;
     let b = Client::builder()
         .user_agent(&cfg.user_agent)
         .connect_timeout(Duration::from_secs(cfg.connect_timeout_s))
         .timeout(Duration::from_secs(cfg.read_timeout_s))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            // follow only same-host redirects
-            if attempt.previous().last().and_then(|u| u.host_str()) == attempt.url().host_str() {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("redirect limit exceeded");
+            }
+            // Never downgrade HTTPS or cross ports/credentials on a redirect.
+            if attempt
+                .previous()
+                .last()
+                .is_some_and(|previous| safe_redirect(previous, attempt.url()))
+            {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -52,19 +63,102 @@ pub fn build_client(cfg: &NetConfig) -> Result<Client, String> {
     b.build().map_err(|e| format!("NETWORK_ERROR: {e}"))
 }
 
-fn registry_host(cfg: &NetConfig) -> Result<String, String> {
-    Url::parse(&cfg.registry_url)
-        .map_err(|e| format!("USAGE_ERROR: registry url: {e}"))?
-        .host_str()
-        .map(|h| h.to_string())
-        .ok_or_else(|| "USAGE_ERROR: registry url has no host".to_string())
+fn validated_registry_url(cfg: &NetConfig) -> Result<Url, String> {
+    validate_endpoint(&cfg.registry_url)
+}
+
+pub fn validate_endpoint(endpoint: &str) -> Result<Url, String> {
+    let url = Url::parse(endpoint).map_err(|_| "USAGE_ERROR: invalid registry url".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "USAGE_ERROR: registry url must be HTTPS without credentials, query or fragment".into(),
+        );
+    }
+    Ok(url)
+}
+
+pub fn validate_config(cfg: &NetConfig) -> Result<(), String> {
+    validated_registry_url(cfg)?;
+    if let Some(mirror) = &cfg.mirror_url {
+        validate_endpoint(mirror)?;
+    }
+    if cfg.connect_timeout_s == 0
+        || cfg.read_timeout_s == 0
+        || cfg.max_packument_size == 0
+        || cfg.max_tarball_size == 0
+        || cfg.concurrency == 0
+    {
+        return Err("USAGE_ERROR: network limits must be positive".into());
+    }
+    Ok(())
+}
+
+fn safe_redirect(previous: &Url, next: &Url) -> bool {
+    next.scheme() == "https"
+        && next.username().is_empty()
+        && next.password().is_none()
+        && previous.origin() == next.origin()
+}
+
+fn registry_endpoint(cfg: &NetConfig) -> Result<&str, String> {
+    validate_config(cfg)?;
+    Ok(cfg.mirror_url.as_deref().unwrap_or(&cfg.registry_url))
+}
+
+fn tarball_request_url(cfg: &NetConfig, input: &str) -> Result<Url, String> {
+    validate_config(cfg)?;
+    let registry = validated_registry_url(cfg)?;
+    let original = Url::parse(input).map_err(|e| format!("USAGE_ERROR: tarball url: {e}"))?;
+    if original.scheme() != "https"
+        || !original.username().is_empty()
+        || original.password().is_some()
+        || original.fragment().is_some()
+    {
+        return Err("TARBALL_HOST_MISMATCH: non-https or credentialed tarball".into());
+    }
+    let mirror = cfg
+        .mirror_url
+        .as_deref()
+        .map(validate_endpoint)
+        .transpose()?;
+    if mirror
+        .as_ref()
+        .is_some_and(|mirror| original.origin() == mirror.origin())
+    {
+        return Ok(original);
+    }
+    if original.origin() != registry.origin() {
+        return Err("TARBALL_HOST_MISMATCH".into());
+    }
+    let Some(mut mirror) = mirror else {
+        return Ok(original);
+    };
+    let prefix = format!("{}/", registry.path().trim_end_matches('/'));
+    let relative = original
+        .path()
+        .strip_prefix(&prefix)
+        .ok_or("TARBALL_HOST_MISMATCH: outside registry path")?;
+    let path = format!("{}/{}", mirror.path().trim_end_matches('/'), relative);
+    mirror.set_path(&path);
+    mirror.set_query(original.query());
+    Ok(mirror)
 }
 
 /// Fetch the full packument (`Accept: application/json`) for `name`.
 /// Returns the raw JSON bytes (capped) — parsing is own-policy's job.
 pub fn fetch_packument(client: &Client, cfg: &NetConfig, name: &str) -> Result<Vec<u8>, String> {
-    let host = registry_host(cfg)?;
-    let url = format!("{}/{}", cfg.registry_url, name.replace('/', "%2F"));
+    let endpoint = registry_endpoint(cfg)?;
+    let url = format!(
+        "{}/{}",
+        endpoint.trim_end_matches('/'),
+        name.replace('/', "%2F")
+    );
     let mut last_err = String::new();
     for attempt in 0..=cfg.max_retries {
         match client.get(&url).header("Accept", "application/json").send() {
@@ -97,7 +191,6 @@ pub fn fetch_packument(client: &Client, cfg: &NetConfig, name: &str) -> Result<V
                     }
                     buf.extend_from_slice(&chunk[..n]);
                 }
-                let _ = host;
                 return Ok(buf);
             }
             Err(e) => {
@@ -127,18 +220,10 @@ pub fn fetch_tarball(
     cfg: &NetConfig,
     tarball_url: &str,
 ) -> Result<TarballDownload, String> {
-    let host = registry_host(cfg)?;
-    let url = Url::parse(tarball_url).map_err(|e| format!("USAGE_ERROR: tarball url: {e}"))?;
-    if url.scheme() != "https" {
-        return Err("TARBALL_HOST_MISMATCH: non-https tarball".to_string());
-    }
-    match url.host_str() {
-        Some(h) if h == host => {}
-        _ => return Err("TARBALL_HOST_MISMATCH".to_string()),
-    }
+    let url = tarball_request_url(cfg, tarball_url)?;
     let mut last_err = String::new();
     for attempt in 0..=cfg.max_retries {
-        match client.get(tarball_url).send() {
+        match client.get(url.clone()).send() {
             Ok(resp) => {
                 let status = resp.status();
                 if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
@@ -210,14 +295,15 @@ pub fn verify_sri_integrity(sri: &str, bytes: &[u8]) -> Result<String, String> {
 }
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    // SHA-512 is 64 bytes: 86 symbols and two padding bytes. Never accept a prefix.
+    if s.len() != 88 || !s.ends_with("==") {
+        return None;
+    }
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut nbits = 0;
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
+    for &c in &s.as_bytes()[..86] {
         let v = TABLE.iter().position(|&t| t == c)? as u32;
         acc = (acc << 6) | v;
         nbits += 6;
@@ -226,7 +312,77 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
             out.push((acc >> nbits) as u8);
         }
     }
+    if out.len() != 64 || acc & 0x0f != 0 {
+        return None;
+    }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_routes_only_explicitly_trusted_registry_origins() {
+        let config = NetConfig {
+            registry_url: "https://registry.example/npm".into(),
+            mirror_url: Some("https://mirror.example/packages".into()),
+            ..NetConfig::default()
+        };
+        assert_eq!(
+            registry_endpoint(&config).unwrap(),
+            "https://mirror.example/packages"
+        );
+        let original = "https://registry.example/npm/pkg/-/pkg-1.0.0.tgz";
+        assert_eq!(
+            tarball_request_url(&config, original).unwrap().as_str(),
+            "https://mirror.example/packages/pkg/-/pkg-1.0.0.tgz"
+        );
+        assert_eq!(config.registry_url, "https://registry.example/npm");
+        for unsafe_url in [
+            "https://elsewhere.example/pkg.tgz",
+            "https://registry.example:444/npm/pkg.tgz",
+            "https://registry.example/npm-other/pkg.tgz",
+            "https://user:password@mirror.example/packages/pkg.tgz",
+        ] {
+            assert!(
+                tarball_request_url(&config, unsafe_url).is_err(),
+                "{unsafe_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_mirror_configuration_is_rejected_without_network() {
+        for endpoint in [
+            "http://mirror.example",
+            "https://user:password@mirror.example",
+            "https://mirror.example?token=value",
+        ] {
+            let config = NetConfig {
+                mirror_url: Some(endpoint.into()),
+                ..NetConfig::default()
+            };
+            assert!(validate_config(&config).is_err(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn redirects_preserve_https_origin_without_credentials_inv4() {
+        let previous = Url::parse("https://registry.npmjs.org/a").unwrap();
+        assert!(safe_redirect(
+            &previous,
+            &Url::parse("https://registry.npmjs.org/b").unwrap()
+        ));
+        for next in [
+            "http://registry.npmjs.org/b",
+            "https://registry.npmjs.org:444/b",
+            "https://other.invalid/b",
+            "https://user:password@registry.npmjs.org/b",
+        ] {
+            assert!(!safe_redirect(&previous, &Url::parse(next).unwrap()));
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -243,17 +399,45 @@ pub fn fetch_osv_dump(
     osv_url: &str,
     max_download_mb: u64,
 ) -> Result<OsvDump, String> {
+    fetch_osv_with_retries(client, osv_url, max_download_mb, 3)
+}
+
+pub fn fetch_osv_dump_configured(
+    client: &Client,
+    config: &NetConfig,
+    osv_url: &str,
+    max_download_mb: u64,
+) -> Result<OsvDump, String> {
+    validate_config(config)?;
+    fetch_osv_with_retries(client, osv_url, max_download_mb, config.max_retries)
+}
+
+fn fetch_osv_with_retries(
+    client: &Client,
+    osv_url: &str,
+    max_download_mb: u64,
+    retries: u32,
+) -> Result<OsvDump, String> {
     let url = Url::parse(osv_url).map_err(|e| format!("USAGE_ERROR: osv url: {e}"))?;
-    if url.scheme() != "https" {
-        return Err("NETWORK_ERROR: osv url must be https".to_string());
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("NETWORK_ERROR: osv url must be https without credentials".to_string());
     }
-    let cap = max_download_mb * 1_048_576;
+    if max_download_mb == 0 {
+        return Err("USAGE_ERROR: max_download_mb must be positive".into());
+    }
+    let cap = max_download_mb
+        .checked_mul(1_048_576)
+        .ok_or("USAGE_ERROR: max_download_mb overflow")?;
     let mut last_err = String::new();
-    for attempt in 0..=3u32 {
+    for attempt in 0..=retries {
         match client.get(osv_url).send() {
             Ok(resp) => {
                 let status = resp.status();
-                if status.is_server_error() && attempt < 3 {
+                if status.is_server_error() && attempt < retries {
                     last_err = format!("NETWORK_ERROR: HTTP {status}");
                     continue;
                 }
@@ -289,7 +473,7 @@ pub fn fetch_osv_dump(
                     last_modified,
                 });
             }
-            Err(e) if (e.is_timeout() || e.is_connect()) && attempt < 3 => {
+            Err(e) if (e.is_timeout() || e.is_connect()) && attempt < retries => {
                 last_err = format!("NETWORK_ERROR: {e}");
             }
             Err(e) => return Err(format!("NETWORK_ERROR: {e}")),

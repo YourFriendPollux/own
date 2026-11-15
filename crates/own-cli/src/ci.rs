@@ -30,7 +30,9 @@ fn read_overrides(root: &Path) -> Result<serde_json::Map<String, serde_json::Val
     Ok(out)
 }
 use own_policy::license as lic;
-use own_policy::pnpm_lock::parse_pnpm_lock;
+use own_policy::pnpm_lock::{
+    file_dependency_path, parse_pnpm_lock, registry_dependency, split_pkg_key,
+};
 use std::path::Path;
 use std::process::Command;
 
@@ -60,27 +62,11 @@ pub fn ci(root: &Path, args: &CiArgs) -> Result<(Vec<Finding>, Vec<String>), Str
     let lock = parse_lock(&lock_text).map_err(|e| format!("PARSE_ERROR: own.lock: {e}"))?;
     // each vendored package must appear as file:vendor/own/<dir> in pnpm-lock importers or snapshots
     for p in &lock.packages {
-        let referenced = pnpm_lock
-            .importers
-            .iter()
-            .flat_map(|im| im.deps.iter())
-            .any(|(n, spec, v)| {
-                n == &p.name
-                    && (spec.starts_with("file:vendor/own/")
-                        || v.starts_with("file:vendor/own/")
-                        || v == &format!("file:{}", p.dir))
-            })
+        let referenced = !pnpm_lock.file_dependents(&p.dir).is_empty()
             || pnpm_lock
                 .packages
                 .iter()
-                .any(|pk| pk.key.contains(&format!("file:{}", p.dir)));
-        // snapshots keys for file: deps look like "zod@file:vendor/own/zod@3.22.4" — check deps spec too
-        let referenced = referenced
-            || pnpm_lock.packages.iter().any(|pk| {
-                pk.deps
-                    .iter()
-                    .any(|(n, v)| n == &p.name && v.contains("vendor/own/"))
-            });
+                .any(|pk| file_dependency_path(&pk.key) == Some(p.dir.as_str()));
         if !referenced {
             findings.push(Finding {
                 code: "OVERRIDE_MISMATCH".to_string(),
@@ -94,26 +80,29 @@ pub fn ci(root: &Path, args: &CiArgs) -> Result<(Vec<Finding>, Vec<String>), Str
     }
 
     // 3. offline diamond re-detection (§9.2 v0.6): any dependent or resolved version
-    //    not covered by the recorded dependents or a decision -> DIAMOND_DETECTED
-    for p in &lock.packages {
-        let mut current: Vec<String> = pnpm_lock
-            .importers
+    //    not covered by the recorded dependents or actual vendored versions
+    //    -> DIAMOND_DETECTED. A strategy string alone is not version coverage.
+    // Only known, integrity-checked vendored parents can retain their original
+    // identity across pnpm's registry-to-directory rewrite. Unknown parents
+    // and wrong directory/version targets remain distinct and are reported.
+    let canonical_dependent = |dependent: &str| {
+        lock.packages
             .iter()
-            .filter(|im| {
-                im.deps
-                    .iter()
-                    .any(|(n, _, v)| n == &p.name && v == &p.version)
-            })
-            .map(|im| format!("importer:{}", im.path))
-            .collect();
-        for pk in &pnpm_lock.packages {
-            if pk.deps.iter().any(|(n, v)| n == &p.name && v == &p.version) {
-                current.push(format!("{}@{}", pk.name, pk.version));
-            }
-        }
+            .find(|parent| dependent == format!("{}@file:{}", parent.name, parent.dir))
+            .map(|parent| format!("{}@{}", parent.name, parent.version))
+            .unwrap_or_else(|| dependent.to_string())
+    };
+    for p in &lock.packages {
+        let mut current = pnpm_lock.registry_dependents(&p.name, &p.version);
+        current.extend(pnpm_lock.file_dependents(&p.dir));
+        let mut current: Vec<String> = current.iter().map(|d| canonical_dependent(d)).collect();
         current.sort();
         current.dedup();
-        let recorded: Vec<String> = p.dependents.clone();
+        let recorded: Vec<String> = p
+            .dependents
+            .iter()
+            .map(|d| canonical_dependent(d))
+            .collect();
         let uncovered: Vec<&String> = current.iter().filter(|c| !recorded.contains(c)).collect();
         if !uncovered.is_empty() {
             findings.push(Finding {
@@ -131,12 +120,52 @@ pub fn ci(root: &Path, args: &CiArgs) -> Result<(Vec<Finding>, Vec<String>), Str
                 ),
             });
         }
+        let uncovered_versions: Vec<String> = pnpm_lock
+            .resolved_versions(&p.name)
+            .into_iter()
+            .filter(|version| {
+                !lock.packages.iter().any(|vendored| {
+                    vendored.ecosystem == p.ecosystem
+                        && vendored.name == p.name
+                        && &vendored.version == version
+                })
+            })
+            .collect();
+        if !uncovered_versions.is_empty() {
+            findings.push(Finding {
+                code: "DIAMOND_DETECTED".to_string(),
+                severity: "error".to_string(),
+                package: format!("{}@{}", p.name, p.version),
+                path: "pnpm-lock.yaml".to_string(),
+                message: format!(
+                    "resolved versions not covered by lock: {}",
+                    uncovered_versions.join(", ")
+                ),
+            });
+        }
         // dev-only dependents' ranges must satisfy the vendored version (v0.6 amendment 1)
         for im in &pnpm_lock.importers {
-            for (n, spec, v) in &im.deps {
-                if n == &p.name
-                    && v == &p.version
-                    && !own_policy::semver::satisfies(&p.version, spec)
+            for (n, spec, v) in im.all_deps() {
+                // Aliases retain their declared names, while their registry
+                // range belongs to the target. This is not a unify decision.
+                // Local references have no registry semver range.
+                let Some((name, version)) = registry_dependency(n, Some(spec), v) else {
+                    continue;
+                };
+                // Catalog specifiers are indirections, not semver literals.
+                // Check the locked target; diamond checks above still enforce
+                // complete dependent and version coverage.
+                let range = if spec.starts_with("catalog:") {
+                    version.clone()
+                } else {
+                    spec.strip_prefix("npm:")
+                        .map(|alias| split_pkg_key(alias).1)
+                        .filter(|range| !range.is_empty())
+                        .unwrap_or_else(|| spec.clone())
+                };
+                if name == p.name
+                    && version == p.version
+                    && !own_policy::semver::satisfies(&p.version, &range)
                 {
                     findings.push(Finding {
                         code: "DIAMOND_DETECTED".to_string(),

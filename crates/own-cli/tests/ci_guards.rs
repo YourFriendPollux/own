@@ -145,6 +145,133 @@ fn read(root: &Path, rel: &str) -> Vec<u8> {
     fs::read(root.join(rel)).unwrap()
 }
 
+fn assert_alias_diamond(fixture: &Fixture, dependent_or_version: &str) {
+    let paths = [
+        "own.toml",
+        "own.lock",
+        "package.json",
+        "pnpm-lock.yaml",
+        "vendor/own/a@1.0.0/LICENSE",
+        "vendor/own/a@1.0.0/index.js",
+        "vendor/own/a@1.0.0/package.json",
+    ];
+    let before = paths.map(|path| read(&fixture.0, path));
+    let out = fixture.run(&["ci", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1), "INV-6: {out:?}");
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = doc["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|finding| {
+            finding["code"] == "DIAMOND_DETECTED"
+                && finding["package"] == "a@1.0.0"
+                && finding["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(dependent_or_version)
+        }),
+        "expected a diamond for {dependent_or_version}: {doc}"
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["code"] == "DIAMOND_DETECTED"),
+        "fixture must not fail for unrelated reasons: {doc}"
+    );
+    for (path, bytes) in paths.into_iter().zip(before) {
+        assert_eq!(read(&fixture.0, path), bytes, "{path} changed");
+    }
+}
+
+#[test]
+fn ci_catalog_indirection_is_not_a_literal_semver_range() {
+    for catalog in ["catalog:", "catalog:legacy"] {
+        let fixture = Fixture::new();
+        let lock = fs::read_to_string(fixture.0.join("pnpm-lock.yaml")).unwrap();
+        fs::write(fixture.0.join("pnpm-lock.yaml"), lock.replace("packages: {}", &format!(
+            "    devDependencies:\n      a:\n        specifier: '{catalog}'\n        version: 1.0.0\npackages: {{}}"
+        ))).unwrap();
+        fixture.osv("2025-01-02T03:04:05Z", serde_json::json!([]));
+        success(&fixture.run(&["ci", "--format", "json"]));
+        let lock = fs::read_to_string(fixture.0.join("pnpm-lock.yaml")).unwrap();
+        fs::write(
+            fixture.0.join("pnpm-lock.yaml"),
+            lock.replace("version: 1.0.0", "version: 2.0.0"),
+        )
+        .unwrap();
+        assert_alias_diamond(&fixture, "resolved versions not covered");
+    }
+}
+
+#[test]
+fn ci_alias_new_version_not_covered_by_strategy_inv6() {
+    for strategy in [Some("vendor-all"), Some("unify"), None] {
+        let fixture = Fixture::new();
+        let mut lock =
+            own_core::lock::parse_lock(&fs::read_to_string(fixture.0.join("own.lock")).unwrap())
+                .unwrap();
+        lock.packages[0].diamond_resolution = strategy.map(str::to_string);
+        let package_json: serde_json::Value =
+            serde_json::from_slice(&read(&fixture.0, "package.json")).unwrap();
+        lock.metadata.lock_digest = compute_lock_digest(
+            &lock,
+            package_json["pnpm"]["overrides"].as_object().unwrap(),
+        );
+        fs::write(fixture.0.join("own.lock"), write_lock_canonical(&lock)).unwrap();
+        fs::write(
+            fixture.0.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: file:vendor/own/a@1.0.0\n        version: file:vendor/own/a@1.0.0\n      alias-a:\n        specifier: npm:a@2.0.0\n        version: a@2.0.0\npackages:\n  a@2.0.0:\n    resolution: {integrity: sha512-x}\nsnapshots:\n  a@2.0.0: {}\n",
+        )
+        .unwrap();
+        assert_alias_diamond(&fixture, "2.0.0");
+    }
+}
+
+#[test]
+fn ci_new_importer_alias_same_version_diamond_detected_inv6() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: file:vendor/own/a@1.0.0\n        version: file:vendor/own/a@1.0.0\n  packages/new:\n    dependencies:\n      alias-a:\n        specifier: npm:a@1.0.0\n        version: a@1.0.0(peer@3.0.0)\npackages:\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n",
+    )
+    .unwrap();
+    assert_alias_diamond(&fixture, "importer:packages/new");
+}
+
+#[test]
+fn ci_new_snapshot_alias_same_version_diamond_detected_inv6() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: file:vendor/own/a@1.0.0\n        version: file:vendor/own/a@1.0.0\npackages:\n  consumer@2.0.0:\n    resolution: {integrity: sha512-x}\nsnapshots:\n  consumer@2.0.0:\n    dependencies:\n      alias-a: a@1.0.0(peer@3.0.0)\n",
+    )
+    .unwrap();
+    assert_alias_diamond(&fixture, "consumer@2.0.0");
+}
+
+#[test]
+fn ci_file_vendor_specifier_is_not_a_registry_range_inv6() {
+    let fixture = Fixture::new();
+    for resolution in [
+        "1.0.0",
+        "file:vendor/own/a@1.0.0",
+        "file:vendor/own/a@1.0.0(peer@3.0.0)",
+    ] {
+        fs::write(
+            fixture.0.join("pnpm-lock.yaml"),
+            format!(
+                "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: file:vendor/own/a@1.0.0\n        version: {resolution}\npackages:\n  a@file:vendor/own/a@1.0.0:\n    resolution: {{directory: vendor/own/a@1.0.0, type: directory}}\nsnapshots:\n  a@file:vendor/own/a@1.0.0: {{}}\n"
+            ),
+        )
+        .unwrap();
+        let before = read(&fixture.0, "own.lock");
+        let out = fixture.run(&["ci", "--format", "json"]);
+        success(&out);
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["findings"], serde_json::json!([]), "{doc}");
+        assert_eq!(read(&fixture.0, "own.lock"), before);
+    }
+}
+
 #[test]
 fn check_missing_override_does_not_mask_unreadable_snapshot_inv5() {
     for invalid_utf8 in [false, true] {

@@ -1,187 +1,224 @@
-# own — verified vendoring for supply chain & compliance
+# own — verified npm vendoring
 
-`own` internalizes an npm dependency **byte-for-byte** from its published tarball
-into `vendor/own/`, with verifiable provenance, continuous offline integrity
-(`own verify`), CVE visibility (E0 alerts via OSV), clean ejection
-(`own eject --adopt`), and native air-gap support.
+`own` copies eligible npm packages from their published tarballs into
+`vendor/own/` without rewriting package source. It records package integrity,
+file manifests, license decisions and pnpm overrides in `own.lock`, then checks
+those records offline with `own verify` or the smaller `own-verify` binary.
 
-## Install
+**Status: pre-1.0, version 0.1.0.** The supported vendoring ecosystem is npm.
+The command set includes local version comparison, OSV checks, SBOM/OpenVEX
+output and adoption of vendored code; the update surface has a known blocker
+listed below. Command presence is not a claim of full specification
+conformance, completed dependency audits or a verified hosted release.
 
-```bash
-OWN_VERSION=v0.1.0 ./scripts/install-own.sh   # verifies cosign signature + SLSA provenance first
+## Requirements
+
+- An existing npm project with `package.json` and a **single-document pnpm v9
+  lockfile**. Unsupported schemas and multi-document locks are refused rather
+  than interpreted as an empty graph.
+- Git 2.30 or newer and a worktree for vendoring, updates, CI checks and adoption.
+- pnpm 9 or 10 for automatic installation. A newer major requires the explicit
+  `--allow-untested-pnpm` opt-in; that flag does not add support for a new lock
+  schema.
+- Network access for registry downloads, updates and OSV refreshes. Ordinary
+  integrity verification and `own ci` are offline.
+
+npm aliases, catalogs, workspace links and peer-qualified resolutions are read
+from supported locks. Non-registry edges are preserved, not reported as npm
+versions. `own scan --include-dev` adds informational development-dependency
+rows; it is not a recursive vulnerability scan of every dependency.
+`scan` can run before `init`; commands consuming own state require initialization.
+
+## Installation
+
+### Build from source
+
+The repository pins Rust **1.99.1**, including rustfmt and clippy. No separate
+minimum-supported-Rust-version guarantee is declared.
+
+```sh
+git clone https://github.com/YourFriendPollux/own.git
+cd own
+cargo build --release --locked -p own-cli -p own-verify
+mkdir -p "$HOME/.local/bin"
+install -m 0755 target/release/own target/release/own-verify "$HOME/.local/bin/"
+own --version
 ```
 
-The installer defaults to `OWN_REPO=YourFriendPollux/own` and verifies the
-cosign keyless bundle (`<asset>.bundle`) and the SLSA provenance attestation
-before installing anything. It fetches the correct cosign build per OS
-(linux/darwin, amd64/arm64) and expects the generator's `multiple.intoto.jsonl`
-(override with `OWN_PROVENANCE_ASSET`). Release targets are `linux-amd64`,
-`linux-arm64` (cross-compiled) and `darwin-arm64` — there is no Windows and no
-`darwin-x64` build. **None of this has been exercised against a real release**:
-no release exists yet, and this host has no cosign.
+Ensure `$HOME/.local/bin` is on PATH. The build produces two binaries; neither
+is installed automatically by Cargo's workspace build.
 
-## Quick start
+### Install a signed release
 
-```bash
-own init                                  # own.toml, empty own.lock, .gitignore/.gitattributes
-own scan                                  # eligibility table of runtime deps (network)
-own add zod@3.22.4                        # vendor byte-identical + integrity + license check
-own verify                                # offline integrity vs own.lock
-own ci                                    # CI gate: verify + coherence + diamonds + licenses
-own osv-fetch && own check                # CVE E0 alerts from the OSV dump
-own licenses --write                      # regenerate vendor/own/LICENSES.md
-own diff zod@3.22.4 zod@3.23.8            # risk signals between two versions
-own update zod@3.23.8                     # single-transaction update (+ PR unless --no-pr)
-own sbom --format both --output sbom.json --vex-output vex.json
-own eject --adopt --yes                   # adopt vendor/ as first-party
-own-verify                                # minimal offline verifier (no network deps)
+From a trusted checkout, and only after assets for the selected tag exist:
+
+```sh
+OWN_VERSION=v0.1.0 ./scripts/install-own.sh
 ```
 
-## Guarantees (invariants)
+The installer requires trusted, preinstalled `cosign` and `slsa-verifier`, plus
+curl, tar, install and a SHA-256 checksum tool. It downloads the archive,
+checksum, cosign bundle and signed SLSA `multiple.intoto.jsonl`, binds them to
+the artifact, repository and exact tag, and verifies them before installing.
+`OWN_BIN_DIR`, `OWN_REPO` and `OWN_PROVENANCE_ASSET` configure destination,
+repository and provenance asset name. Verification tools are not bootstrapped
+from the downloads they would authenticate.
 
-- **INV-1** byte identity with the published tarball; `own` never writes inside `vendor/own/<dir>/`
-- **INV-2/3** registry URL + SRI sha512 + tarball sha256 verified *before* extraction; extraction reads the verified cache fd (no TOCTOU)
-- **INV-8** `own verify` is fully offline and binds the actual manifest records
-  (digest, file count, total size) to `own.lock` before checking disk state
-- **INV-9** every writing command is transactional: the exclusive lock is taken **before** any journal recovery, so a concurrent `own` gets `LOCK_BUSY` instead of rolling back the active transaction. The journal, the backups and every `rename` are `fsync`ed (file + parent directory) before the work they protect, so recovery also survives a power loss, not just `kill -9`. SIGINT/SIGTERM leave the journal `started` and the next writing command restores it (`W_TXN_RECOVERED`): the handler is async-signal-safe and touches nothing.
-- **INV-10** byte-reproducible outputs; inject the clock with `OWN_NOW` (RFC 3339 UTC)
-- Golden hash vectors from SPEC §7.3 are unit tests in `own-core`
+The release workflow defines **linux-amd64**, **linux-arm64** and
+**darwin-arm64** archives. Windows and darwin-x64 are not release targets.
+A prepared workflow or a passing local installer test is not proof of a
+published, successfully signed release.
 
-## Layout
+## Use in an existing project
 
+The exact package version must already be resolved in the project's supported
+lockfile. The following example assumes `zod@3.22.4` is present:
+
+```sh
+own init
+own scan
+own add zod@3.22.4 --allow-diamond vendor-all
+own verify
+own verify --installed
+own ci
+own licenses --write
+own-verify --installed
 ```
-crates/own-core      lock, manifest, JCS (RFC 8785), canonical TOML writer, verify, transactions
-crates/own-policy    eligibility §9.1, SPDX §9.3, npm semver, pnpm-lock v9 parser
-crates/own-net       registry client, OSV dump fetch (§10.2 network policy)
-crates/own-extract   hardened tarball extraction (§11.2, 23 hostile tests)
-crates/own-cli       the `own` binary
-crates/own-verify    minimal offline verifier (no reqwest in its dep tree)
-fuzz/                cargo-fuzz targets: extraction, packument, SPDX, OSV (corpus is gitignored, regenerated by cargo fuzz)
-scripts/             day1.sh (Go/No-Go), corpus.txt (250 pkgs ranked by measured
-                     weekly downloads) + corpus-build.py (regenerates it, measures
-                     §9.1 eligibility), e2e-pnpm.sh (pnpm 9/10 end-to-end), install-own.sh
+
+`init` creates configuration, an empty lock and the vendoring layout, and
+updates Git ignore/attribute rules without excluding vendored bytes from Git.
+`add` verifies registry metadata and tarball integrity before publication,
+checks eligibility and license policy, updates overrides and runs pnpm with
+installation scripts disabled. It performs a forced post-install pass and
+checks the installed copies. **Budget disk space for pnpm's forced installation
+of optional platform variants.**
+
+As an alternative to automatic installation, deliberately split preparation
+and installation:
+
+```sh
+own add zod@3.22.4 --allow-diamond vendor-all --no-install
+pnpm install --ignore-scripts
+own verify --installed
+own ci
 ```
 
-Note: `SPEC.md` and `docs/` are **not part of this published archive**. The
-normative identifiers (INV-n, §sections) referenced in code and tests are
-defined in the spec; see the repository history or request it from the
-maintainers. CODEOWNERS currently points to `@YourFriendPollux` (individual
-maintainer) until an org team exists.
+`--no-install` explicitly skips post-install verification; it is not proof that
+an application can build. Run the project's own build and tests afterwards.
+A project-wide linter may need to exclude third-party files under
+`vendor/own/**` from application-style rules. Keep those files tracked by Git;
+do not solve a lint problem by ignoring the vendored tree in `.gitignore`.
 
-## Quality gates (CI)
+### Commands and boundaries
 
-`cargo fmt --check` · `clippy -D warnings` · `cargo test --workspace --locked` ·
-`cargo deny check` · `cargo vet --locked` (audit coverage remains incomplete) ·
-fuzz smoke (4 targets, cargo-fuzz installed in CI) ·
-determinism check (INV-10, non-empty synthetic offline fixture; compares verifier
-output and CycloneDX bytes and asserts the component is present).
-Current local verification: **178 workspace tests pass**, 5 opt-in network
-tests are excluded from this count.
-`cargo deny` passes with duplicate-version warnings; `cargo vet` reports
-21 dependencies lacking audit coverage. These are local results, not evidence
-that hosted CI or release signing passed.
+| Command | Behavior |
+|---|---|
+| `scan` | Registry eligibility for dependencies declared by lock importers. |
+| `add` | Verified verbatim vendoring; explicit diamond and license decisions. |
+| `verify`, `own-verify` | Offline lock/manifest/file checks; `--installed` additionally checks discovered pnpm copies. |
+| `ci` | Offline verification, override/lock coherence, dependent/version coverage, license policy and generated license-document checks. Requires pnpm-lock.yaml. |
+| `licenses --write`, `policy-sync` | License inventory generation and policy re-evaluation. |
+| `migrate` | Validates the current schema; **schema 1 is current and migration is a no-op**. Other schemas are refused. |
+| `osv-fetch`, `check` | OSV snapshot refresh and advisory evaluation for owned packages. Missing or stale snapshots are not silently clean. |
+| `diff` | Offline comparison of two versions already present in own.lock and on disk. `--from-cache` is refused. |
+| `update` | Transactional update with offline verification. Its default downstream path would create a branch, commit, push and PR; use `--no-pr` to disable that automation. |
+| `sbom` | CycloneDX 1.5 and/or OpenVEX. VEX requires a usable local OSV snapshot; no stale/missing-snapshot CLI opt-out is exposed by this command. |
+| `slice`, `check --e1/--e2` | Experimental reachability evidence; slicing does not rewrite or reduce the vendored package. |
+| `verify-signature` | External cosign verification, optionally with SLSA provenance verification. Requires appropriate trusted tools and may use network access. |
+| `eject --adopt` | Adopts the files as first-party, keeps files/license notices/overrides, removes own bookkeeping and runs installation/build checks. Requires a clean worktree and confirmation. |
 
-Measured on 2026-11-14 against the public npm registry:
+`verify --remote` and `check --remote` are currently refused; use the supported
+registry downloads and local OSV snapshot commands rather than treating these
+options as implemented remote verification. See each
+command's `--help` for its actual options.
 
-- `scripts/e2e-pnpm.sh` — pnpm **9.15.9** and **10.34.9**: `own add zod@3.22.4`,
-  then `pnpm install` and `pnpm install --frozen-lockfile` both stable,
-  `require('zod')` resolves, the copy pnpm installs is **byte-identical** to
-  `vendor/own/zod@3.22.4`, and `own verify --installed` is clean. Appending to a
-  vendored file gives `DRIFT_MODIFIED` (exit 1), an unlisted file gives
-  `DRIFT_EXTRA`, restoring the bytes returns exit 0, and `own-verify` reports the
-  same finding from the same lock.
-- The same script also pins the §5 prerequisite: in a directory that is not a
-  work tree, `own add` exits 2 with a `GIT_ERROR` naming `git init` and vendors
-  nothing.
-- Lifecycle probe (§9.1, the `[À VALIDER J1]` line): pnpm 9 **does** run a
-  `file:` dependency's `postinstall` (marker written, 2 `pnpm:lifecycle` events
-  seen, so the detector's ≥ 1 requirement holds); pnpm 10 reports "Ignored build
-  scripts" and runs nothing (0 events). Neither major ran a script for the
-  vendored package itself.
-- `scripts/day1.sh` step 1 on the committed corpus: **106 / 250 eligible**
-  (license allowlist included), 0 packages skipped, threshold 15 — GO. With the
-  §9.1 packument criteria alone (no license, no size) it is 122 / 250.
-- OSV end to end: `own osv-fetch` against the configured public source took
-  14 s and wrote a 13 KB dump covering the single vendored package; `own check`
-  exited 1 with the four advisories affecting lodash 4.17.20, each also present
-  in the JSON `findings` list (not only in `data.alerts`).
+## Integrity and reproducibility
 
-Historical measurement of `own ci`: **16 ms release / 145 ms debug**
-on a 12-package, 9.4 MB vendored repo (budget §8.1: < 30 s on 50 pkgs / 50 MB).
+- Registry SRI SHA-512 and tarball SHA-256 are checked before extraction.
+- Hardened extraction refuses unsafe paths, links, unsupported members and
+  built-in resource-limit violations.
+- Offline verification binds actual manifest records, counts and total size to
+  `own.lock`, then detects missing, extra or changed files. Both verifiers share
+  the installed-file checks.
+- Vendoring, license/SBOM state mutations and adoption use the transaction layer's
+  exclusive locking, journaled backups and recovery. OSV snapshot replacement
+  is not a journaled transaction with the same durability guarantees.
+  An interrupted process leaves recovery work for the next writing command;
+  this is not an immediate rollback from a signal handler.
+- Reproducibility requires identical inputs and clock settings. SBOM creation
+  timestamps follow `OWN_NOW`, then `SOURCE_DATE_EPOCH`, then the real clock;
+  two real-time runs can legitimately have different timestamps.
 
-## Known limits (honest)
+Do not hand-edit vendored source in verbatim mode. Use a version update or
+explicit adoption when you need to maintain the source yourself.
 
-- `own-verify --installed` uses the same offline installed-file comparison as
-  `own verify --installed`; malformed or missing project inputs are explicit errors.
-- `git` (>= 2.30) is a prerequisite of `add`, `update`, `eject` and `ci`, and any
-  failing git command is a `GIT_ERROR` (SPEC §5). A directory that is not a work
-  tree therefore fails the git-ignore probe with "not a git repository — run
-  `git init` first", even though `own init` itself accepts such a directory.
-- Integrity anchoring is local (lock + manifests in the same repo): `own verify`
-  detects drift, not a malicious commit that updates everything at once.
-- **Provenance is detected, not verified**: when a version ships npm attestations
-  (Sigstore) or a registry ECDSA signature, `own add`/`own update` say so
-  explicitly (`W_PROVENANCE_UNVERIFIED`) and the lock keeps
-  `provenance_level = "integrity-only"` — it never claims `attested` or
-  `registry-signed` without having verified the signature (spec §8.1 step 4 is
-  not implemented yet; INV-7 forbids the shortcut).
-- Interrupting a run (Ctrl-C, SIGTERM) does **not** roll back immediately: the
-  process exits 130/143 and the next writing command restores the backup. This
-  is deliberate — rolling back from a signal handler is not async-signal-safe.
-- `cargo vet` currently fails on dependencies without audit coverage. Existing
-  exemptions are not independent audits; new exemptions are not added just to
-  make the gate green. The count is **22** unvetted crates (as of 2026-11-14).
-  Importing Mozilla's audit set was measured and does not clear them: `cargo-vet`
-  refuses to persist `imports.lock` while the run fails, so the import cannot be
-  adopted until the gap is closed — and trusting an individual reviewer
-  (`cargo vet trust`) is a maintainer decision, not a gate-flipping trick.
-- `own verify-signature` shells out to `cosign` (SPEC §8.3). No cosign is
-  installed here, so only the refusals are observed: a missing path is named
-  (`IO_ERROR: <path> not readable`, exit 2) and an absent cosign is
-  `IO_ERROR: cosign binary not found` (exit 2). Keyless verification of a real
-  bundle, and the installer's signature + provenance steps, remain unexercised.
-- `own ci` requires `pnpm-lock.yaml` (its override/coherence check reads it), so
-  it fails with `IO_ERROR` (exit 2) on a repo that never ran `pnpm install`.
-- Toolchain: `rust-toolchain.toml` pins Rust 1.99.1 (`rustfmt` + `clippy`). The
-  MSRV is not declared in `Cargo.toml` yet and no MSRV job runs in CI.
+## Security limits
 
-## Status
+- **npm provenance is detected, not cryptographically verified.** Advertised
+  attestations and registry signatures emit `W_PROVENANCE_UNVERIFIED`; package
+  records remain `integrity-only`. This is distinct from verification of the
+  tool's signed release archive.
+- Integrity is anchored locally. An attacker changing lock, manifests and
+  package files together is outside ordinary drift detection.
+- Installed-file checks cover discovered materialized copies; they do not
+  prove that every package was installed or that the application builds.
+- The public OSV npm archive is validated end to end, preserving raw ECOSYSTEM
+  tokens such as NocoDB `fixed="2026.04.1"`; non-evaluable constraints are marked
+  `OSV_UNEVALUABLE`, never silently reported as clean. A missing or stale snapshot
+  still does not establish current advisory coverage.
+- Advisory checks cover owned packages, not every dependency or the application.
+  Missing hints keep reachability results conservative; no alert is not a
+  security guarantee.
+- Python/PyPI vendoring is unimplemented; ordinary `add --ecosystem pypi`
+  returns `ECOSYSTEM_UNSUPPORTED`. Do not combine unsupported ecosystem flags
+  with the special `vendor-all` path or treat that combination as supported.
+- Only `vendor-all` has a dedicated diamond-resolution path. Accepted
+  `keep-external`/`unify` values do not establish full implementations of those
+  strategies; `update --allow-diamond` is not consumed by its implementation.
+- `[registry].url`, an explicitly configured `[registry].mirror`, `[net]` client
+  limits, `[security]` extraction limits and `[osv].url`/`max_download_mb` are
+  validated and used. They do not implement authenticated private-registry login,
+  OSV API mode (`check --remote` is refused) or any air-gap bootstrap claim.
+- Experimental E2 runs package entry code in a bounded child process; it is not
+  a purely static analysis, an application test suite or a certified sandbox.
+- Independent dependency audit coverage is incomplete. `cargo vet` is a required
+  CI gate; exemptions are not equivalent to external audits and must not be
+  added merely to make publishing pass.
 
-Phase 0's command set (spec weeks 1-14) is present: 0.1 Core, hardening,
-`own-verify`, 0.2 (OSV/check/diff/update), 0.3 (sbom/eject/verify-signature).
-This is not a claim of full spec conformance or a completed release audit.
-The next conformance priorities are:
+See [SECURITY.md](SECURITY.md) for reporting and trust boundaries.
 
-- OSV now checks snapshot/advisory structure and UTC timestamps, measures
-  elapsed age, and uses the system clock when `OWN_NOW` is absent. `check` and
-  VEX honor `local_path`, `max_age_days`, environment overrides and dated
-  id/alias exceptions. Expired exceptions retain the alert and emit
-  `W_IGNORE_EXPIRED`; stale overrides emit `W_OSV_STALE`. Cache paths must be
-  project-relative and contain no parent components. VEX refuses missing/stale
-  snapshots by default. The download path is now exercised end to end against
-  the public source (lodash 4.17.20: a 14 s fetch wrote a 13 KB dump covering
-  the only vendored package, and `check` reported the four advisories that
-  affect that version). Remaining work includes timestamp fractions, future
-  dates, unsupported-range handling, JSON warning coverage, explicit VEX
-  opt-outs, and publishing a dump — there is no publication feature at all. No
-  alert is still not a security guarantee.
-- Complete signature/provenance verification rather than upgrading detected
-  metadata into verified trust levels; close the outstanding dependency audits.
+## Repository and verification
 
-Phase 1 (slicing) still requires the §4 gate (>= 70% code reduction on the
-corpus). Phase 2 surfaces are present: E1/E2 reachability evidence
-(`own check --e1/--e2`, Annexes G/H) and `vendor-all` resolution from
-`pnpm-lock.yaml`; their presence does not certify the full phase's acceptance
-criteria. On the four real advisories that affect lodash 4.17.20 — none of which
-carry file or function hints — `--e1` and `--e2` keep every alert at E0, so the
-conservative rule holds and no downgrade is invented from missing information.
-Python vendoring is not implemented: `own add --ecosystem pypi` refuses with
-`ECOSYSTEM_UNSUPPORTED` (exit 2) rather than failing on a pnpm lock that a Python
-package never has. The referenced Annexes G/H are not present in the supplied
-normative source, and the source itself covers only Phase 0; the phase-2
-validation contract must therefore state these extensions and their proofs
-explicitly rather than claiming annex conformance.
+The seven-crate workspace contains core records/transactions, policy, networking,
+extraction, CLI, minimal verifier and experimental slicing. `schemas/` describes
+serialized data, `supply-chain/` holds audit policy, and `fuzz/fuzz_targets/`
+contains the fuzz harness sources. `scripts/install-own.sh` and
+`scripts/package-release.py` support distribution; `scripts/tests/` protects
+installer and packaging behavior.
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -v
+cargo deny check
+cargo vet --locked
+```
+
+CI also runs fuzz smoke and a non-empty offline determinism regression. Release
+jobs depend on the reusable CI workflow; a failing required gate blocks them.
+Test counts and network-dependent measurements are not frozen into documentation.
+Opt-in upstream tests are excluded from the ordinary offline suite.
+
+Generated build output, logs, fuzz corpora, caches and exploratory QA scripts are
+not part of the publication source tree. The published binary archives contain
+only `own` and `own-verify`; repository documentation is not bundled into them.
+`SPEC.md` and private design documents are not distributed here. Refer to the
+public command contracts and regression tests, and request the normative source
+from maintainers when a change needs its section identifiers.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT
+[MIT](LICENSE).

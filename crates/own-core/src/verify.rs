@@ -51,9 +51,13 @@ pub fn verify(
     policy_json: &serde_json::Value,
     overrides: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<VerifyOutcome, String> {
+    crate::config::validate_license_policy(policy_json)?;
+    let canonical_root = fs::canonicalize(root).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let root = canonical_root.as_path();
     let mut findings: Vec<Finding> = Vec::new();
 
-    let lock_path = root.join("own.lock");
+    let lock_path =
+        crate::path_safety::project_path(root, "own.lock").map_err(|e| format!("IO_ERROR: {e}"))?;
     let lock_text = fs::read_to_string(&lock_path)
         .map_err(|e| format!("IO_ERROR: own.lock unreadable: {e}"))?;
     let lock: Lock =
@@ -74,8 +78,10 @@ pub fn verify(
         ));
     }
 
-    let vendor = root.join("vendor/own");
-    let manifests = vendor.join(".manifests");
+    let vendor = crate::path_safety::project_path(root, "vendor/own")
+        .map_err(|e| format!("IO_ERROR: {e}"))?;
+    let manifests = crate::path_safety::project_path(root, "vendor/own/.manifests")
+        .map_err(|e| format!("IO_ERROR: {e}"))?;
 
     let mut seen_dirs: BTreeSet<String> = BTreeSet::new();
     let mut seen_manifests: BTreeSet<String> = BTreeSet::new();
@@ -93,12 +99,17 @@ pub fn verify(
                 &pkg.dir,
                 "dir field != vendor/own/<name>@<version>",
             ));
+            continue; // Never read a path that disagrees with the lock identity.
         }
         // manifest
-        let mpath = manifests.join(format!(
-            "{}.toml",
+        let pkg_root = crate::path_safety::project_path(root, &pkg.dir)
+            .map_err(|e| format!("IO_ERROR: {e}"))?;
+        let manifest_rel = format!(
+            "vendor/own/.manifests/{}.toml",
             crate::lock::dir_name(&pkg.name, &pkg.version)
-        ));
+        );
+        let mpath = crate::path_safety::project_path(root, &manifest_rel)
+            .map_err(|e| format!("IO_ERROR: {e}"))?;
         seen_manifests.insert(format!(
             "{}.toml",
             crate::lock::dir_name(&pkg.name, &pkg.version)
@@ -177,11 +188,17 @@ pub fn verify(
         }
 
         // per-file checks under vendor/own/<dir>
-        let pkg_root = root.join(&pkg.dir);
         let mut manifest_paths: BTreeSet<String> = BTreeSet::new();
         for f in &manifest.files {
             manifest_paths.insert(f.path.clone());
-            let fp = pkg_root.join(&f.path);
+            let fp =
+                match crate::path_safety::project_path(root, &format!("{}/{}", pkg.dir, f.path)) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        findings.push(Finding::err("DRIFT_EXTRA", &pdir, &f.path, &e.to_string()));
+                        continue;
+                    }
+                };
             match fs::symlink_metadata(&fp) {
                 Err(_) => findings.push(Finding::err(
                     "DRIFT_MISSING",
@@ -265,15 +282,32 @@ pub fn verify(
             for entry in WalkDir::new(&pkg_root).follow_links(false) {
                 let entry = match entry {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(e) => {
+                        findings.push(Finding::err("IO_ERROR", &pdir, &pkg.dir, &e.to_string()));
+                        continue;
+                    }
                 };
+                let rel = pathdiff(&pkg_root, entry.path());
+                if rel.is_empty() {
+                    continue;
+                }
                 if entry.file_type().is_symlink() {
-                    let rel = pathdiff(&pkg_root, entry.path());
                     findings.push(Finding::err("DRIFT_EXTRA", &pdir, &rel, "symlink present"));
                     continue;
                 }
+                if entry.file_type().is_dir() {
+                    let prefix = format!("{rel}/");
+                    if !manifest_paths.iter().any(|file| file.starts_with(&prefix)) {
+                        findings.push(Finding::err(
+                            "DRIFT_EXTRA",
+                            &pdir,
+                            &rel,
+                            "directory not in manifest tree",
+                        ));
+                    }
+                    continue;
+                }
                 if entry.file_type().is_file() {
-                    let rel = pathdiff(&pkg_root, entry.path());
                     if !manifest_paths.contains(&rel) {
                         findings.push(Finding::err(
                             "DRIFT_EXTRA",
@@ -282,6 +316,13 @@ pub fn verify(
                             "file not in manifest",
                         ));
                     }
+                } else {
+                    findings.push(Finding::err(
+                        "DRIFT_EXTRA",
+                        &pdir,
+                        &rel,
+                        "special file present",
+                    ));
                 }
             }
         } else {
@@ -295,7 +336,8 @@ pub fn verify(
 
         // license files present and matching lock.license_files
         for lf in &pkg.license_files {
-            let fp = pkg_root.join(&lf.path);
+            let fp = crate::path_safety::project_path(root, &format!("{}/{}", pkg.dir, lf.path))
+                .map_err(|e| format!("IO_ERROR: {e}"))?;
             match fs::read(&fp) {
                 Ok(d) => {
                     if sha256_hex(&d) != lf.sha256 {
@@ -362,11 +404,15 @@ pub fn verify(
     for p in &lock.packages {
         *counts.entry(p.name.as_str()).or_insert(0) += 1;
     }
-    let lock_overrides: serde_json::Map<String, serde_json::Value> = lock
+    let mut lock_overrides: serde_json::Map<String, serde_json::Value> = lock
         .packages
         .iter()
         .map(|p| {
-            let key = if counts.get(p.name.as_str()) == Some(&1) {
+            // vendor-all also uses an exact version selector when only one
+            // version is locked. Accept either single-version spelling, not
+            // both; the complete map equality below still rejects extras.
+            let key = if counts.get(p.name.as_str()) == Some(&1) && overrides.contains_key(&p.name)
+            {
                 p.name.clone()
             } else {
                 crate::lock::versioned_override_key(&p.name, &p.version)
@@ -374,6 +420,19 @@ pub fn verify(
             (key, serde_json::json!(format!("file:{}", p.dir)))
         })
         .collect();
+    // Alias selectors supplement, never replace, the canonical real-name keys.
+    // Every selector is bound to an existing locked package and its exact dir.
+    for (selector, value) in overrides {
+        if let Some(target) = npm_alias_target(selector) {
+            if lock
+                .packages
+                .iter()
+                .any(|p| p.name == target && *value == serde_json::json!(format!("file:{}", p.dir)))
+            {
+                lock_overrides.insert(selector.clone(), value.clone());
+            }
+        }
+    }
     if lock_overrides != *overrides {
         findings.push(Finding::err(
             "OVERRIDE_MISMATCH",
@@ -384,7 +443,8 @@ pub fn verify(
     }
 
     // LICENSES.md
-    let lm_path = vendor.join("LICENSES.md");
+    let lm_path = crate::path_safety::project_path(root, "vendor/own/LICENSES.md")
+        .map_err(|e| format!("IO_ERROR: {e}"))?;
     match &lock.metadata.licenses_md_sha256 {
         Some(h) => {
             if !lm_path.exists() {
@@ -459,6 +519,22 @@ fn pathdiff(base: &Path, p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Target name of pnpm's exact npm-alias selector. Parent selectors and empty
+/// identities are not generated by own and must not become ignored overrides.
+pub fn npm_alias_target(selector: &str) -> Option<&str> {
+    let (alias, spec) = selector.split_once("@npm:")?;
+    let (name, range) = spec.rsplit_once('@')?;
+    if alias.is_empty()
+        || name.is_empty()
+        || range.is_empty()
+        || selector.contains('>')
+        || range.contains(':')
+    {
+        return None;
+    }
+    Some(name)
+}
+
 /// SPEC §8.1 `verify --installed`: compare the copies pnpm materialised in
 /// `node_modules/.pnpm` against the manifests. Every **installed** file must
 /// exist in the manifest with the same bytes and size (`DRIFT_INSTALLED`);
@@ -477,14 +553,8 @@ pub fn verify_installed(root: &Path) -> Result<Vec<Finding>, String> {
     let mut findings: Vec<Finding> = Vec::new();
     for pkg in &lock.packages {
         let label = format!("{}@{}", pkg.name, pkg.version);
-        // pnpm layout: node_modules/.pnpm/<name>@<ver>/node_modules/<name>
-        // (scoped names use @scope+name for the version directory, §5)
-        let installed = root
-            .join("node_modules/.pnpm")
-            .join(crate::lock::dir_name(&pkg.name, &pkg.version))
-            .join("node_modules")
-            .join(&pkg.name);
-        if !installed.is_dir() {
+        let copies = installed_copies(root, pkg)?;
+        if copies.is_empty() {
             continue;
         }
         let mpath = root.join("vendor/own/.manifests").join(format!(
@@ -504,44 +574,46 @@ pub fn verify_installed(root: &Path) -> Result<Vec<Finding>, String> {
             .iter()
             .map(|f| (f.path.as_str(), (f.sha256.as_str(), f.size)))
             .collect();
-        for entry in WalkDir::new(&installed).follow_links(false) {
-            let entry = entry.map_err(|e| format!("IO_ERROR: {e}"))?;
-            let rel = match entry.path().strip_prefix(&installed) {
-                Ok(r) => r.to_string_lossy().replace('\\', "/"),
-                Err(_) => continue,
-            };
-            if rel.is_empty() {
-                continue;
-            }
-            let md = entry.metadata().map_err(|e| format!("IO_ERROR: {e}"))?;
-            if md.is_dir() {
-                continue;
-            }
-            if !md.is_file() {
-                findings.push(Finding::err(
-                    "DRIFT_INSTALLED",
-                    &label,
-                    &rel,
-                    "installed entry is not a regular file",
-                ));
-                continue;
-            }
-            let data = fs::read(entry.path()).map_err(|e| format!("IO_ERROR: {e}"))?;
-            let h = sha256_hex(&data);
-            match known.get(rel.as_str()) {
-                Some((expected, size)) if *expected == h && *size == data.len() as u64 => {}
-                Some(_) => findings.push(Finding::err(
-                    "DRIFT_INSTALLED",
-                    &label,
-                    &rel,
-                    "installed bytes differ from manifest",
-                )),
-                None => findings.push(Finding::err(
-                    "DRIFT_INSTALLED",
-                    &label,
-                    &rel,
-                    "installed file is not in the manifest",
-                )),
+        for installed in copies {
+            for entry in WalkDir::new(&installed).follow_links(false) {
+                let entry = entry.map_err(|e| format!("IO_ERROR: {e}"))?;
+                let rel = match entry.path().strip_prefix(&installed) {
+                    Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                    Err(_) => continue,
+                };
+                if rel.is_empty() {
+                    continue;
+                }
+                let md = entry.metadata().map_err(|e| format!("IO_ERROR: {e}"))?;
+                if md.is_dir() {
+                    continue;
+                }
+                if !md.is_file() {
+                    findings.push(Finding::err(
+                        "DRIFT_INSTALLED",
+                        &label,
+                        &rel,
+                        "installed entry is not a regular file",
+                    ));
+                    continue;
+                }
+                let data = fs::read(entry.path()).map_err(|e| format!("IO_ERROR: {e}"))?;
+                let h = sha256_hex(&data);
+                match known.get(rel.as_str()) {
+                    Some((expected, size)) if *expected == h && *size == data.len() as u64 => {}
+                    Some(_) => findings.push(Finding::err(
+                        "DRIFT_INSTALLED",
+                        &label,
+                        &rel,
+                        "installed bytes differ from manifest",
+                    )),
+                    None => findings.push(Finding::err(
+                        "DRIFT_INSTALLED",
+                        &label,
+                        &rel,
+                        "installed file is not in the manifest",
+                    )),
+                }
             }
         }
     }
@@ -553,6 +625,71 @@ pub fn verify_installed(root: &Path) -> Result<Vec<Finding>, String> {
         ))
     });
     Ok(findings)
+}
+
+/// Discover physical copies instead of guessing one virtual-store key. File
+/// dependencies, aliases and peer contexts all use different pnpm keys.
+/// The store key remains an identity anchor if package.json itself is tampered.
+fn installed_copies(
+    root: &Path,
+    pkg: &crate::lock::Package,
+) -> Result<BTreeSet<std::path::PathBuf>, String> {
+    fn entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
+        match fs::read_dir(dir) {
+            Ok(rd) => rd
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("IO_ERROR: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("IO_ERROR: {}: {e}", dir.display())),
+        }
+    }
+    fn key_matches(key: &str, prefix: &str) -> bool {
+        key.strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['_', '(']))
+    }
+    let modules = root.join("node_modules");
+    let store = modules.join(".pnpm");
+    let registry_key = crate::lock::dir_name(&pkg.name, &pkg.version);
+    let file_key = format!(
+        "{}@file+{}",
+        pkg.name.replace('/', "+"),
+        pkg.dir.replace('/', "+")
+    );
+    let mut locations = vec![(modules, false)];
+    for entry in entries(&store)? {
+        if entry
+            .file_type()
+            .map_err(|e| format!("IO_ERROR: {e}"))?
+            .is_dir()
+        {
+            let key = entry.file_name().to_string_lossy().into_owned();
+            locations.push((
+                entry.path().join("node_modules"),
+                key_matches(&key, &registry_key) || key_matches(&key, &file_key),
+            ));
+        }
+    }
+    let mut copies = BTreeSet::new();
+    for (location, anchored) in locations {
+        let mut candidates = Vec::new();
+        for entry in entries(&location)? {
+            if entry.file_name().to_string_lossy().starts_with('@') {
+                candidates.extend(entries(&entry.path())?.into_iter().map(|e| e.path()));
+            } else if !entry.file_name().to_string_lossy().starts_with('.') {
+                candidates.push(entry.path());
+            }
+        }
+        for path in candidates {
+            let metadata_matches = fs::read(path.join("package.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|value| value["name"] == pkg.name && value["version"] == pkg.version);
+            if path.is_dir() && (metadata_matches || anchored && path == location.join(&pkg.name)) {
+                copies.insert(fs::canonicalize(&path).map_err(|e| format!("IO_ERROR: {e}"))?);
+            }
+        }
+    }
+    Ok(copies)
 }
 
 /// Recompute `package_files_sha256` for a directory tree (used by add/update and tests).
@@ -806,6 +943,73 @@ mod tests {
             serde_json::json!("file:vendor/own/a@2.0.0"),
         );
         ov
+    }
+
+    #[test]
+    fn installed_verifier_checks_file_alias_and_every_peer_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        two_version_tree(tmp.path(), &versioned_overrides());
+        for store in [
+            "a@file+vendor+own+a@1.0.0",
+            "a@file+vendor+own+a@1.0.0_peer@2.0.0",
+            "a@1.0.0_peer@3.0.0",
+        ] {
+            let installed = tmp
+                .path()
+                .join("node_modules/.pnpm")
+                .join(store)
+                .join("node_modules/a");
+            fs::create_dir_all(installed.join("dist")).unwrap();
+            fs::write(installed.join("dist/index.js"), b"tampered\n").unwrap();
+            let findings = verify_installed(tmp.path()).unwrap();
+            assert!(
+                findings.iter().any(|f| f.code == "DRIFT_INSTALLED"
+                    && f.package == "a@1.0.0"
+                    && f.path == "dist/index.js"),
+                "unobserved pnpm copy {store}: {findings:?}"
+            );
+            fs::write(installed.join("dist/index.js"), b"module.exports=1\n").unwrap();
+            assert!(verify_installed(tmp.path()).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn alias_overrides_are_bound_to_the_real_locked_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut overrides = versioned_overrides();
+        overrides.insert(
+            "old@npm:a@^1.0.0".into(),
+            serde_json::json!("file:vendor/own/a@1.0.0"),
+        );
+        two_version_tree(tmp.path(), &overrides);
+        assert!(verify(
+            tmp.path(),
+            &crate::canonical::default_license_policy(),
+            &overrides
+        )
+        .unwrap()
+        .findings
+        .is_empty());
+        for bad in [
+            "old",
+            "old@npm:b@1.0.0",
+            "old@npm:a@",
+            "old@npm:a@1.0.0>other",
+        ] {
+            let mut invalid = versioned_overrides();
+            invalid.insert(bad.into(), serde_json::json!("file:vendor/own/a@1.0.0"));
+            let findings = verify(
+                tmp.path(),
+                &crate::canonical::default_license_policy(),
+                &invalid,
+            )
+            .unwrap()
+            .findings;
+            assert!(
+                findings.iter().any(|f| f.code == "OVERRIDE_MISMATCH"),
+                "accepted {bad}: {findings:?}"
+            );
+        }
     }
 
     #[test]

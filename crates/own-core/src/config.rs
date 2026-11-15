@@ -42,30 +42,50 @@ concurrency = 8
 pub fn license_policy_json(toml_text: &str) -> Result<serde_json::Value, String> {
     let v: toml::Value =
         toml::from_str(toml_text).map_err(|e| format!("PARSE_ERROR: own.toml: {e}"))?;
-    let lic = v
-        .get("license")
-        .cloned()
-        .unwrap_or_else(|| toml::Value::Table(Default::default()));
-    let mut m = serde_json::Map::new();
-    for key in ["allow", "review", "deny"] {
-        if let Some(arr) = lic.get(key).and_then(|a| a.as_array()) {
-            m.insert(
-                key.to_string(),
-                serde_json::Value::Array(
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(|s| serde_json::json!(s)))
-                        .collect(),
-                ),
-            );
+    let table = v
+        .as_table()
+        .ok_or("PARSE_ERROR: own.toml root must be a table")?;
+    if let Some(version) = table.get("schema_version") {
+        if version.as_integer() != Some(crate::canonical::SCHEMA_VERSION as i64) {
+            return Err("CONFIG_SCHEMA_UNSUPPORTED: own.toml schema_version".into());
         }
     }
-    if let Some(u) = lic.get("unknown").and_then(|u| u.as_str()) {
-        m.insert("unknown".to_string(), serde_json::json!(u));
-    }
-    if m.is_empty() {
+    let Some(lic) = table.get("license") else {
+        return Ok(default_license_policy());
+    };
+    let policy =
+        serde_json::to_value(lic).map_err(|e| format!("PARSE_ERROR: own.toml license: {e}"))?;
+    validate_license_policy(&policy)?;
+    if policy.as_object().unwrap().is_empty() {
         return Ok(default_license_policy());
     }
-    Ok(serde_json::Value::Object(m))
+    Ok(policy)
+}
+
+/// Refuse malformed policy values instead of normalizing them into a different
+/// policy. Missing fields are permitted; malformed present fields never are.
+pub fn validate_license_policy(policy: &serde_json::Value) -> Result<(), String> {
+    let object = policy
+        .as_object()
+        .ok_or("PARSE_ERROR: license policy must be an object")?;
+    for (key, value) in object {
+        match key.as_str() {
+            "allow" | "review" | "deny" => {
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| format!("PARSE_ERROR: license.{key} must be an array"))?;
+                if arr.iter().any(|v| v.as_str().is_none_or(|s| s.is_empty())) {
+                    return Err(format!(
+                        "PARSE_ERROR: license.{key} entries must be nonempty strings"
+                    ));
+                }
+            }
+            "unknown" if value.as_str() == Some("deny") => {}
+            "unknown" => return Err("PARSE_ERROR: license.unknown must be 'deny'".into()),
+            _ => return Err(format!("PARSE_ERROR: unknown license field: {key}")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

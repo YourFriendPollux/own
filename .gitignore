@@ -1,7 +1,37 @@
+# Runtime cache and transaction state
 .own/
-!vendor/own/**
-/target
-# cargo-fuzz has its own workspace: its build artifacts are not the project's
+
+# Rust and cargo-fuzz build/test output
+/target/
 /fuzz/target/
-# corpus libFuzzer : artefacts générés (hash-nommés), régénérables via cargo fuzz
 /fuzz/corpus/
+/fuzz/artifacts/
+
+# Python caches and local analysis output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local release output, logs and editor files
+/dist/
+/own-*.tar.gz
+/own-*.tar.gz.sha256
+/own-*.tar.gz.bundle
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local credentials are never source inputs
+.env
+.env.*
+!.env.example
+
+# Vendored package bytes must remain trackable, including ignored extensions.
+!vendor/own/**

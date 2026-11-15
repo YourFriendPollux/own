@@ -4,8 +4,11 @@
 //! are listed with status `dev`).
 
 use own_core::lock::parse_lock;
-use own_net::{build_client, fetch_packument, NetConfig};
-use own_policy::{eligibility, pnpm_lock::parse_pnpm_lock};
+use own_net::{build_client, fetch_packument};
+use own_policy::{
+    eligibility,
+    pnpm_lock::{parse_pnpm_lock, registry_dependency},
+};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -22,6 +25,7 @@ pub struct ScanRow {
 }
 
 pub fn scan(root: &Path, include_dev: bool) -> Result<(Vec<ScanRow>, u32), String> {
+    let settings = crate::project_config::load(root)?;
     let text = std::fs::read_to_string(root.join("pnpm-lock.yaml"))
         .map_err(|e| format!("PARSE_ERROR: pnpm-lock.yaml: {e}"))?;
     let lock = parse_pnpm_lock(&text)?;
@@ -38,48 +42,49 @@ pub fn scan(root: &Path, include_dev: bool) -> Result<(Vec<ScanRow>, u32), Strin
     let mut dev_only: BTreeSet<(String, String)> = BTreeSet::new();
     for im in &lock.importers {
         for (n, spec, v) in &im.deps {
-            if spec.starts_with("file:vendor/own/") || v.starts_with("file:vendor/own/") {
-                continue; // vendored: shown via own.lock, not re-fetched
+            if let Some(identity) = registry_dependency(n, Some(spec), v) {
+                runtime.insert(identity);
             }
-            runtime.insert((n.clone(), v.clone()));
+        }
+        for (n, spec, v) in &im.dev_deps {
+            if let Some(identity) = registry_dependency(n, Some(spec), v) {
+                dev_only.insert(identity);
+            }
         }
     }
-    // dev-only: declared in devDependencies — our parser doesn't separate; approximate:
-    // a dep is dev-only if it appears in no runtime chain. We keep the simple rule:
-    // all importer deps are runtime for scan purposes (devDependencies parsing is a
-    // later refinement; --include-dev stays informational).
-    let _ = include_dev;
-    let _ = &mut dev_only;
+    dev_only.retain(|identity| !runtime.contains(identity));
+    if include_dev {
+        runtime.extend(dev_only.iter().cloned());
+    }
+    if runtime.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
 
-    let cfg = NetConfig::default();
+    let cfg = settings.net;
     let client = build_client(&cfg)?;
-    let names: Vec<String> = runtime.iter().map(|(n, _)| n.clone()).collect();
+    let identities: Vec<(String, String)> = runtime.into_iter().collect();
     let conc = cfg.concurrency.max(1);
-    let chunked: Vec<Vec<String>> = names.chunks(conc.max(1)).map(|c| c.to_vec()).collect();
-    // rayon parallel fetch
-    let results: Vec<(String, Result<serde_json::Value, String>)> = chunked
-        .par_iter()
-        .flat_map(|chunk| {
-            chunk.par_iter().map(|name| {
+    // A dedicated pool enforces the cap; nested parallel chunks did not.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(conc)
+        .build()
+        .map_err(|e| format!("NETWORK_ERROR: {e}"))?;
+    let results: Vec<_> = pool.install(|| {
+        identities
+            .par_iter()
+            .map(|(name, version)| {
                 let r = fetch_packument(&client, &cfg, name).and_then(|bytes| {
-                    serde_json::from_slice(&bytes)
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
                         .map_err(|e| format!("PARSE_ERROR: packument {name}: {e}"))
                 });
-                (name.clone(), r)
+                ((name.clone(), version.clone()), r)
             })
-        })
-        .collect();
-    let mut errors = 0u32;
+            .collect()
+    });
     let mut rows = Vec::new();
-    for (name, res) in results {
-        let version = runtime
-            .iter()
-            .find(|(n, _)| n == &name)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
+    for ((name, version), res) in results {
         match res {
             Err(e) => {
-                errors += 1;
                 rows.push(ScanRow {
                     name,
                     version,
@@ -96,19 +101,23 @@ pub fn scan(root: &Path, include_dev: bool) -> Result<(Vec<ScanRow>, u32), Strin
                 // if already vendored, short-circuit before fetch result usage
                 if own_lock
                     .as_ref()
-                    .map(|l| l.packages.iter().any(|p| p.name == name))
+                    .map(|l| {
+                        l.packages
+                            .iter()
+                            .any(|p| p.name == name && p.version == version)
+                    })
                     .unwrap_or(false)
                 {
                     rows.push(ScanRow {
                         name: name.clone(),
-                        version,
+                        version: version.clone(),
                         size: None,
                         license: own_lock
                             .as_ref()
                             .unwrap()
                             .packages
                             .iter()
-                            .find(|p| p.name == name)
+                            .find(|p| p.name == name && p.version == version)
                             .map(|p| p.license_expression.clone()),
                         deps: 0,
                         install_scripts: 0,
@@ -138,7 +147,11 @@ pub fn scan(root: &Path, include_dev: bool) -> Result<(Vec<ScanRow>, u32), Strin
                     Some(v) => {
                         let vendored = own_lock
                             .as_ref()
-                            .map(|l| l.packages.iter().any(|p| p.name == name))
+                            .map(|l| {
+                                l.packages
+                                    .iter()
+                                    .any(|p| p.name == name && p.version == version)
+                            })
                             .unwrap_or(false);
                         if vendored {
                             (
@@ -190,6 +203,17 @@ pub fn scan(root: &Path, include_dev: bool) -> Result<(Vec<ScanRow>, u32), Strin
             }
         }
     }
+    for row in &mut rows {
+        if dev_only.contains(&(row.name.clone(), row.version.clone()))
+            && !row.status.starts_with("unknown:")
+        {
+            row.status = "dev".into();
+        }
+    }
+    let errors = rows
+        .iter()
+        .filter(|row| row.status.starts_with("unknown:"))
+        .count() as u32;
     rows.sort_by(|a, b| {
         (a.name.as_str(), a.version.as_str()).cmp(&(b.name.as_str(), b.version.as_str()))
     });

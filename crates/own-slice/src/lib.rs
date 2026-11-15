@@ -39,7 +39,7 @@ impl SliceReport {
     }
 }
 
-const JS_EXTS: [&str; 3] = ["js", "mjs", "cjs"];
+const JS_EXTS: [&str; 8] = ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"];
 
 fn is_js(path: &Path) -> bool {
     path.extension()
@@ -55,39 +55,50 @@ fn resolve(spec: &str, from_file: &Path, pkg_root: &Path) -> Option<PathBuf> {
     }
     let base = from_file.parent()?.join(spec);
     let base = base.normalize();
-    let mut candidates = vec![
-        base.clone(),
-        base.join("index.js"),
-        base.join("index.mjs"),
-        base.join("index.cjs"),
-        base.join("index.json"),
-    ];
-    // F: append-extension candidates (require('./a.min') -> a.min.js) plus
-    // TS-family extensions the AST backend can parse
-    for ext in ["js", "mjs", "cjs", "json", "ts", "tsx", "jsx", "mts", "cts"] {
-        let mut p = base.clone().into_os_string();
-        p.push(format!(".{ext}"));
-        candidates.push(PathBuf::from(p));
-        candidates.push(base.with_extension(ext));
+    // Node resolves exact files and appended extensions before directories.
+    // ./a.min must try a.min.js, never a.js via extension replacement.
+    if let Some(file) = resolve_file(&base, pkg_root) {
+        return Some(file);
     }
     // subdir package.json "main" (Node directory resolution)
     let sub_pkg = base.join("package.json");
     if sub_pkg.is_file() {
-        if let Ok(txt) = std::fs::read_to_string(&sub_pkg) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                if let Some(m) = v.get("main").and_then(|m| m.as_str()) {
-                    let c = base.join(m).normalize();
-                    if c.starts_with(pkg_root) && c.is_file() {
-                        return Some(c);
-                    }
-                }
+        let txt = std::fs::read_to_string(&sub_pkg).ok()?;
+        let v = serde_json::from_str::<serde_json::Value>(&txt).ok()?;
+        if let Some(m) = v.get("main").and_then(|m| m.as_str()) {
+            let target = base.join(m).normalize();
+            if let Some(file) = resolve_file(&target, pkg_root) {
+                return Some(file);
+            }
+            if let Some(file) = resolve_index(&target, pkg_root) {
+                return Some(file);
             }
         }
     }
-    for c in candidates {
-        let norm = c.normalize();
-        if norm.starts_with(pkg_root) && norm.is_file() {
-            return Some(norm);
+    resolve_index(&base, pkg_root)
+}
+
+fn resolve_file(base: &Path, pkg_root: &Path) -> Option<PathBuf> {
+    let mut candidates = vec![base.to_path_buf()];
+    for extension in ["js", "json", "node"] {
+        let mut file = base.as_os_str().to_os_string();
+        file.push(format!(".{extension}"));
+        candidates.push(PathBuf::from(file));
+    }
+    for candidate in candidates {
+        let path = candidate.normalize();
+        if path.starts_with(pkg_root) && path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn resolve_index(base: &Path, pkg_root: &Path) -> Option<PathBuf> {
+    for name in ["index.js", "index.json", "index.node"] {
+        let path = base.join(name).normalize();
+        if path.starts_with(pkg_root) && path.is_file() {
+            return Some(path);
         }
     }
     None
@@ -212,15 +223,20 @@ pub fn slice_package_model(
     model: ConsumerModel,
 ) -> SliceReport {
     let mut all_js: Vec<PathBuf> = Vec::new();
+    let mut traversal_failed = false;
     for e in walkdir::WalkDir::new(pkg_root).follow_links(false) {
         let e = match e {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => {
+                traversal_failed = true;
+                continue;
+            }
         };
         if e.file_type().is_file() && is_js(e.path()) {
             all_js.push(e.path().to_path_buf());
         }
     }
+    all_js.sort();
     let total_bytes: u64 = all_js
         .iter()
         .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
@@ -231,6 +247,15 @@ pub fn slice_package_model(
     for e in entry_points_for(pkg_root, model) {
         queue.push_back(e);
     }
+    if traversal_failed || queue.is_empty() {
+        return keep_all(
+            pkg_root,
+            package_name,
+            total_bytes,
+            all_js_ref(&all_js, pkg_root),
+            "incomplete tree or entry points".into(),
+        );
+    }
     while let Some(f) = queue.pop_front() {
         if kept.contains(&f) || !f.is_file() || !is_js(&f) {
             continue;
@@ -238,7 +263,15 @@ pub fn slice_package_model(
         kept.insert(f.clone());
         let raw = match std::fs::read(&f) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => {
+                return keep_all(
+                    pkg_root,
+                    package_name,
+                    total_bytes,
+                    all_js_ref(&all_js, pkg_root),
+                    "unreadable reachable file".into(),
+                )
+            }
         };
         // AST backend (Annexe F.4): parse failure or dynamic signal in a
         // reachable file => whole package kept, zero drops.
@@ -266,6 +299,14 @@ pub fn slice_package_model(
                 for spec in e.literal_specs {
                     if let Some(r) = resolve(&spec, &f, pkg_root) {
                         queue.push_back(r);
+                    } else if spec.starts_with('.') {
+                        return keep_all(
+                            pkg_root,
+                            package_name,
+                            total_bytes,
+                            all_js_ref(&all_js, pkg_root),
+                            "unresolved relative dependency".into(),
+                        );
                     }
                 }
                 continue;
@@ -293,7 +334,8 @@ pub fn slice_package_model(
         .filter(|p| !kept.contains(*p))
         .map(|p| rel(pkg_root, p))
         .collect();
-    let kept_files: Vec<String> = kept.iter().map(|p| rel(pkg_root, p)).collect();
+    let mut kept_files: Vec<String> = kept.iter().map(|p| rel(pkg_root, p)).collect();
+    kept_files.sort();
     SliceReport {
         package: package_name.to_string(),
         total_bytes,

@@ -41,9 +41,18 @@ fn read_overrides(
                 .as_object()
                 .ok_or("PARSE_ERROR: package.json: pnpm.overrides must be an object")?;
             for (key, value) in overrides {
+                if key.trim().is_empty() {
+                    return Err(
+                        "PARSE_ERROR: package.json: pnpm.overrides keys must be nonempty strings"
+                            .into(),
+                    );
+                }
                 let value = value.as_str().ok_or_else(|| {
                     format!("PARSE_ERROR: package.json: pnpm.overrides[{key:?}] must be a string")
                 })?;
+                if value.trim().is_empty() {
+                    return Err(format!("PARSE_ERROR: package.json: pnpm.overrides[{key:?}] must be a nonempty string"));
+                }
                 if value.starts_with("file:vendor/own/") {
                     out.insert(key.clone(), serde_json::Value::String(value.to_string()));
                 }
@@ -71,7 +80,6 @@ fn main() -> ExitCode {
             return report_error(json, &format!("USAGE_ERROR: {error}"));
         }
     };
-    let root = cli.root.unwrap_or_else(|| std::env::current_dir().unwrap());
     let result = (|| {
         if cli.format != "human" && cli.format != "json" {
             return Err(format!(
@@ -79,6 +87,12 @@ fn main() -> ExitCode {
                 cli.format
             ));
         }
+        let root = match cli.root {
+            Some(root) => root,
+            None => {
+                std::env::current_dir().map_err(|e| format!("IO_ERROR: current directory: {e}"))?
+            }
+        };
         for file in ["own.toml", "own.lock"] {
             std::fs::metadata(root.join(file)).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -90,7 +104,12 @@ fn main() -> ExitCode {
         }
         let config = std::fs::read_to_string(root.join("own.toml"))
             .map_err(|e| format!("IO_ERROR: own.toml: {e}"))?;
-        let policy = license_policy_json(&config)?;
+        let policy = license_policy_json(&config).map_err(|error| match error.split_once(':') {
+            Some((code, message)) if !message.trim_start().starts_with("own.toml") => {
+                format!("{code}: own.toml: {}", message.trim_start())
+            }
+            _ => error,
+        })?;
         let overrides = read_overrides(&root)?;
         let mut outcome = verify(&root, &policy, &overrides)?;
         if cli.installed {
@@ -129,13 +148,27 @@ fn main() -> ExitCode {
                 );
             } else {
                 for f in &outcome.findings {
-                    println!(
-                        "{}: [{}] {} {}",
-                        f.severity.to_uppercase(),
-                        f.code,
-                        f.package,
-                        f.path
-                    );
+                    // Same shape as `own verify`, message included: the code alone
+                    // does not say whether a file was modified, deleted or is a
+                    // symlink.
+                    if f.message.is_empty() {
+                        println!(
+                            "{}: [{}] {} {}",
+                            f.severity.to_uppercase(),
+                            f.code,
+                            f.package,
+                            f.path
+                        );
+                    } else {
+                        println!(
+                            "{}: [{}] {} {} — {}",
+                            f.severity.to_uppercase(),
+                            f.code,
+                            f.package,
+                            f.path,
+                            f.message
+                        );
+                    }
                 }
                 if code == 0 {
                     println!("ok: no findings");
