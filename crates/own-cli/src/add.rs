@@ -679,20 +679,36 @@ pub fn manifest_pfs_pub(root: &Path, dir: &str) -> Result<String, String> {
 }
 
 fn read_overrides_json(root: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let text =
-        std::fs::read_to_string(root.join("package.json")).map_err(|e| format!("IO_ERROR: {e}"))?;
+    let text = std::fs::read_to_string(root.join("package.json"))
+        .map_err(|e| format!("IO_ERROR: package.json: {e}"))?;
     let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("PARSE_ERROR: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("PARSE_ERROR: package.json: {e}"))?;
+    let object = v
+        .as_object()
+        .ok_or("PARSE_ERROR: package.json: expected an object")?;
     let mut out = serde_json::Map::new();
-    if let Some(ov) = v
-        .get("pnpm")
-        .and_then(|p| p.get("overrides"))
-        .and_then(|o| o.as_object())
-    {
-        for (k, val) in ov {
-            if let Some(s) = val.as_str() {
-                if s.starts_with("file:vendor/own/") {
-                    out.insert(k.clone(), serde_json::Value::String(s.to_string()));
+    if let Some(pnpm) = object.get("pnpm") {
+        let pnpm = pnpm
+            .as_object()
+            .ok_or("PARSE_ERROR: package.json: pnpm must be an object")?;
+        if let Some(overrides) = pnpm.get("overrides") {
+            let overrides = overrides
+                .as_object()
+                .ok_or("PARSE_ERROR: package.json: pnpm.overrides must be an object")?;
+            for (key, value) in overrides {
+                if key.trim().is_empty() {
+                    return Err("PARSE_ERROR: package.json: blank pnpm.overrides selector".into());
+                }
+                let value = value.as_str().ok_or_else(|| {
+                    format!("PARSE_ERROR: package.json: pnpm.overrides[{key:?}] must be a string")
+                })?;
+                if value.trim().is_empty() {
+                    return Err(format!(
+                        "PARSE_ERROR: package.json: pnpm.overrides[{key:?}] must be a nonempty string"
+                    ));
+                }
+                if value.starts_with("file:vendor/own/") {
+                    out.insert(key.clone(), serde_json::Value::String(value.to_string()));
                 }
             }
         }
