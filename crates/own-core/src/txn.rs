@@ -133,7 +133,23 @@ fn take_exclusive_lock(file: &File) -> Result<(), String> {
 
 fn rollback_dir(txn_dir: &Path, root: &Path) -> std::io::Result<()> {
     checked_absolute(root, txn_dir)?;
-    checked_absolute(root, &txn_dir.join("journal.json"))?;
+    let journal_path = txn_dir.join("journal.json");
+    // The journal and the backup dir are ours, but a planted symlink must be
+    // refused before any read: only real files/directories are accepted.
+    for p in [&journal_path, &txn_dir.join("backup")] {
+        match fs::symlink_metadata(p) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsafe txn path component: {}", p.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    checked_absolute(root, &journal_path)?;
     checked_absolute(root, &txn_dir.join("backup"))?;
     let content = fs::read_to_string(txn_dir.join("journal.json"))?;
     let v: serde_json::Value = serde_json::from_str(&content)
@@ -145,6 +161,19 @@ fn rollback_dir(txn_dir: &Path, root: &Path) -> std::io::Result<()> {
         _ => return Err(invalid_journal("invalid state")),
     }
     let backup = txn_dir.join("backup");
+    // The backup dir is ours, but a planted symlink at that exact path must be
+    // refused before any traversal into it.
+    match fs::symlink_metadata(&backup) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe txn path component: {}", backup.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     // Validate the complete journal and available originals before any removal.
     // Legacy entries have no existence flag: missing backup means absent path.
     let mut files = Vec::new();
@@ -178,7 +207,10 @@ fn rollback_dir(txn_dir: &Path, root: &Path) -> std::io::Result<()> {
             return Err(invalid_journal("backup name is not flat"));
         }
         let dst = checked_path(root, &rel)?;
-        let src = checked_absolute(root, &backup.join(flat))?;
+        // The backup copy lives in our own journal tree and may legitimately be
+        // a symlink (copy_dir preserves it): validate it against the txn tree
+        // instead of the project root, whose leaf rules would reject it.
+        let src = checked_txn_path(txn_dir, &backup.join(flat))?;
         let present = match fs::symlink_metadata(&src) {
             Ok(_) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -214,6 +246,24 @@ fn rollback_dir(txn_dir: &Path, root: &Path) -> std::io::Result<()> {
             if src.is_dir() {
                 copy_dir(&src, &dst)?;
                 sync_tree(&dst)?;
+            } else if fs::symlink_metadata(&src)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                // The original leaf was a symlink: restore the link itself,
+                // never its target's content (fs::copy would follow it).
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
+                    sync_existing_parent(&dst)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "cannot restore backup symlink on this platform",
+                    ));
+                }
             } else {
                 fs::copy(&src, &dst)?;
                 sync_path(&dst)?;
@@ -226,6 +276,53 @@ fn rollback_dir(txn_dir: &Path, root: &Path) -> std::io::Result<()> {
 
 fn invalid_journal(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+/// Validate a path inside the transaction's own bookkeeping tree
+/// (`.own/txn/<id>/...`). Unlike [`checked_path`] on the project root, the
+/// leaf may be a symlink: `copy_dir` deliberately preserves symlinks in
+/// backups, and recovery must be able to read them back.
+fn checked_txn_path(txn_dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let rel = absolute
+        .strip_prefix(txn_dir)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path outside txn dir"))?
+        .to_str()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path is not UTF-8")
+        })?;
+    validate_relative(rel)?;
+    // Every existing ancestor component must be a real directory (no symlink
+    // traversal); the leaf itself may be a regular file, directory or symlink.
+    let mut p = txn_dir.to_path_buf();
+    let parts: Vec<_> = Path::new(rel).components().collect();
+    for (i, part) in parts.iter().enumerate() {
+        p.push(part.as_os_str());
+        match fs::symlink_metadata(&p) {
+            Ok(md) => {
+                let leaf = i + 1 == parts.len();
+                if md.file_type().is_symlink() && !leaf {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unsafe txn path component: {}", p.display()),
+                    ));
+                }
+                if !leaf && !md.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unsafe txn path component: {}", p.display()),
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(p)
 }
 
 fn validate_journal_root(j: &serde_json::Value, root: &Path) -> std::io::Result<()> {
@@ -323,6 +420,17 @@ impl Txn {
         for dir in directories {
             checked_absolute(&root, &dir).map_err(|e| format!("IO_ERROR: {e}"))?;
             let j = dir.join("journal.json");
+            // The journal lives in our own bookkeeping tree and may itself be
+            // a symlink planted by an attacker: refuse it before reading.
+            if fs::symlink_metadata(&j)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(format!(
+                    "IO_ERROR: unsafe txn path component: {}",
+                    j.display()
+                ));
+            }
             checked_absolute(&root, &j).map_err(|e| format!("IO_ERROR: {e}"))?;
             if !j.try_exists().map_err(|e| format!("IO_ERROR: {e}"))? {
                 continue;
